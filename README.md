@@ -22,7 +22,10 @@ conversation; ciacola keeps its id and what it cost. So:
 
 That last point is why there is no work queue at the centre. A queue's
 durability buys re-execution, which is the one thing paid agent work
-must never do.
+must never do, and the durable record a queue would hold already exists:
+a turn is written to the ledger before anything is told to run it. The
+default executor polls that record, so a turn queued before a crash is
+picked up after one, with no queue and no recovery pass involved.
 
 ## Six verbs
 

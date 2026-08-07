@@ -22,14 +22,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ciacola_core::exec::TurnExecutor;
 use ciacola_core::health::{
     Health, operator_tools as health_operator_tools, resources as health_resources,
     tools as health_tools,
 };
 use ciacola_core::plugin::{Plugin, PluginContext, PluginHost, Surface};
 use ciacola_core::roles::RolesPlugin;
-use ciacola_core::{HandExecutor, Ledger, Notifier, board, recover, server};
+use ciacola_core::{
+    HandExecutor, Ledger, Notifier, PollingExecutor, TurnExecutor, board, recover, server,
+};
 use ciacola_findings::FindingsPlugin;
 use ciacola_git::GitPlugin;
 use ciacola_kanban::{KanbanPlugin, agents_resource};
@@ -86,7 +87,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let (tx, rx) = notification_channel(64);
     let notify = Notifier(tx);
-    let exec = HandExecutor::start(ledger.clone(), notify.clone(), concurrency);
+    // Two executors, one trait, and nothing above this line can tell
+    // them apart. The polling one rereads the ledger, so a turn queued
+    // before a crash is picked up on the next tick without help; the
+    // channel one is a little quicker off the mark. Default to durable.
+    let exec: std::sync::Arc<dyn TurnExecutor> =
+        if std::env::var("CIACOLA_EXECUTOR").as_deref() == Ok("channel") {
+            HandExecutor::start(ledger.clone(), notify.clone(), concurrency)
+        } else {
+            PollingExecutor::start(
+                ledger.clone(),
+                notify.clone(),
+                concurrency,
+                std::time::Duration::from_secs(2),
+            )
+        };
     let drain_exec = exec.clone();
 
     if std::env::var("CIACOLA_NO_RECOVER").is_err() {

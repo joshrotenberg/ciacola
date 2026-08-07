@@ -55,6 +55,7 @@ pub mod ledger;
 pub mod limits;
 pub mod notify;
 pub mod plugin;
+pub mod polling;
 pub mod recover;
 pub mod registry;
 pub mod roles;
@@ -71,6 +72,7 @@ pub use plugin::{
     BoxFut, Migration, Plugin, PluginContext, PluginHost, Section, Submission, Surface,
     apply_migrations, submit,
 };
+pub use polling::PollingExecutor;
 pub use roles::{Role, Roles, Runtime};
 pub use store::Store;
 pub use time::now_unix;

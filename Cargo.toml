@@ -18,12 +18,6 @@ tower-mcp = { path = "../tower-mcp/crates/tower-mcp", features = ["http"] }
 claude-wrapper = { path = "../claude-wrapper" }
 git-spawn = { path = "../git-spawn" }
 
-# The queue, behind the TurnExecutor seam and used by one crate.
-apalis = "=1.0.0-rc.9"
-apalis-core = { version = "=1.0.0-rc.9", features = ["serde"] }
-apalis-sqlite = "=1.0.0-rc.8"
-apalis-codec = "=0.1.0-rc.9"
-
 axum = "0.8"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
