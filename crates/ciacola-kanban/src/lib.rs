@@ -240,8 +240,8 @@ struct TrackArgs {
     item_id: String,
     /// Human title. Required the first time, sticky after.
     title: Option<String>,
-    /// One of: todo, doing, done, dropped.
-    lane: String,
+    /// Where the work stands.
+    lane: Lane,
     /// The agent currently on it, if any.
     owner: Option<String>,
     /// Status note: why deferred, what a correction was, the outcome.
@@ -252,7 +252,29 @@ struct TrackArgs {
 #[serde(deny_unknown_fields)]
 struct ItemsArgs {
     /// Filter to one lane. Omit for all.
-    lane: Option<String>,
+    lane: Option<Lane>,
+}
+
+/// A real enum rather than a documented string, so a client completes
+/// it from the schema without asking the server anything.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Lane {
+    Todo,
+    Doing,
+    Done,
+    Dropped,
+}
+
+impl Lane {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Lane::Todo => "todo",
+            Lane::Doing => "doing",
+            Lane::Done => "done",
+            Lane::Dropped => "dropped",
+        }
+    }
 }
 
 /// The write side: `track`. The read side for agents that prefer a
@@ -270,16 +292,11 @@ pub fn tools(items: Items) -> Vec<Tool> {
             .handler(move |args: TrackArgs| {
                 let items = items.clone();
                 async move {
-                    if !LANES.contains(&args.lane.as_str()) {
-                        return Ok(CallToolResult::error(format!(
-                            "lane must be one of {LANES:?}"
-                        )));
-                    }
                     match items
                         .track(
                             &args.item_id,
                             args.title.as_deref(),
-                            &args.lane,
+                            args.lane.as_str(),
                             args.owner.as_deref(),
                             args.note.as_deref(),
                         )
@@ -299,7 +316,7 @@ pub fn tools(items: Items) -> Vec<Tool> {
         .handler(move |args: ItemsArgs| {
             let items = items.clone();
             async move {
-                match items.list(args.lane.as_deref()).await {
+                match items.list(args.lane.map(Lane::as_str)).await {
                     Ok(all) => Ok(CallToolResult::json(json!({
                         "items": all.iter().map(item_json).collect::<Vec<_>>()
                     }))),

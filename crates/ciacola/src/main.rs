@@ -171,6 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    let merged_roles_for_completion = merged_roles.clone();
     plugins.push(Box::new(RolesPlugin::new(merged_roles)));
 
     let host = Arc::new(PluginHost::setup(plugins, &ctx).await?);
@@ -194,6 +195,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let health = Health::new(pool, path).with_host(host.clone());
 
     // Core verbs, then every plugin's contribution for this surface.
+    // Live values for completion/complete, so a generic REPL completes
+    // agent ids and role names from this server without knowing what a
+    // ciacola is. Enum arguments need no help; they are in the schema.
+    let completing = ciacola_core::roles::Roles::with_runtime(
+        merged_roles_for_completion.clone(),
+        mcp_config_path.display().to_string(),
+        declared.runtime.clone(),
+    );
+
     let mut stdio_router = server::router_with_limits(
         ledger.clone(),
         exec.clone(),
@@ -203,6 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .resource(agents_resource(ledger.clone()));
     stdio_router = host.install(stdio_router, Surface::Operator);
+    stdio_router = ciacola_core::complete::attach(stdio_router, ledger.clone(), completing.clone());
     for tool in health_tools(health.clone()) {
         stdio_router = stdio_router.tool(tool);
     }
@@ -217,6 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         server::router_with_limits(ledger.clone(), exec, notify, false, declared.limits.clone())
             .resource(agents_resource(ledger.clone()));
     agent_router = host.install(agent_router, Surface::Agent);
+    agent_router = ciacola_core::complete::attach(agent_router, ledger.clone(), completing);
     for tool in health_tools(health.clone()) {
         agent_router = agent_router.tool(tool);
     }

@@ -190,8 +190,8 @@ fn finding_json(f: &FindingRow) -> serde_json::Value {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct FileFindingArgs {
-    /// bug, suggestion, or observation.
-    kind: String,
+    /// What sort of thing this is.
+    kind: Kind,
     /// What it is about: "flat-server", "prompt:spoke-provisioning",
     /// "repo:tower-mcp", etc.
     subject: String,
@@ -205,8 +205,45 @@ struct FileFindingArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct FindingsArgs {
-    /// open, applied, or dismissed. Omit for all.
-    status: Option<String>,
+    /// Omit for all.
+    status: Option<Status>,
+}
+
+/// Enums, so a client completes them from the schema.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Bug,
+    Suggestion,
+    Observation,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Bug => "bug",
+            Kind::Suggestion => "suggestion",
+            Kind::Observation => "observation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    Open,
+    Applied,
+    Dismissed,
+}
+
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Open => "open",
+            Status::Applied => "applied",
+            Status::Dismissed => "dismissed",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -235,14 +272,9 @@ pub fn tools(findings: Findings) -> Vec<Tool> {
             .handler(move |args: FileFindingArgs| {
                 let findings = findings.clone();
                 async move {
-                    if !KINDS.contains(&args.kind.as_str()) {
-                        return Ok(CallToolResult::error(format!(
-                            "kind must be one of {KINDS:?}"
-                        )));
-                    }
                     match findings
                         .file(
-                            &args.kind,
+                            args.kind.as_str(),
                             &args.subject,
                             &args.body,
                             args.author.as_deref(),
@@ -267,7 +299,7 @@ pub fn tools(findings: Findings) -> Vec<Tool> {
             .handler(move |args: FindingsArgs| {
                 let findings = findings.clone();
                 async move {
-                    match findings.list(args.status.as_deref()).await {
+                    match findings.list(args.status.map(Status::as_str)).await {
                         Ok(all) => Ok(CallToolResult::json(json!({
                             "findings": all.iter().map(finding_json).collect::<Vec<_>>()
                         }))),

@@ -48,6 +48,7 @@
 //! until house rules became an explicit layer of the system prompt.
 
 pub mod agent;
+pub mod complete;
 pub mod exec;
 pub mod health;
 pub mod ledger;
