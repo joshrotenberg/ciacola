@@ -1,0 +1,25 @@
+[package]
+name = "ciacola-apalis"
+description = "An apalis-backed TurnExecutor, the alternative that proves the seam."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ciacola-core = { workspace = true }
+apalis-sqlite = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tower-mcp = { workspace = true }
+tracing = { workspace = true }
+apalis = { workspace = true }
+apalis-codec = { workspace = true }
+apalis-core = { workspace = true }
+tokio-util = { workspace = true }
+ulid = { workspace = true }

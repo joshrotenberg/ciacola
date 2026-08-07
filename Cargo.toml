@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/joshrotenberg/ciacola"
+authors = ["Josh Rotenberg <joshrotenberg@gmail.com>"]
+
+[workspace.dependencies]
+ciacola-core = { path = "crates/ciacola-core" }
+
+# Ours, path deps while everything moves together.
+tower-mcp = { path = "../tower-mcp/crates/tower-mcp", features = ["http"] }
+claude-wrapper = { path = "../claude-wrapper" }
+git-spawn = { path = "../git-spawn" }
+
+# The queue, behind the TurnExecutor seam and used by one crate.
+apalis = "=1.0.0-rc.9"
+apalis-core = { version = "=1.0.0-rc.9", features = ["serde"] }
+apalis-sqlite = "=1.0.0-rc.8"
+apalis-codec = "=0.1.0-rc.9"
+
+axum = "0.8"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ulid = "1"
+
+[workspace.lints.clippy]
+type_complexity = "warn"

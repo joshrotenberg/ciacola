@@ -1,0 +1,33 @@
+[package]
+name = "ciacola"
+description = "A laptop-local agent server: durable conversations, fronted entirely by MCP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ciacola"
+path = "src/main.rs"
+
+[dependencies]
+ciacola-core = { workspace = true }
+ciacola-findings = { path = "../ciacola-findings" }
+ciacola-git = { path = "../ciacola-git" }
+ciacola-kanban = { path = "../ciacola-kanban" }
+ciacola-memory = { path = "../ciacola-memory" }
+ciacola-refs = { path = "../ciacola-refs" }
+ciacola-repo-worker = { path = "../ciacola-repo-worker" }
+ciacola-schedule = { path = "../ciacola-schedule" }
+ciacola-tuning = { path = "../ciacola-tuning" }
+ciacola-webhook = { path = "../ciacola-webhook" }
+apalis-sqlite = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tower-mcp = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

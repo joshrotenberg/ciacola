@@ -1,0 +1,21 @@
+[package]
+name = "ciacola-tuning"
+description = "What each model and effort level has actually cost and achieved."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ciacola-core = { workspace = true }
+apalis-sqlite = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tower-mcp = { workspace = true }
+tracing = { workspace = true }
+

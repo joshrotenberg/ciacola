@@ -1,0 +1,24 @@
+[package]
+name = "ciacola-core"
+description = "An agent is a durable conversation: ledger, executor, plugin trait, and MCP surface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+apalis-sqlite = { workspace = true }
+axum = { workspace = true }
+claude-wrapper = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tower-mcp = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }

@@ -1,0 +1,61 @@
+# ciacola, annotated. Every section is optional; a server with an empty
+# config file starts, serves the six verbs, and does nothing until told.
+
+[runtime]
+# Seal the ambient provider config. "full" drops user, project, and
+# local settings; "project" keeps the user's global ones. Worth having
+# on for unattended work: an interactive session inherits a CLAUDE.md
+# the person can see, a scheduled agent inherits it invisibly.
+hermetic = "full"
+
+# Isolation removes the operator's standing rules along with everything
+# else, so put them back deliberately. Inline, or a file, or both.
+house_rules_file = "~/.claude/CLAUDE.md"
+
+# Provider config and session directory. Pointing this at the server's
+# own directory keeps transcripts with the run that produced them,
+# which is the precondition for mining them later.
+#
+# It also isolates the login: a fresh directory authenticates as
+# nobody. Mint a token with `claude setup-token` and name the variable
+# holding it below.
+# claude_home = "~/.local/share/ciacola/claude"
+# token_env = "CIACOLA_CLAUDE_TOKEN"
+
+[limits]
+# Circuit breakers, not budgets. Measured spend across real turns spans
+# 54x, so no number is correct; a breaker only has to be wrong in the
+# safe direction. Applies to new submissions, never to running work.
+# daily_warn_usd = 25.0
+# daily_stop_usd = 50.0
+
+# Depth is the leading indicator: a conductor spawning conductors
+# compounds faster than any spend check notices. 0 disables.
+max_spawn_depth = 3
+
+# Plugins read their own sections; the server never sees these fields.
+[plugins.repo-worker]
+root = "~/.local/share/ciacola/repos"
+repos = ["joshrotenberg/mdbook-lint"]
+
+# [plugins.webhook]
+# hooks = [{ path = "issue", agent = "tower-mcp-manager" }]
+
+# Reusable agent definitions, exposed as MCP prompts and to spawn_role.
+# Plugins ship their own; these win on a name collision.
+# [[roles]]
+# name = "summarizer"
+# description = "Summarizes one PR in five bullets."
+# model = "haiku"
+# arguments = ["repo", "pr"]
+# system_prompt = "..."
+
+# Persistent agents: upserted by name at every boot. The definition
+# follows this file; the identity and conversation persist.
+# [[agents]]
+# name = "tower-mcp-manager"
+# role = "repo-manager"
+#
+# [agents.schedule]
+# every_secs = 1800
+# text = "Wake up. Run your wake list."
