@@ -129,7 +129,15 @@ forbid. House rules are now an explicit layer of the system prompt.
    the route through, and the server warns at boot.
 6. **No graceful shutdown for the HTTP side.** `drain` handles
    in-flight turns; the axum server is dropped.
-7. **Cost is Claude-only.** codex reports tokens and no price at all
+7. **`wait` is shadowed in mcp-repl.** `wait` is one of the six verbs
+   and also an mcp-repl built-in (wait for a background task), and the
+   built-in wins: typing `wait` gets "no tasks in this session to wait
+   for". `find wait` lists both, so the client knows about the clash
+   and simply has no way to express "the tool". `call wait
+   {"agent_id": "...", "seq": 1}` reaches it. Renaming the verb to suit
+   one client is the wrong direction; the fix is upstream, an escape
+   for a tool a built-in shadows.
+8. **Cost is Claude-only.** codex reports tokens and no price at all
    and deliberately refuses to synthesize one, which is why tokens are
    in the ledger beside cost. A second provider will find `cost_usd`
    optional in practice but not in shape.
@@ -205,14 +213,26 @@ because it buys client state management at the cost of a second
 language, a second toolchain, and a JSON API that duplicates the MCP
 surface.
 
-**One provocation before any of that work happens.** The board is for
-*watching*; the REPL is for *doing*. Making the board interactive may
-be solving the wrong problem, since every action it would grow already
-exists as an MCP tool that mcp-repl can call today. The strongest
-version of this project might be a board that gets much better at
-watching (timelines, per-agent transcripts, spend over time, what is
-stuck and for how long) and stays read-only, with a REPL that gets
-better at doing. Worth deciding deliberately rather than by default.
+**The board is for *watching*; the REPL is for *doing*.** That split
+was decided rather than defaulted into, and it is why there is no
+ciacola REPL. mcp-repl is 18,757 lines, of which the reusable
+machinery is roughly 7,000 (schema contracts, surface search, the wire
+tracer, the reedline editor) and the REPL loop itself is the other
+5,600 in `lib.rs`. Writing a native one duplicates all of it, and the
+copy drifts.
+
+The alternative that was taken instead: **make the server worth
+completing against.** A generic client already knows `send` takes an
+`agent_id`, because the schema says so, and what it cannot know is
+which ids exist right now. So the server answers `completion/complete`
+from the ledger, closed sets are real enums instead of documented
+strings, and `instructions` carries a front door that mcp-repl
+markdown-renders into its banner. None of it names a client and all of
+it works in any client that implements the protocol.
+
+That leaves the board free to get much better at watching (timelines,
+per-agent transcripts, spend over time, what is stuck and for how
+long) and to stay read-only.
 
 **Publishing.** Names are free on crates.io. `ciacola-core` is the only
 one with a public API worth stabilising; the plugins are examples as

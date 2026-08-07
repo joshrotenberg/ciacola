@@ -166,6 +166,40 @@ fn turn_json(turn: &TurnRow) -> serde_json::Value {
     })
 }
 
+/// What a person sees on connecting. A client that renders server
+/// instructions (mcp-repl markdown-renders them into its banner) gets a
+/// front door without either side knowing about the other, which is the
+/// same bet [`crate::complete`] makes: enrich the server, and generic
+/// clients become specific ones for free.
+///
+/// Kept to what is not derivable from the schema. The argument names are
+/// in `tools/list`; the fact that `send` does not block is not.
+const OPERATOR: &str = "\
+ciacola runs coding agents as durable conversations. An agent exists \
+while nothing is running; a *turn* is one execution against it.
+
+- `spawn` defines an agent. It runs nothing and costs nothing.
+- `send` returns a turn number immediately. It does not block.
+- `wait` blocks for one. `list` shows what is in flight.
+- `kill` stops a turn. The agent survives it, and can be sent to again.
+
+`agent_id` completes on the agent's *name*, so type `alpha` rather than \
+a ULID. The board is at `/board`.";
+
+/// The same, for the loopback surface agents are handed. It answers the
+/// question an agent cannot answer from a schema: that these tools point
+/// back at the system running it, and what that costs.
+const AGENT: &str = "\
+You are connected to the server running you. These tools spawn and \
+drive other agents, which is all that delegation requires here: a \
+conductor spawning debaters is a prompt, not a framework.
+
+- Work a child does is charged to the conversation that spawned it.
+- Spawn depth is capped, and a spawn past the cap is refused with the \
+reason.
+- `kill` is deliberately absent. Stopping paid work stays a person's \
+call.";
+
 /// The whole server, parameterised only by who executes turns.
 pub fn router(ledger: Ledger, exec: Arc<dyn TurnExecutor>, notify: Notifier) -> McpRouter {
     router_with(ledger, exec, notify, true)
@@ -488,6 +522,7 @@ pub fn router_with_limits(
 
     let router = McpRouter::new()
         .server_info(format!("ciacola-{}", exec.name()), "0.0.0")
+        .instructions(if include_kill { OPERATOR } else { AGENT })
         .tool(spawn)
         .tool(send)
         .tool(get)
