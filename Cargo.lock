@@ -278,7 +278,6 @@ dependencies = [
 name = "ciacola"
 version = "0.0.1"
 dependencies = [
- "apalis-sqlite",
  "axum",
  "ciacola-core",
  "ciacola-findings",
@@ -291,6 +290,7 @@ dependencies = [
  "ciacola-tuning",
  "ciacola-webhook",
  "serde",
+ "sqlx",
  "tokio",
  "toml",
  "tower-mcp",
@@ -322,7 +322,6 @@ dependencies = [
 name = "ciacola-core"
 version = "0.0.1"
 dependencies = [
- "apalis-sqlite",
  "axum",
  "claude-wrapper",
  "schemars",
@@ -341,7 +340,6 @@ dependencies = [
 name = "ciacola-findings"
 version = "0.0.1"
 dependencies = [
- "apalis-sqlite",
  "ciacola-core",
  "schemars",
  "serde",
@@ -357,7 +355,6 @@ dependencies = [
 name = "ciacola-git"
 version = "0.0.1"
 dependencies = [
- "apalis-sqlite",
  "ciacola-core",
  "schemars",
  "serde",
@@ -372,7 +369,6 @@ dependencies = [
 name = "ciacola-kanban"
 version = "0.0.1"
 dependencies = [
- "apalis-sqlite",
  "axum",
  "ciacola-core",
  "schemars",
@@ -389,7 +385,6 @@ dependencies = [
 name = "ciacola-memory"
 version = "0.0.1"
 dependencies = [
- "apalis-sqlite",
  "ciacola-core",
  "schemars",
  "serde",
@@ -404,7 +399,6 @@ dependencies = [
 name = "ciacola-refs"
 version = "0.0.1"
 dependencies = [
- "apalis-sqlite",
  "ciacola-core",
  "schemars",
  "serde",
@@ -419,7 +413,6 @@ dependencies = [
 name = "ciacola-repo-worker"
 version = "0.0.1"
 dependencies = [
- "apalis-sqlite",
  "ciacola-core",
  "git-spawn",
  "schemars",
@@ -436,7 +429,6 @@ dependencies = [
 name = "ciacola-schedule"
 version = "0.0.1"
 dependencies = [
- "apalis-sqlite",
  "ciacola-core",
  "schemars",
  "serde",
@@ -452,7 +444,6 @@ dependencies = [
 name = "ciacola-tuning"
 version = "0.0.1"
 dependencies = [
- "apalis-sqlite",
  "ciacola-core",
  "schemars",
  "serde",
@@ -467,7 +458,6 @@ dependencies = [
 name = "ciacola-webhook"
 version = "0.0.1"
 dependencies = [
- "apalis-sqlite",
  "axum",
  "ciacola-core",
  "schemars",

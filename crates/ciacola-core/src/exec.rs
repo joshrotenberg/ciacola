@@ -8,8 +8,8 @@
 //!
 //! - [`HandExecutor`] (here): a channel, a semaphore, a cancellation
 //!   token per turn.
-//! - `ApalisExecutor` (flat4): push `{agent_id, seq}` to a queue and
-//!   let a worker drive the same functions.
+//! - `ciacola_apalis::ApalisExecutor`: push `{agent_id, seq}` to a
+//!   queue and let a worker drive the same functions.
 //!
 //! `claim_turn` is what makes both safe: whoever delivers the work, and
 //! however many times, the exchange runs at most once. The claim also
@@ -177,8 +177,8 @@ async fn load(
 
 type Kills = Arc<Mutex<HashMap<(String, i64), CancellationToken>>>;
 
-/// The hand-rolled half of the spike-off: everything apalis would do for
-/// us, written out. A channel is the queue, a semaphore is the
+/// The default executor: everything a work queue would do for us,
+/// written out. A channel is the queue, a semaphore is the
 /// concurrency limit, a cancellation token is the kill switch. Dropping
 /// the turn's future kills the provider process group (claude-wrapper
 /// sets kill_on_drop and its own process group per child).

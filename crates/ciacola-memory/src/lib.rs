@@ -13,10 +13,10 @@
 //! boundary, so memory is a prompt-injection surface between agents),
 //! and nothing consolidates or expires entries yet.
 
-use apalis_sqlite::SqlitePool;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
+use sqlx::SqlitePool;
 use tower_mcp::{
     CallToolResult, ReadResourceResult, Resource, ResourceBuilder, ResourceContent, Tool,
     ToolBuilder,

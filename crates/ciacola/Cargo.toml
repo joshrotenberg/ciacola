@@ -13,6 +13,7 @@ name = "ciacola"
 path = "src/main.rs"
 
 [dependencies]
+sqlx = { workspace = true }
 ciacola-core = { workspace = true }
 ciacola-findings = { path = "../ciacola-findings" }
 ciacola-git = { path = "../ciacola-git" }
@@ -23,7 +24,6 @@ ciacola-repo-worker = { path = "../ciacola-repo-worker" }
 ciacola-schedule = { path = "../ciacola-schedule" }
 ciacola-tuning = { path = "../ciacola-tuning" }
 ciacola-webhook = { path = "../ciacola-webhook" }
-apalis-sqlite = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }

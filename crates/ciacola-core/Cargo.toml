@@ -9,7 +9,6 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-apalis-sqlite = { workspace = true }
 axum = { workspace = true }
 claude-wrapper = { workspace = true }
 schemars = { workspace = true }

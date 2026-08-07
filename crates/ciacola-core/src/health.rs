@@ -14,10 +14,10 @@
 //! `ciacola://health`, notice the trend, and file a finding about it,
 //! which is the introspection loop pointed inward.
 
-use apalis_sqlite::SqlitePool;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
+use sqlx::SqlitePool;
 use tower_mcp::{
     CallToolResult, ReadResourceResult, Resource, ResourceBuilder, ResourceContent, Tool,
     ToolBuilder,

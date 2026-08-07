@@ -1,10 +1,10 @@
 //! The six verbs, as MCP tools: spawn, send, get, list, wait, kill.
 //!
-//! Built once and shared by flat3 (hand-rolled executor) and flat4
-//! (apalis executor), so the spike-off compares executors and nothing
-//! else. Every tool is a shell over the ledger; the executor appears in
-//! exactly two of them (`send` submits, `kill` signals), which is the
-//! measure of how thin the seam is.
+//! Built once and parameterised only by who executes turns, so the
+//! executor is swappable without the client noticing. Every tool is a
+//! shell over the ledger, and the executor appears in exactly two of
+//! them (`send` submits, `kill` signals), which is the measure of how
+//! thin that seam is.
 
 use std::sync::Arc;
 use std::time::Duration;

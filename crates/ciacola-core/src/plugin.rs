@@ -47,9 +47,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use apalis_sqlite::SqlitePool;
 use axum::Router;
 use serde_json::{Value, json};
+use sqlx::SqlitePool;
 use tower_mcp::{LogLevel, McpRouter, Prompt, Resource, Tool};
 
 use crate::agent::FlatError;

@@ -1,16 +1,16 @@
 //! The product ledger: agents and turns, in sqlite, beside no queue.
 //!
-//! Stage 9 established the rule this module lives by: the application's
-//! own record is the source of truth, and anything a turn *learns* (the
-//! session id above all) is written here the moment it is known. The
-//! queue-shaped system needed this ledger *in addition to* apalis; the
-//! flat system needs only this.
+//! The rule this module lives by: the application's own record is the
+//! source of truth, and anything a turn *learns* (the session id above
+//! all) is written here the moment it is known. A queue-shaped design
+//! needs this ledger *in addition to* its queue; ciacola needs only
+//! this, which is why there is no queue at the centre.
 //!
 //! Turn states: `queued -> running -> ok | failed | killed`. An agent's
 //! state is derived from its turns, never stored, so it cannot drift.
 
-use apalis_sqlite::SqlitePool;
 use serde::Serialize;
+use sqlx::SqlitePool;
 
 use crate::agent::{AgentDef, Exchange, FlatError};
 use crate::plugin::Migration;

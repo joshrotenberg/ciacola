@@ -19,9 +19,9 @@
 //! namespace, or reaches past this into the pool, will get what it
 //! asked for. If you need a real boundary, run a separate MCP server.
 
-use apalis_sqlite::SqlitePool;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sqlx::SqlitePool;
 
 use crate::agent::FlatError;
 use crate::plugin::Migration;

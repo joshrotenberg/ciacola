@@ -22,7 +22,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use apalis_sqlite::SqlitePool;
 use ciacola_core::exec::TurnExecutor;
 use ciacola_core::health::{
     Health, operator_tools as health_operator_tools, resources as health_resources,
@@ -41,6 +40,7 @@ use ciacola_schedule::SchedulePlugin;
 use ciacola_schedule::Schedules;
 use ciacola_tuning::TuningPlugin;
 use ciacola_webhook::WebhookPlugin;
+use sqlx::SqlitePool;
 
 mod config;
 use tower_mcp::context::notification_channel;

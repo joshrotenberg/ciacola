@@ -12,10 +12,10 @@
 //! look at, has no side effects, and any MCP client can render or
 //! subscribe to it. First real use of resources in this workspace.
 
-use apalis_sqlite::SqlitePool;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
+use sqlx::SqlitePool;
 use tower_mcp::{
     CallToolResult, ReadResourceResult, Resource, ResourceBuilder, ResourceContent, Tool,
     ToolBuilder,

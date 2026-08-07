@@ -10,7 +10,6 @@ authors.workspace = true
 
 [dependencies]
 ciacola-core = { workspace = true }
-apalis-sqlite = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

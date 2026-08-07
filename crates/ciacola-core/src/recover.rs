@@ -6,8 +6,8 @@
 //! correct answer:
 //!
 //! - **queued**: the crash lost only the in-memory delivery. Resubmit
-//!   to the executor. Under apalis this may duplicate a delivery the
-//!   backend will also make; `claim_turn` makes the duplicate free.
+//!   to the executor. A queue-backed executor may duplicate a delivery
+//!   its backend also makes; `claim_turn` makes the duplicate free.
 //! - **running**: the exchange was in flight. Its provider process
 //!   survived our death (kill_on_drop is a destructor, and destructors
 //!   do not run on SIGKILL; the child sits in its own process group),
