@@ -672,13 +672,13 @@ to do, on purpose."
                      <td><a href=\"/board/agent/{id}\">{name}</a></td>\
                      <td class=\"mono\">{branch}</td><td>{pr}</td>\
                      <td class=\"dim mono\">{wt}</td></tr>",
-                    repo = ciacola_core::board::esc(&a.repo),
+                    repo = ciacola_core::render::esc(&a.repo),
                     issue = a.issue,
-                    id = ciacola_core::board::esc(agent_id),
-                    name = ciacola_core::board::esc(&name),
-                    branch = ciacola_core::board::esc(&a.branch),
+                    id = ciacola_core::render::esc(agent_id),
+                    name = ciacola_core::render::esc(&name),
+                    branch = ciacola_core::render::esc(&a.branch),
                     pr = a.pr.map(|n| format!("#{n}")).unwrap_or_else(|| "-".into()),
-                    wt = ciacola_core::board::esc(&a.worktree),
+                    wt = ciacola_core::render::esc(&a.worktree),
                 ));
             }
             html.push_str("</table>");

@@ -1,30 +1,50 @@
-//! The board: the ledger, rendered.
+//! The read side, rendered.
 //!
-//! Two pages of server-rendered HTML over the same tables every MCP
-//! tool reads, mounted on the HTTP port flat6 already serves. No
-//! framework, no build step, no new dependency beyond axum, which
-//! tower-mcp's http transport already pulls in.
+//! Server-rendered HTML over the same tables every MCP tool reads.
+//! Optional by construction: nothing in core depends on this crate, so
+//! a server that does not want a board simply does not merge its
+//! router.
 //!
-//! The point being tested: the board a queue framework sells shows the
-//! wrong nouns for this system (task statuses a crash makes lie), and
-//! the board over the ledger, agents, conversations, spend, schedules,
-//! is a page per SELECT.
+//! # Live without a build step
+//!
+//! The board used to carry `<meta http-equiv="refresh" content="5">`,
+//! which reloads the whole page: scroll position lost, a flash every
+//! five seconds, and a reload whether or not anything changed.
+//!
+//! Instead the server holds an SSE connection, renders the body on a
+//! tick, and sends a version only when the rendering actually differs.
+//! The client refetches one fragment and swaps it. Scroll survives,
+//! nothing flashes, and an idle system sends nothing at all.
+//!
+//! That is the LiveView shape (server owns the state, client is dumb)
+//! reached with about forty lines of vanilla JavaScript and no
+//! dependency. It is deliberately not htmx or Leptos yet: the state
+//! here is entirely server-side and the interactions are coarse, so
+//! neither has anything to add until the board grows client state that
+//! a round trip cannot serve. Whatever replaces this should have to
+//! justify a build step first.
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Path, State};
+use axum::response::sse::{Event, Sse};
 use axum::response::{Html, Redirect};
 use axum::routing::get;
 
 use std::sync::Arc;
 
-use crate::ledger::{Ledger, TurnRow};
-use crate::plugin::PluginHost;
+use ciacola_core::ledger::{Ledger, TurnRow};
+use ciacola_core::plugin::PluginHost;
+use ciacola_core::render::{ago, chip, esc, human_count, page_with, usd};
 
 #[derive(Clone)]
 struct BoardState {
     ledger: Ledger,
     host: Arc<PluginHost>,
-    limits: crate::limits::Limits,
+    limits: ciacola_core::limits::Limits,
 }
 
 /// The board knows core (agents) and asks the host for everything
@@ -38,12 +58,14 @@ pub fn router(ledger: Ledger, host: Arc<PluginHost>) -> Router {
 pub fn router_with_limits(
     ledger: Ledger,
     host: Arc<PluginHost>,
-    limits: crate::limits::Limits,
+    limits: ciacola_core::limits::Limits,
 ) -> Router {
     let plugin_routes = host.routes();
     Router::new()
         .route("/", get(|| async { Redirect::to("/board") }))
         .route("/board", get(overview))
+        .route("/board/fragment", get(overview_fragment))
+        .route("/board/events", get(events))
         .route("/board/agent/{agent_id}", get(agent_page))
         .with_state(BoardState {
             ledger,
@@ -53,95 +75,10 @@ pub fn router_with_limits(
         .merge(plugin_routes)
 }
 
-pub fn esc(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-pub fn usd(micro: i64) -> String {
-    format!("${:.4}", micro as f64 / 1e6)
-}
-
-/// "4m ago", not a timestamp. An unattended system is read to answer
-/// "is this stuck", and a wall-clock time makes the reader do the
-/// arithmetic. Zero means never.
-pub fn ago(unix: i64) -> String {
-    if unix == 0 {
-        return "never".into();
-    }
-    let secs = (crate::time::now_unix() - unix).max(0);
-    match secs {
-        0..=59 => format!("{secs}s ago"),
-        60..=3599 => format!("{}m ago", secs / 60),
-        3600..=86399 => format!("{}h ago", secs / 3600),
-        _ => format!("{}d ago", secs / 86400),
-    }
-}
-
-/// 595.7k rather than 595713: the header is read at a glance.
-fn human_count(n: i64) -> String {
-    match n {
-        0..=999 => n.to_string(),
-        1_000..=999_999 => format!("{:.1}k", n as f64 / 1e3),
-        _ => format!("{:.1}M", n as f64 / 1e6),
-    }
-}
-
-pub fn chip(state: &str) -> String {
-    let color = match state {
-        "ok" | "idle" => "#3fb950",
-        "running" => "#58a6ff",
-        "queued" | "skipped" => "#d29922",
-        "failed" => "#f85149",
-        "killed" => "#8b949e",
-        _ => "#8b949e",
-    };
-    format!(
-        "<span class=\"chip\" style=\"border-color:{color};color:{color}\">{}</span>",
-        esc(state)
-    )
-}
-
-pub fn page(title: &str, body: &str) -> Html<String> {
-    Html(format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\">\
-         <meta http-equiv=\"refresh\" content=\"5\">\
-         <title>{}</title><style>\
-         body{{background:#0d1117;color:#e6edf3;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;padding:2rem;max-width:70rem}}\
-         a{{color:#58a6ff;text-decoration:none}} a:hover{{text-decoration:underline}}\
-         h1{{font-size:1.2rem;margin:0 0 1.5rem}} h2{{font-size:0.85rem;text-transform:uppercase;letter-spacing:0.08em;color:#8b949e;margin:2rem 0 0.5rem}}\
-         table{{border-collapse:collapse;width:100%}}\
-         th{{text-align:left;font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;color:#8b949e;font-weight:500;padding:0.4rem 0.75rem;border-bottom:1px solid #21262d}}\
-         td{{padding:0.5rem 0.75rem;border-bottom:1px solid #21262d;vertical-align:top}}\
-         .chip{{border:1px solid;border-radius:1rem;padding:0.05rem 0.6rem;font-size:0.75rem;white-space:nowrap}}\
-         .num{{text-align:right;font-variant-numeric:tabular-nums}}\
-         .dim{{color:#8b949e}} .mono{{font-family:ui-monospace,monospace;font-size:0.85em}}\
-         .stat{{display:inline-block;margin-right:2.5rem}} .stat b{{display:block;font-size:1.4rem;font-weight:600}} .stat span{{color:#8b949e;font-size:0.8rem}}\
-         .msg{{margin:0.25rem 0 0.75rem;padding:0.6rem 0.9rem;border-left:3px solid #21262d;white-space:pre-wrap}}\
-         .msg.them{{border-color:#58a6ff}} .msg.it{{border-color:#3fb950}} .msg.err{{border-color:#f85149}}\
-         .kanban{{display:flex;gap:1rem;align-items:flex-start}}\
-         .lane{{flex:1;min-width:0;background:#161b22;border:1px solid #21262d;border-radius:6px;padding:0.6rem}}\
-         .lane h3{{font-size:0.72rem;text-transform:uppercase;letter-spacing:0.08em;color:#8b949e;margin:0 0 0.5rem;font-weight:600}}\
-         .card{{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:0.5rem 0.6rem;margin-bottom:0.5rem}}\
-         .card b{{font-weight:600;font-size:0.85rem}}\
-         .card .dim{{font-size:0.78rem;display:block;margin-top:0.15rem}}\
-         </style></head><body>{}</body></html>",
-        esc(title),
-        body
-    ))
-}
-
-async fn overview(State(state): State<BoardState>) -> Html<String> {
+async fn overview_body(state: &BoardState) -> String {
     let agents = match state.ledger.list_agents().await {
         Ok(agents) => agents,
-        Err(e) => {
-            return page(
-                "board",
-                &format!("<p>ledger error: {}</p>", esc(&e.to_string())),
-            );
-        }
+        Err(e) => return format!("<p>ledger error: {}</p>", esc(&e.to_string())),
     };
     let retired = state.ledger.retired_count().await.unwrap_or_default();
 
@@ -150,13 +87,13 @@ async fn overview(State(state): State<BoardState>) -> Html<String> {
     let running = agents.iter().filter(|a| a.state == "running").count();
     let day_cost = state
         .ledger
-        .spend_since(crate::time::now_unix() - 86_400)
+        .spend_since(ciacola_core::time::now_unix() - 86_400)
         .await
         .unwrap_or_default();
     let tokens = state.ledger.token_totals().await.unwrap_or_default();
 
     let mut body = format!(
-        "<h1>flat board</h1>\
+        "<h1>ciacola</h1>\
          <div><span class=\"stat\"><b>{}</b><span>agents</span></span>\
          <span class=\"stat\"><b>{}</b><span>running</span></span>\
          <span class=\"stat\"><b>{}</b><span>turns</span></span>\
@@ -219,7 +156,7 @@ async fn overview(State(state): State<BoardState>) -> Html<String> {
         <th>session</th></tr>",
     );
     // Families together: roots first, each followed by its children.
-    let row_html = |agent: &crate::ledger::AgentRow, child: bool| {
+    let row_html = |agent: &ciacola_core::ledger::AgentRow, child: bool| {
         format!(
             "<tr><td>{indent}<a href=\"/board/agent/{id}\">{name}</a> <span class=\"dim mono\">{short}</span></td>\
              <td>{chip}</td><td class=\"num\">{turns}</td><td class=\"num\">{cost}</td>\
@@ -243,7 +180,7 @@ async fn overview(State(state): State<BoardState>) -> Html<String> {
                 .unwrap_or("-")),
         )
     };
-    let is_root = |a: &&crate::ledger::AgentRow| {
+    let is_root = |a: &&ciacola_core::ledger::AgentRow| {
         a.spawned_by.is_none()
             || !agents
                 .iter()
@@ -260,7 +197,44 @@ async fn overview(State(state): State<BoardState>) -> Html<String> {
     }
     body.push_str("</table>");
 
-    page("flat board", &body)
+    body
+}
+
+async fn overview(State(state): State<BoardState>) -> Html<String> {
+    page_with("ciacola", &overview_body(&state).await, true)
+}
+
+/// Just the body, for the client to swap in without a reload.
+async fn overview_fragment(State(state): State<BoardState>) -> Html<String> {
+    Html(overview_body(&state).await)
+}
+
+fn version_of(body: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    body.hash(&mut h);
+    h.finish()
+}
+
+/// A version number whenever the rendered board actually changes.
+///
+/// Rendering server-side to decide is the honest cheap trick: it costs
+/// a few queries a second at this scale, and it means an idle system
+/// sends nothing, so an open board is not a busy one.
+async fn events(
+    State(state): State<BoardState>,
+) -> Sse<impl futures_core::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let stream = async_stream::stream! {
+        let mut last = 0u64;
+        loop {
+            let version = version_of(&overview_body(&state).await);
+            if version != last {
+                last = version;
+                yield Ok(Event::default().event("board").data(version.to_string()));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    };
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 fn turn_html(turn: &TurnRow) -> String {
@@ -286,9 +260,10 @@ fn turn_html(turn: &TurnRow) -> String {
 
 async fn agent_page(State(state): State<BoardState>, Path(agent_id): Path<String>) -> Html<String> {
     let Ok(Some(agent)) = state.ledger.get_agent(&agent_id).await else {
-        return page(
+        return page_with(
             "not found",
             "<p>no such agent. <a href=\"/board\">back</a></p>",
+            false,
         );
     };
     let turns = state
@@ -351,5 +326,5 @@ async fn agent_page(State(state): State<BoardState>, Path(agent_id): Path<String
     for turn in &turns {
         body.push_str(&turn_html(turn));
     }
-    page(&agent.name, &body)
+    page_with(&agent.name, &body, false)
 }

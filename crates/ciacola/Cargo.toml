@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 sqlx = { workspace = true }
 ciacola-core = { workspace = true }
+ciacola-board = { path = "../ciacola-board" }
 ciacola-findings = { path = "../ciacola-findings" }
 ciacola-git = { path = "../ciacola-git" }
 ciacola-kanban = { path = "../ciacola-kanban" }

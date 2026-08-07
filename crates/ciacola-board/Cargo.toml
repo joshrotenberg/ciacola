@@ -1,0 +1,20 @@
+[package]
+name = "ciacola-board"
+description = "The read side, rendered: agents, work, cost, and what is stuck. Optional."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ciacola-core = { workspace = true }
+axum = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+async-stream = "0.3"
+futures-core = "0.3"
+tracing = { workspace = true }

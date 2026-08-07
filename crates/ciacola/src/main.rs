@@ -29,7 +29,7 @@ use ciacola_core::health::{
 use ciacola_core::plugin::{Plugin, PluginContext, PluginHost, Surface};
 use ciacola_core::roles::RolesPlugin;
 use ciacola_core::{
-    HandExecutor, Ledger, Notifier, PollingExecutor, TurnExecutor, board, recover, server,
+    HandExecutor, Ledger, Notifier, PollingExecutor, TurnExecutor, recover, server,
 };
 use ciacola_findings::FindingsPlugin;
 use ciacola_git::GitPlugin;
@@ -226,7 +226,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let http = HttpTransport::new(agent_router)
         .into_router_at("/mcp")
-        .merge(board::router_with_limits(ledger, host, declared.limits));
+        // The board is optional by construction: nothing in core knows
+        // about it, so leaving it out is leaving out a merge.
+        .merge(ciacola_board::router_with_limits(
+            ledger,
+            host,
+            declared.limits,
+        ));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, http).await {

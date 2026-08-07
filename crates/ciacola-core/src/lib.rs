@@ -48,7 +48,6 @@
 //! until house rules became an explicit layer of the system prompt.
 
 pub mod agent;
-pub mod board;
 pub mod exec;
 pub mod health;
 pub mod ledger;
@@ -58,6 +57,7 @@ pub mod plugin;
 pub mod polling;
 pub mod recover;
 pub mod registry;
+pub mod render;
 pub mod roles;
 pub mod server;
 pub mod store;

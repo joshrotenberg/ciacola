@@ -414,10 +414,11 @@ impl Plugin for SchedulePlugin {
                      <td class=\"dim\">{text}</td><td class=\"num\">{every}s</td>\
                      <td class=\"num\">{next}s</td><td class=\"num\">{fires}</td>\
                      <td class=\"num\">{skips}</td></tr>",
-                    id = ciacola_core::board::esc(&s.agent_id),
-                    id6 =
-                        ciacola_core::board::esc(&s.agent_id[s.agent_id.len().saturating_sub(6)..]),
-                    text = ciacola_core::board::esc(&s.text.chars().take(60).collect::<String>()),
+                    id = ciacola_core::render::esc(&s.agent_id),
+                    id6 = ciacola_core::render::esc(
+                        &s.agent_id[s.agent_id.len().saturating_sub(6)..]
+                    ),
+                    text = ciacola_core::render::esc(&s.text.chars().take(60).collect::<String>()),
                     every = s.every_secs,
                     next = (s.next_fire_unix - now).max(0),
                     fires = s.fires,

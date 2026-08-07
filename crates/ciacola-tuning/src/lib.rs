@@ -238,18 +238,18 @@ impl Plugin for TuningPlugin {
                      <td class=\"dim\">{effort}</td><td class=\"num\">{runs}</td>\
                      <td class=\"num\">{failed}</td><td class=\"num\">{median}</td>\
                      <td class=\"num\">{secs}</td><td class=\"num\">{total}</td></tr>",
-                    role = ciacola_core::board::esc(&s.role),
-                    model = ciacola_core::board::esc(&s.model),
-                    effort = ciacola_core::board::esc(&s.effort),
+                    role = ciacola_core::render::esc(&s.role),
+                    model = ciacola_core::render::esc(&s.model),
+                    effort = ciacola_core::render::esc(&s.effort),
                     runs = s.runs,
                     failed = if s.failures > 0 {
                         format!("<span style=\"color:#f85149\">{}</span>", s.failures)
                     } else {
                         "0".into()
                     },
-                    median = ciacola_core::board::usd(s.median_cost_micro_usd),
+                    median = ciacola_core::render::usd(s.median_cost_micro_usd),
                     secs = s.median_secs,
-                    total = ciacola_core::board::usd(s.total_cost_micro_usd),
+                    total = ciacola_core::render::usd(s.total_cost_micro_usd),
                 ));
             }
             html.push_str("</table>");

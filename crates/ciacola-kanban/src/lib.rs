@@ -477,14 +477,14 @@ impl Plugin for KanbanPlugin {
                     html.push_str(&format!(
                         "<div class=\"card\"><b><a href=\"/board/item/{iid}\">{title}</a></b>\
                          <span class=\"dim mono\">{iid}{owner}</span>{note}</div>",
-                        iid = ciacola_core::board::esc(&item.item_id),
-                        title = ciacola_core::board::esc(&item.title),
+                        iid = ciacola_core::render::esc(&item.item_id),
+                        title = ciacola_core::render::esc(&item.title),
                         owner = item
                             .owner
                             .as_deref()
                             .map(|o| format!(
                                 " &middot; {}",
-                                ciacola_core::board::esc(&o[o.len().saturating_sub(6)..])
+                                ciacola_core::render::esc(&o[o.len().saturating_sub(6)..])
                             ))
                             .unwrap_or_default(),
                         note = item
@@ -492,7 +492,7 @@ impl Plugin for KanbanPlugin {
                             .as_deref()
                             .map(|n| format!(
                                 "<span class=\"dim\">{}</span>",
-                                ciacola_core::board::esc(&n.chars().take(160).collect::<String>())
+                                ciacola_core::render::esc(&n.chars().take(160).collect::<String>())
                             ))
                             .unwrap_or_default(),
                     ));
@@ -545,16 +545,17 @@ use axum::extract::{Path, State};
 use axum::response::Html;
 use axum::routing::get;
 
-use ciacola_core::board;
+use ciacola_core::render;
 
 async fn item_page(
     State((items, ledger)): State<(Items, Ledger)>,
     Path(item_id): Path<String>,
 ) -> Html<String> {
     let Ok(Some(item)) = items.get(&item_id).await else {
-        return board::page(
+        return render::page_with(
             "not found",
             "<p>no such item. <a href=\"/board\">back</a></p>",
+            false,
         );
     };
     let events = items.events(&item_id).await.unwrap_or_default();
@@ -578,11 +579,11 @@ async fn item_page(
             agents_html.push_str(&format!(
                 "<tr><td><a href=\"/board/agent/{id}\">{name}</a></td><td>{chip}</td>\
                  <td class=\"num\">{turns}</td><td class=\"num\">{cost}</td></tr>",
-                id = board::esc(&agent.agent_id),
-                name = board::esc(&agent.name),
-                chip = board::chip(&agent.state),
+                id = render::esc(&agent.agent_id),
+                name = render::esc(&agent.name),
+                chip = render::chip(&agent.state),
                 turns = agent.turns,
-                cost = board::usd(agent.cost_micro_usd),
+                cost = render::usd(agent.cost_micro_usd),
             ));
         }
     }
@@ -593,10 +594,10 @@ async fn item_page(
          <p class=\"dim mono\">{id}</p>\
          <p class=\"dim\">attributed cost {cost} across {n} agent(s), plus an \
           unattributed share of the manager's turns</p>",
-        title = board::esc(&item.title),
-        chip = board::chip(&item.lane),
-        id = board::esc(&item.item_id),
-        cost = board::usd(attributed),
+        title = render::esc(&item.title),
+        chip = render::chip(&item.lane),
+        id = render::esc(&item.item_id),
+        cost = render::usd(attributed),
         n = owners.len(),
     );
 
@@ -613,16 +614,16 @@ async fn item_page(
             "<h2>{seq}. {chip} <span class=\"dim\">{owner}</span></h2>\
              <div class=\"msg them\">{note}</div>",
             seq = event.seq,
-            chip = board::chip(&event.lane),
+            chip = render::chip(&event.lane),
             owner = event
                 .owner
                 .as_deref()
                 .map(|o| format!("owner ..{}", &o[o.len().saturating_sub(6)..]))
                 .unwrap_or_default(),
-            note = board::esc(event.note.as_deref().unwrap_or("(no note)")),
+            note = render::esc(event.note.as_deref().unwrap_or("(no note)")),
         ));
     }
-    board::page(&item.title, &body)
+    render::page_with(&item.title, &body, false)
 }
 
 fn item_routes(items: Items, ledger: Ledger) -> Router {

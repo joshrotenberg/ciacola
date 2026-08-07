@@ -267,14 +267,14 @@ impl Plugin for GitPlugin {
                      <td class=\"num\"><span style=\"color:#3fb950\">+{ins}</span> \
                      <span style=\"color:#f85149\">-{del}</span></td>\
                      <td class=\"num\">{dirty}</td><td class=\"dim mono\">{upstream}</td></tr>",
-                    id = ciacola_core::board::esc(&r.agent_id),
-                    name = ciacola_core::board::esc(&r.name),
-                    branch = ciacola_core::board::esc(&r.branch),
-                    head = ciacola_core::board::esc(&r.head),
+                    id = ciacola_core::render::esc(&r.agent_id),
+                    name = ciacola_core::render::esc(&r.name),
+                    branch = ciacola_core::render::esc(&r.branch),
+                    head = ciacola_core::render::esc(&r.head),
                     ins = r.insertions,
                     del = r.deletions,
                     dirty = r.dirty_files,
-                    upstream = ciacola_core::board::esc(&match &r.upstream {
+                    upstream = ciacola_core::render::esc(&match &r.upstream {
                         Some(u) if r.ahead > 0 || r.behind > 0 =>
                             format!("{u} (+{}/-{})", r.ahead, r.behind),
                         Some(u) => u.clone(),

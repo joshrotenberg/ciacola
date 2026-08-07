@@ -255,10 +255,10 @@ impl Plugin for RefsPlugin {
                 html.push_str(&format!(
                     "<tr><td>{name}</td><td class=\"mono dim\">{url}</td>\
                      <td class=\"dim\">{note}</td><td class=\"dim\">{tags}</td></tr>",
-                    name = ciacola_core::board::esc(name),
-                    url = ciacola_core::board::esc(&r.url),
-                    note = ciacola_core::board::esc(r.note.as_deref().unwrap_or("")),
-                    tags = ciacola_core::board::esc(&r.tags.join(", ")),
+                    name = ciacola_core::render::esc(name),
+                    url = ciacola_core::render::esc(&r.url),
+                    note = ciacola_core::render::esc(r.note.as_deref().unwrap_or("")),
+                    tags = ciacola_core::render::esc(&r.tags.join(", ")),
                 ));
             }
             html.push_str("</table>");

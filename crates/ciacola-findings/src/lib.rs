@@ -416,10 +416,10 @@ impl Plugin for FindingsPlugin {
                 html.push_str(&format!(
                     "<tr><td>{kind}</td><td>{subject}</td><td class=\"dim\">{body}</td>\
                      <td class=\"dim mono\">{by}</td></tr>",
-                    kind = ciacola_core::board::esc(&f.kind),
-                    subject = ciacola_core::board::esc(&f.subject),
-                    body = ciacola_core::board::esc(&f.body.chars().take(180).collect::<String>()),
-                    by = ciacola_core::board::esc(
+                    kind = ciacola_core::render::esc(&f.kind),
+                    subject = ciacola_core::render::esc(&f.subject),
+                    body = ciacola_core::render::esc(&f.body.chars().take(180).collect::<String>()),
+                    by = ciacola_core::render::esc(
                         f.author
                             .as_deref()
                             .map(|a| &a[a.len().saturating_sub(6)..])

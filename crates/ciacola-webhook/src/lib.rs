@@ -290,12 +290,13 @@ impl Plugin for WebhookPlugin {
                     "<tr><td class=\"mono\">POST /hook/{path}</td><td>{agent}</td>\
                      <td class=\"num\">{fires}</td><td class=\"num\">{skips}</td>\
                      <td class=\"dim\">{last}</td></tr>",
-                    path = ciacola_core::board::esc(&hook.path),
-                    agent = ciacola_core::board::esc(&hook.agent),
+                    path = ciacola_core::render::esc(&hook.path),
+                    agent = ciacola_core::render::esc(&hook.agent),
                     fires = s.fires,
                     skips = s.skips,
-                    last =
-                        ciacola_core::board::esc(s.last_detail.as_deref().unwrap_or("never fired")),
+                    last = ciacola_core::render::esc(
+                        s.last_detail.as_deref().unwrap_or("never fired")
+                    ),
                 ));
             }
             html.push_str("</table>");
