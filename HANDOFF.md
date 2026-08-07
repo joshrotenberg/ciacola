@@ -166,6 +166,54 @@ calls and phase transitions, recorded as turn events and rendered,
 which answers "is it doing something sensible" without reading
 anything. Blocked upstream in both wrappers today.
 
+**The board, properly.** It is 355 lines of hand-rolled HTML with a
+five-second meta refresh, and it has carried further than it deserves
+to. Two separable questions.
+
+*Making it optional* is easy and consistent: move it to a
+`ciacola-board` crate that takes a `Ledger` and an `Arc<PluginHost>`
+and returns a `Router`, and let the binary merge it or not. The eight
+plugins that contribute sections already import `ciacola_core::board`
+for three helpers (`esc`, `usd`, `chip`), so those helpers stay in core
+and the renderer moves out. Nothing in core needs the board.
+
+*Making it good* is the interesting one, and the toolkit question has a
+clearer answer here than it would for most apps, because of a property
+worth protecting: **the board has no build step.** `cargo run` and it
+is there. Adding `trunk`, `cargo-leptos`, or `npm` is a permanent tax
+on every contributor and every CI run, and it should be paid only for
+something that cannot be had otherwise.
+
+The LiveView instinct is right, and the reason it is right is
+architectural rather than aesthetic: the state is entirely server-side.
+The ledger *is* the state. A client-side framework's core value is
+owning client state, and this board has none worth owning. What it
+needs is live updates and a handful of coarse actions (answer a gate,
+kill a turn, resolve a finding, open a pull request), which is
+precisely the shape htmx serves: the server renders fragments, the
+client swaps them, nothing is built.
+
+So the recommendation is **axum plus htmx plus SSE first**, which keeps
+the no-build-step property and reuses machinery that already exists
+(tower-mcp's HTTP transport is already an SSE server, and notifications
+already flow through it). Reach for Leptos or Dioxus when the board
+grows genuine client state that a server round trip cannot serve:
+client-side filtering of large tables, a dependency graph you can drag,
+optimistic updates. Those are real reasons and none of them apply yet.
+A React or Svelte SPA is the least appropriate of the options here,
+because it buys client state management at the cost of a second
+language, a second toolchain, and a JSON API that duplicates the MCP
+surface.
+
+**One provocation before any of that work happens.** The board is for
+*watching*; the REPL is for *doing*. Making the board interactive may
+be solving the wrong problem, since every action it would grow already
+exists as an MCP tool that mcp-repl can call today. The strongest
+version of this project might be a board that gets much better at
+watching (timelines, per-agent transcripts, spend over time, what is
+stuck and for how long) and stays read-only, with a REPL that gets
+better at doing. Worth deciding deliberately rather than by default.
+
 **Publishing.** Names are free on crates.io. `ciacola-core` is the only
 one with a public API worth stabilising; the plugins are examples as
 much as products.
