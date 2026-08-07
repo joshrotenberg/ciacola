@@ -135,8 +135,9 @@ forbid. House rules are now an explicit layer of the system prompt.
    for". `find wait` lists both, so the client knows about the clash
    and simply has no way to express "the tool". `call wait
    {"agent_id": "...", "seq": 1}` reaches it. Renaming the verb to suit
-   one client is the wrong direction; the fix is upstream, an escape
-   for a tool a built-in shadows.
+   one client is the wrong direction, so this is filed upstream as
+   [mcp-repl#87](https://github.com/joshrotenberg/mcp-repl/issues/87)
+   and nothing here changes.
 8. **Cost is Claude-only.** codex reports tokens and no price at all
    and deliberately refuses to synthesize one, which is why tokens are
    in the ledger beside cost. A second provider will find `cost_usd`
