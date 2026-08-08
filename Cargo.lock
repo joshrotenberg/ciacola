@@ -217,6 +217,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ciacola-agent-claude"
+version = "0.0.1"
+dependencies = [
+ "ciacola-agent",
+ "claude-wrapper",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ciacola-board"
 version = "0.0.1"
 dependencies = [
