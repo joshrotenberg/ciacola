@@ -15,13 +15,14 @@
 //! # The exception, named rather than hidden
 //!
 //! [`Protocol`](AgentError::Protocol), [`Timeout`](AgentError::Timeout),
-//! and [`Cancelled`](AgentError::Cancelled) can all be raised *after*
+//! [`Cancelled`](AgentError::Cancelled), and an unclassified
+//! [`Other`](AgentError::Other) can all be raised *after*
 //! the provider process launched and did paid work: a CLI that drifted
 //! past the wrapper's tested range still burned tokens producing the
 //! output that failed to parse; a run that hit its deadline was working
 //! for the whole twenty minutes we waited; a cancelled run stopped
 //! mid-turn, not before it. Claiming "no spend, no session" for these
-//! three would be exactly the mistake this module exists to avoid
+//! variants would be exactly the mistake this module exists to avoid
 //! elsewhere. Where an adapter can say what it knows about that spend,
 //! it goes on [`PartialTelemetry`] rather than being thrown away for
 //! the sake of a claim that does not hold for them.
@@ -52,6 +53,9 @@ pub struct PartialTelemetry {
     pub cost: Option<Cost>,
     /// Tokens known before the turn stopped, if the adapter has them.
     pub usage: Option<TokenUsage>,
+    /// Measured wall-clock time before the turn stopped. The caller can
+    /// always supply this even when the provider reports no usage.
+    pub elapsed: Option<Duration>,
 }
 
 impl PartialTelemetry {
@@ -65,7 +69,10 @@ impl PartialTelemetry {
     /// True when every field is absent, i.e. this carries no more
     /// information than admitting the gap.
     pub fn is_empty(&self) -> bool {
-        self.resume.is_none() && self.cost.is_none() && self.usage.is_none()
+        self.resume.is_none()
+            && self.cost.is_none()
+            && self.usage.is_none()
+            && self.elapsed.is_none()
     }
 }
 
@@ -109,7 +116,7 @@ pub enum AgentError {
         /// What is known about spend and the conversation, if anything.
         ///
         /// Boxed to keep [`AgentError`] small: it is the `Err` half of
-        /// every turn's `Result`, and three variants carrying this
+        /// every turn's `Result`, and several variants carrying this
         /// inline pushed it past the size where clippy starts
         /// objecting to the cost on the success path.
         partial: Box<PartialTelemetry>,
@@ -127,7 +134,7 @@ pub enum AgentError {
         /// What is known about spend and the conversation, if anything.
         ///
         /// Boxed to keep [`AgentError`] small: it is the `Err` half of
-        /// every turn's `Result`, and three variants carrying this
+        /// every turn's `Result`, and several variants carrying this
         /// inline pushed it past the size where clippy starts
         /// objecting to the cost on the success path.
         partial: Box<PartialTelemetry>,
@@ -145,7 +152,7 @@ pub enum AgentError {
         /// What is known about spend and the conversation, if anything.
         ///
         /// Boxed to keep [`AgentError`] small: it is the `Err` half of
-        /// every turn's `Result`, and three variants carrying this
+        /// every turn's `Result`, and several variants carrying this
         /// inline pushed it past the size where clippy starts
         /// objecting to the cost on the success path.
         partial: Box<PartialTelemetry>,
@@ -176,6 +183,8 @@ pub enum AgentError {
         provider: ProviderKey,
         /// Whatever it said.
         detail: String,
+        /// What is known if this unclassified failure followed launch.
+        partial: Box<PartialTelemetry>,
     },
 }
 
@@ -202,9 +211,10 @@ impl AgentError {
         }
     }
 
-    /// What is known about spend and the conversation, for the three
+    /// What is known about spend and the conversation, for the
     /// variants that can follow real work: [`Protocol`](Self::Protocol),
-    /// [`Timeout`](Self::Timeout), and [`Cancelled`](Self::Cancelled).
+    /// [`Timeout`](Self::Timeout), [`Cancelled`](Self::Cancelled), and
+    /// [`Other`](Self::Other).
     /// Every other variant returns `None` because none of them can
     /// happen after the provider has spent anything, which is the
     /// actual distinction this method draws: not "does this variant
@@ -214,7 +224,8 @@ impl AgentError {
         match self {
             AgentError::Protocol { partial, .. }
             | AgentError::Timeout { partial, .. }
-            | AgentError::Cancelled { partial, .. } => Some(partial.as_ref()),
+            | AgentError::Cancelled { partial, .. }
+            | AgentError::Other { partial, .. } => Some(partial.as_ref()),
             _ => None,
         }
     }
@@ -262,7 +273,9 @@ impl fmt::Display for AgentError {
                 "provider '{provider}' cannot honour {constraint:?}: {detail}"
             ),
             AgentError::Io { detail } => write!(f, "{detail}"),
-            AgentError::Other { provider, detail } => {
+            AgentError::Other {
+                provider, detail, ..
+            } => {
                 write!(f, "provider '{provider}': {detail}")
             }
         }
@@ -320,6 +333,7 @@ mod tests {
                     output: 300,
                     cached_input: 0,
                 }),
+                elapsed: Some(Duration::from_secs(1_200)),
             }
             .into(),
         };
@@ -330,6 +344,7 @@ mod tests {
             Some("sess-mid-run")
         );
         assert_eq!(partial.cost, Some(Cost::Reported { micro_usd: 900_000 }));
+        assert_eq!(partial.elapsed, Some(Duration::from_secs(1_200)));
     }
 
     /// A launch failure happens before the provider ever starts, so it
@@ -342,5 +357,23 @@ mod tests {
             detail: "binary not found".into(),
         };
         assert!(e.partial().is_none());
+    }
+
+    /// The fallback variant must not reintroduce telemetry loss merely
+    /// because an adapter could not classify a post-launch failure.
+    #[test]
+    fn an_unclassified_post_launch_failure_keeps_elapsed_time() {
+        let e = AgentError::Other {
+            provider: ProviderKey::claude(),
+            detail: "unexpected wrapper failure".into(),
+            partial: PartialTelemetry {
+                elapsed: Some(Duration::from_secs(30)),
+                ..PartialTelemetry::none()
+            }
+            .into(),
+        };
+        let partial = e.partial().expect("post-launch telemetry");
+        assert_eq!(partial.elapsed, Some(Duration::from_secs(30)));
+        assert!(!partial.is_empty());
     }
 }

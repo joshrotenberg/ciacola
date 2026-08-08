@@ -161,6 +161,10 @@ pub enum Sandbox {
     /// nobody reviewed first.
     #[default]
     Unconstrained,
+    /// No filesystem writes; the provider may still read the workspace.
+    /// This maps directly to Codex's `read-only` sandbox and is useful
+    /// for review, triage, and planning agents.
+    ReadOnly,
     /// Filesystem writes confined to [`TurnIntent::working_dir`]; the
     /// network stays reachable.
     WorkspaceWrite,
@@ -174,6 +178,7 @@ impl Sandbox {
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "unconstrained" | "none" | "false" => Some(Sandbox::Unconstrained),
+            "read-only" | "read_only" => Some(Sandbox::ReadOnly),
             "workspace-write" | "workspace_write" => Some(Sandbox::WorkspaceWrite),
             "workspace-write-no-network" | "workspace_write_no_network" => {
                 Some(Sandbox::WorkspaceWriteNoNetwork)
@@ -390,9 +395,11 @@ mod tests {
             Some(Sandbox::WorkspaceWriteNoNetwork)
         );
         assert_eq!(Sandbox::parse("none"), Some(Sandbox::Unconstrained));
+        assert_eq!(Sandbox::parse("read-only"), Some(Sandbox::ReadOnly));
         assert_eq!(Sandbox::parse("bogus"), None);
 
         assert!(!Sandbox::Unconstrained.is_constrained());
+        assert!(Sandbox::ReadOnly.is_constrained());
         assert!(Sandbox::WorkspaceWrite.is_constrained());
         assert!(Sandbox::WorkspaceWriteNoNetwork.is_constrained());
     }

@@ -40,7 +40,7 @@
 //! hold a session id. Whatever an adapter still knows in that case goes
 //! on [`error::PartialTelemetry`] rather than being thrown away for the
 //! sake of a blanket "Err means nothing happened" claim that does not
-//! hold for these three.
+//! hold for those post-launch failures.
 //!
 //! **Cost and token usage are not shared `Option` fields.** Claude
 //! reports money; codex reports tokens and deliberately refuses to

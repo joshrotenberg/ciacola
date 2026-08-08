@@ -107,8 +107,8 @@ pub trait Provider: Send + Sync {
     /// `Err` means the turn produced no usable result. For most
     /// [`AgentError`] variants that also means nothing was spent and no
     /// conversation was opened, but not for all of them: a cancelled,
-    /// timed-out, or unparseable run may have done real paid work
-    /// first. An adapter returning one of those three puts whatever it
+    /// timed-out, unparseable, or otherwise unclassified run may have done real paid work
+    /// first. An adapter returning one of those variants puts whatever it
     /// still knows on
     /// [`PartialTelemetry`](crate::PartialTelemetry) rather than
     /// discarding it.
@@ -204,20 +204,12 @@ impl ProviderRegistry {
         Ok(self)
     }
 
-    /// Builder-shaped [`register`](Self::register), for `main`.
-    ///
-    /// Panics on a duplicate key rather than returning a `Result`,
-    /// because this is boot-time wiring: a binary that links two
-    /// adapters under the same key has a bug in the list it builds, not
-    /// a recoverable runtime condition, and failing closed here means
-    /// the process never starts serving turns on the wrong adapter.
-    /// Code that wants to handle the collision (tests, an operator
-    /// shim) calls [`register`](Self::register) directly instead.
-    #[must_use]
-    pub fn with(mut self, provider: Arc<dyn Provider>) -> Self {
-        self.register(provider)
-            .expect("duplicate provider key registered at boot");
-        self
+    /// Builder-shaped [`register`](Self::register), for boot wiring.
+    /// A duplicate remains a normal configuration error so the binary
+    /// can report it cleanly instead of panicking during startup.
+    pub fn with(mut self, provider: Arc<dyn Provider>) -> Result<Self, DuplicateProvider> {
+        self.register(provider)?;
+        Ok(self)
     }
 
     /// The adapter for this key, or an error that names what is
@@ -300,16 +292,17 @@ mod tests {
         assert_eq!(registry.keys(), vec!["claude".to_string()]);
     }
 
-    /// `with` is the boot-time builder; a collision there is a bug in
-    /// the list the binary assembles, not a runtime condition to route
-    /// around, so it fails closed by panicking rather than starting a
-    /// server with an ambiguous adapter.
+    /// The boot-time builder also fails closed, but returns a useful
+    /// configuration error instead of panicking.
     #[test]
-    #[should_panic(expected = "duplicate provider key")]
-    fn with_panics_on_a_duplicate_key_at_boot() {
-        let _ = ProviderRegistry::new()
+    fn with_refuses_a_duplicate_key_at_boot() {
+        let registry = ProviderRegistry::new()
             .with(Arc::new(Stub("claude")))
-            .with(Arc::new(Stub("claude")));
+            .expect("first registration");
+        let err = registry
+            .with(Arc::new(Stub("claude")))
+            .expect_err("duplicate registration");
+        assert_eq!(err.key, "claude");
     }
 
     /// The compatibility property the live ledger depends on: a

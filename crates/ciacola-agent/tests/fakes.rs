@@ -114,6 +114,7 @@ impl Provider for Fake {
                             output: 300,
                             cached_input: 0,
                         }),
+                        elapsed: Some(Duration::from_secs(1_200)),
                     }
                     .into(),
                 }),
@@ -194,7 +195,9 @@ fn intent() -> TurnIntent {
 /// says what it has when it cannot.
 #[test]
 fn the_registry_resolves_by_name_and_names_what_it_has() {
-    let registry = ProviderRegistry::new().with(Arc::new(Fake::new(Script::Succeed)));
+    let registry = ProviderRegistry::new()
+        .with(Arc::new(Fake::new(Script::Succeed)))
+        .expect("unique provider key");
     assert!(registry.get(&ProviderKey::new("fake")).is_ok());
     let Err(err) = registry.get(&ProviderKey::claude()) else {
         panic!("nothing is registered as claude here");
