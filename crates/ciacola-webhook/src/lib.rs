@@ -318,3 +318,263 @@ impl Plugin for WebhookPlugin {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use sqlx::SqlitePool;
+
+    use ciacola_core::agent::AgentDef;
+    use ciacola_core::exec::TurnExecutor;
+    use ciacola_core::ledger::Ledger;
+    use ciacola_core::notify::Notifier;
+
+    use super::*;
+
+    /// Records what it was handed and does nothing else, the same
+    /// CI-safe stand-in `ciacola-schedule` uses: nothing here shells
+    /// out to a provider, so a submitted turn stays `queued` forever,
+    /// which is exactly what "the agent is busy" means to the
+    /// admission guard in `Ledger::enqueue_turn`.
+    #[derive(Default)]
+    struct RecordingExecutor {
+        submitted: Mutex<Vec<(String, i64)>>,
+    }
+
+    impl TurnExecutor for RecordingExecutor {
+        fn submit(&self, agent_id: String, seq: i64) {
+            self.submitted.lock().unwrap().push((agent_id, seq));
+        }
+        fn kill(&self, _agent_id: &str, _seq: i64) -> bool {
+            false
+        }
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+    }
+
+    /// `plugin_kv` is core's table, applied by `PluginHost::setup`
+    /// before any plugin runs. Duplicated here rather than dragged in
+    /// through a full `PluginContext`, the same shortcut `ciacola-refs`
+    /// takes for its own `Store`-backed tests.
+    async fn kv_pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.expect("pool");
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS plugin_kv (
+                 plugin TEXT NOT NULL,
+                 key TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 updated_unix INTEGER NOT NULL,
+                 PRIMARY KEY (plugin, key));",
+        )
+        .execute(&pool)
+        .await
+        .expect("create plugin_kv");
+        pool
+    }
+
+    async fn setup(hooks: Vec<Hook>) -> (HookState, Arc<RecordingExecutor>, Ledger, SqlitePool) {
+        let pool = kv_pool().await;
+        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+        let exec = Arc::new(RecordingExecutor::default());
+        let ctx = PluginContext {
+            pool: pool.clone(),
+            ledger: ledger.clone(),
+            exec: exec.clone() as Arc<dyn TurnExecutor>,
+            notify: Notifier(tx),
+            db_path: String::new(),
+            loopback_mcp_config: String::new(),
+            plugin_config: toml::Value::Table(toml::map::Map::new()),
+            limits: Default::default(),
+            runtime: Default::default(),
+        };
+        let state = HookState {
+            ctx,
+            hooks: Arc::new(hooks),
+            store: Store::new(pool.clone(), "webhook"),
+        };
+        (state, exec, ledger, pool)
+    }
+
+    async fn new_agent(ledger: &Ledger, name: &str) -> String {
+        ledger
+            .create_agent(&AgentDef::new(name, "sys"), None)
+            .await
+            .expect("create agent")
+    }
+
+    async fn turn_count(pool: &SqlitePool) -> i64 {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM turns")
+            .fetch_one(pool)
+            .await
+            .expect("count");
+        count
+    }
+
+    fn hook(path: &str, agent: &str) -> Hook {
+        Hook {
+            path: path.into(),
+            agent: agent.into(),
+            text: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_path_fires_only_its_named_agent() {
+        let (state, exec, ledger, pool) = setup(vec![hook("issue", "a"), hook("other", "b")]).await;
+        let a = new_agent(&ledger, "a").await;
+        let _b = new_agent(&ledger, "b").await;
+
+        let (status, body) = receive(State(state), Path("issue".into()), "hi".into()).await;
+
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(
+            exec.submitted.lock().unwrap().as_slice(),
+            [(a.clone(), 1)],
+            "a hit on one configured path must dispatch exactly the agent it names, and no other"
+        );
+        assert_eq!(
+            turn_count(&pool).await,
+            1,
+            "one hit must produce exactly one turn total"
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_path_produces_nothing() {
+        let (state, exec, _ledger, pool) = setup(vec![hook("issue", "a")]).await;
+
+        let (status, body) = receive(State(state), Path("nope".into()), "hi".into()).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(
+            exec.submitted.lock().unwrap().is_empty(),
+            "an unconfigured path must never reach the executor"
+        );
+        assert_eq!(
+            turn_count(&pool).await,
+            0,
+            "an unconfigured path must produce nothing: not an error turn, not a default agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_target_agent_produces_nothing() {
+        let (state, exec, ledger, pool) = setup(vec![hook("issue", "a")]).await;
+        let a = new_agent(&ledger, "a").await;
+        assert!(ledger.retire_agent(&a).await.expect("retire"));
+
+        let (status, _body) = receive(State(state), Path("issue".into()), "hi".into()).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(exec.submitted.lock().unwrap().is_empty());
+        assert_eq!(
+            turn_count(&pool).await,
+            0,
+            "a hook whose target retired since config was read must not be bypassed into a turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_target_agent_is_skipped_through_the_same_admission_path() {
+        let (state, exec, ledger, pool) = setup(vec![hook("issue", "a")]).await;
+        let a = new_agent(&ledger, "a").await;
+        ledger
+            .enqueue_turn(&a, "already running")
+            .await
+            .expect("enqueue");
+
+        let (status, _body) = receive(State(state), Path("issue".into()), "hi".into()).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            exec.submitted.lock().unwrap().is_empty(),
+            "a busy agent must be skipped, not queued a second time"
+        );
+        assert_eq!(
+            turn_count(&pool).await,
+            1,
+            "the hook must go through the same admission as any other submission path, not bypass it"
+        );
+    }
+
+    #[tokio::test]
+    async fn over_budget_is_refused_through_the_same_admission_path() {
+        let (mut state, exec, ledger, pool) = setup(vec![hook("issue", "a")]).await;
+        state.ctx.limits.daily_stop_usd = Some(0.0);
+        let _a = new_agent(&ledger, "a").await;
+
+        let (status, body) = receive(State(state), Path("issue".into()), "hi".into()).await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert!(exec.submitted.lock().unwrap().is_empty());
+        assert_eq!(
+            turn_count(&pool).await,
+            0,
+            "the daily spend limit must be enforced on the webhook path exactly like any other, \
+             per plugin::submit being the one convergence point"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_body_and_no_configured_text_is_rejected_without_a_turn() {
+        let (state, exec, ledger, pool) = setup(vec![hook("issue", "a")]).await;
+        let _a = new_agent(&ledger, "a").await;
+
+        let (status, body) = receive(State(state), Path("issue".into()), "   \n  ".into()).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(exec.submitted.lock().unwrap().is_empty());
+        assert_eq!(turn_count(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn request_body_round_trips_into_the_prompt() {
+        let (state, _exec, ledger, _pool) = setup(vec![hook("issue", "a")]).await;
+        let a = new_agent(&ledger, "a").await;
+
+        let (status, body) = receive(
+            State(state),
+            Path("issue".into()),
+            "  fix the thing  \n".into(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let turn = ledger
+            .get_turn(&a, 1)
+            .await
+            .expect("get_turn")
+            .expect("turn exists");
+        assert_eq!(
+            turn.prompt, "fix the thing",
+            "the body must round-trip, trimmed, into the prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_text_overrides_the_request_body() {
+        let (state, _exec, ledger, _pool) = setup(vec![Hook {
+            path: "issue".into(),
+            agent: "a".into(),
+            text: Some("fixed prompt".into()),
+        }])
+        .await;
+        let a = new_agent(&ledger, "a").await;
+
+        let (status, _body) =
+            receive(State(state), Path("issue".into()), "ignored body".into()).await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let turn = ledger
+            .get_turn(&a, 1)
+            .await
+            .expect("get_turn")
+            .expect("turn exists");
+        assert_eq!(turn.prompt, "fixed prompt");
+    }
+}
