@@ -371,6 +371,113 @@ pub fn resources(findings: Findings) -> Vec<Resource> {
     vec![all]
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn findings() -> Findings {
+        let pool = SqlitePool::connect("sqlite::memory:").await.expect("pool");
+        Findings::setup(pool).await.expect("setup")
+    }
+
+    #[tokio::test]
+    async fn prune_never_deletes_an_open_finding() {
+        let f = findings().await;
+        f.file("bug", "s", "b", None).await.expect("file");
+
+        // A cutoff far in the future would sweep anything resolved, but
+        // this finding is still open: prune must leave it alone.
+        let deleted = f.prune(now_unix() + 1_000_000).await.expect("prune");
+        assert_eq!(deleted, 0);
+        assert_eq!(f.list(Some("open")).await.expect("list").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_a_resolved_finding_newer_than_the_cutoff() {
+        let f = findings().await;
+        let id = f.file("bug", "s", "b", None).await.expect("file");
+        f.resolve(&id, "dismissed", None).await.expect("resolve");
+
+        let deleted = f.prune(now_unix() - 1_000_000).await.expect("prune");
+        assert_eq!(deleted, 0);
+        assert_eq!(f.list(None).await.expect("list").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_a_resolved_finding_older_than_the_cutoff() {
+        let f = findings().await;
+        let id = f.file("bug", "s", "b", None).await.expect("file");
+        f.resolve(&id, "dismissed", None).await.expect("resolve");
+
+        let deleted = f.prune(now_unix() + 1_000_000).await.expect("prune");
+        assert_eq!(deleted, 1);
+        assert!(f.list(None).await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_then_list_round_trips_the_finding() {
+        let f = findings().await;
+        let id = f
+            .file("bug", "subject", "body", Some("agent-1"))
+            .await
+            .expect("file");
+
+        let all = f.list(None).await.expect("list");
+        assert_eq!(all.len(), 1);
+        let got = &all[0];
+        assert_eq!(got.finding_id, id);
+        assert_eq!(got.kind, "bug");
+        assert_eq!(got.subject, "subject");
+        assert_eq!(got.body, "body");
+        assert_eq!(got.author.as_deref(), Some("agent-1"));
+        assert_eq!(got.status, "open");
+        assert_eq!(got.resolution, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_sets_status_and_resolution_and_leaves_the_open_listing() {
+        let f = findings().await;
+        let id = f.file("suggestion", "s", "b", None).await.expect("file");
+        assert!(
+            f.resolve(&id, "applied", Some("fixed in #1"))
+                .await
+                .expect("resolve")
+        );
+
+        let open = f.list(Some("open")).await.expect("list open");
+        assert!(
+            open.is_empty(),
+            "a resolved finding must not appear in an open-only listing"
+        );
+
+        let all = f.list(None).await.expect("list all");
+        let got = all.iter().find(|r| r.finding_id == id).expect("present");
+        assert_eq!(got.status, "applied");
+        assert_eq!(got.resolution.as_deref(), Some("fixed in #1"));
+    }
+
+    #[tokio::test]
+    async fn resolve_is_a_noop_once_a_finding_is_no_longer_open() {
+        let f = findings().await;
+        let id = f.file("bug", "s", "b", None).await.expect("file");
+        assert!(f.resolve(&id, "applied", None).await.expect("first"));
+        assert!(!f.resolve(&id, "dismissed", None).await.expect("second"));
+    }
+
+    #[test]
+    fn unknown_kind_and_status_are_schema_errors() {
+        serde_json::from_value::<FileFindingArgs>(json!({
+            "kind": "nonsense",
+            "subject": "s",
+            "body": "b",
+        }))
+        .expect_err("unknown kind must not deserialize");
+
+        serde_json::from_value::<FindingsArgs>(json!({ "status": "nonsense" }))
+            .expect_err("unknown status must not deserialize");
+    }
+}
+
 // --- plugin ---
 
 use ciacola_core::plugin::{BoxFut, Migration, Plugin, PluginContext, Section, Surface};
