@@ -96,16 +96,39 @@ pub async fn recover(
         if !searched {
             report.orphans_unverified += 1;
         }
+        // Assigned at creation, so this is normally true. It is false
+        // for agents that predate assignment and never completed a turn.
+        let resumable = ledger
+            .get_agent(&turn.agent_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|a| a.session.is_some());
         ledger
             .fail_turn(
                 &turn.agent_id,
                 turn.seq,
                 "failed",
-                if searched {
-                    "orphaned by server crash; conversation intact, send again"
-                } else {
-                    "orphaned by server crash; provider process could NOT be \
-                     verified dead, check by hand; conversation intact"
+                // "conversation intact" used to be asserted rather
+                // than known, and was wrong in exactly the case it was
+                // written for: the session id was recorded only at turn
+                // end, so a crash lost it and "send again" started over.
+                // Ids are assigned before the turn runs now, so the
+                // claim is true when there is one and this says so
+                // either way rather than guessing.
+                &match (searched, resumable) {
+                    (true, true) => {
+                        "orphaned by server crash; session kept, send again to resume".to_string()
+                    }
+                    (true, false) => "orphaned by server crash; no session recorded, \
+                                      send again to start over"
+                        .to_string(),
+                    (false, true) => "orphaned by server crash; provider process could NOT be \
+                                      verified dead, check by hand; session kept"
+                        .to_string(),
+                    (false, false) => "orphaned by server crash; provider process could NOT be \
+                                       verified dead, check by hand; no session recorded"
+                        .to_string(),
                 },
                 0,
                 None,

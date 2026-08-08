@@ -321,6 +321,10 @@ pub fn compose_system_prompt(def: &AgentDef) -> String {
 /// One exchange with the provider: say `text` to the conversation
 /// identified by `session` (or start one under `def`'s system prompt).
 ///
+/// `started` is whether that session has been opened at the provider
+/// yet. An id is assigned before the first turn runs, so its presence
+/// says nothing about whether a conversation exists behind it.
+///
 /// Pure in the sense that matters: it mutates nothing of ours. Every
 /// caller decides for itself where the outcome is recorded, which is
 /// what lets the same function serve the in-memory `prompt`, the
@@ -339,6 +343,7 @@ pub fn compose_system_prompt(def: &AgentDef) -> String {
 pub async fn run_exchange(
     def: &AgentDef,
     session: Option<&str>,
+    started: bool,
     text: &str,
 ) -> Result<Exchange, FlatError> {
     let mut builder = Claude::builder();
@@ -362,11 +367,18 @@ pub async fn run_exchange(
     }
     let claude = builder.build()?;
 
-    let mut command = match session {
+    let mut command = match (session, started) {
         // The session carries the system prompt and everything said so
         // far; the resumed prompt is just the next thing we say.
-        Some(session) => QueryCommand::new(text).resume(session),
-        None => QueryCommand::new(text).system_prompt(compose_system_prompt(def)),
+        (Some(session), true) => QueryCommand::new(text).resume(session),
+        // Assigned but not yet opened: name it, and send the system
+        // prompt that the session will carry from here on.
+        (Some(session), false) => QueryCommand::new(text)
+            .session_id(session)
+            .system_prompt(compose_system_prompt(def)),
+        // Agents created before ids were assigned have none. They keep
+        // the old behaviour and pick one up from the provider.
+        (None, _) => QueryCommand::new(text).system_prompt(compose_system_prompt(def)),
     };
     if let Some(model) = &def.model {
         command = command.model(model);
@@ -449,7 +461,8 @@ pub async fn run_exchange(
 /// conversation if not. On success the turn is recorded on the agent and
 /// returned.
 pub async fn prompt<'a>(agent: &'a mut Agent, text: &str) -> Result<&'a Turn, FlatError> {
-    let exchange = run_exchange(&agent.def, agent.session.as_deref(), text).await?;
+    let started = agent.session.is_some();
+    let exchange = run_exchange(&agent.def, agent.session.as_deref(), started, text).await?;
     if let Some(error) = exchange.error {
         return Err(error.into());
     }
