@@ -17,7 +17,7 @@ use tower_mcp::{CallToolResult, LogLevel, McpRouter, ToolBuilder};
 
 use crate::agent::AgentDef;
 use crate::exec::TurnExecutor;
-use crate::identity::AgentIdentity;
+use crate::identity::{AgentIdentity, grant_child_tools};
 use crate::ledger::{AgentRow, Ledger, TurnRow};
 use crate::notify::Notifier;
 
@@ -262,34 +262,21 @@ fn spawn_tool(ledger: Ledger, max_depth: i64, operator_surface: bool) -> tower_m
                     // inherits is decided by this server, or handing an
                     // agent the operator surface would be one guessable
                     // path away.
-                    let mut denied: Vec<String> = Vec::new();
-                    match (&caller, args.allowed_tools) {
-                        (Some(parent_id), Some(requested)) => {
-                            let parent = match ledger.get_agent(parent_id).await {
-                                Ok(Some(parent)) => parent,
-                                Ok(None) => {
-                                    return Ok(CallToolResult::error(format!(
-                                        "caller '{parent_id}' not found"
-                                    )));
-                                }
-                                Err(e) => return Ok(CallToolResult::error(e.to_string())),
-                            };
-                            let (granted, refused): (Vec<String>, Vec<String>) = requested
-                                .into_iter()
-                                .partition(|t| parent.def.allowed_tools.contains(t));
-                            denied = refused;
-                            def = def.allowed_tools(granted);
+                    let mut denied = Vec::new();
+                    if let Some(requested) = args.allowed_tools {
+                        match grant_child_tools(&ledger, caller.as_deref(), requested).await {
+                            Ok(grant) => {
+                                denied = grant.denied;
+                                def = def.allowed_tools(grant.granted);
+                            }
+                            Err(e) => return Ok(CallToolResult::error(e.to_string())),
                         }
-                        (None, Some(requested)) => {
-                            def = def.allowed_tools(requested);
-                        }
-                        (_, None) => {}
                     }
                     match (&caller, args.mcp_config) {
                         (Some(_), Some(_)) => {
                             return Ok(CallToolResult::error(
                                 "an agent does not choose its child's mcp_config; \
-                                 the child gets this server's loopback"
+                                 use a server-configured role when the child needs loopback tools"
                                     .to_string(),
                             ));
                         }
@@ -837,5 +824,85 @@ mod identity_tests {
             "must refuse: {}",
             rendered(&out)
         );
+    }
+
+    /// A role is another creation path, not an exemption from the
+    /// capability ceiling. Refuse rather than silently trim it because a
+    /// role's prompt is written against its complete provisioned bundle.
+    #[tokio::test]
+    async fn a_role_cannot_out_reach_its_authenticated_parent() {
+        let l = ledger().await;
+        let parent = l
+            .create_agent(&AgentDef::new("p", "s").allowed_tools(["Read"]), None)
+            .await
+            .expect("parent");
+        let role = crate::roles::Role {
+            name: "writer".into(),
+            description: "d".into(),
+            model: None,
+            effort: None,
+            hermetic: None,
+            working_dir: None,
+            allowed_tools: vec!["Read".into(), "Edit".into()],
+            max_turns: None,
+            rotate_after_turns: None,
+            loopback: false,
+            surface: None,
+            arguments: Vec::new(),
+            system_prompt: "s".into(),
+        };
+        let roles = crate::roles::Roles::new(vec![role], "agent.json");
+        let spawn_role = crate::roles::tools_with_depth(roles, l.clone(), 3, false)
+            .into_iter()
+            .find(|t| t.definition().name == "spawn_role")
+            .expect("spawn_role");
+        let out = spawn_role
+            .call_with_context(
+                ctx_as(Some(&parent)),
+                serde_json::json!({"role": "writer", "arguments": {}}),
+            )
+            .await;
+        assert!(
+            rendered(&out).contains("needs tools its parent does not hold: Edit"),
+            "must refuse: {}",
+            rendered(&out)
+        );
+        assert_eq!(l.list_agents().await.expect("list").len(), 1);
+    }
+
+    /// Missing identity on the agent mount is not operator authority. The
+    /// known anonymous-operator gap belongs to the operator mount alone.
+    #[tokio::test]
+    async fn an_anonymous_agent_surface_caller_cannot_spawn_an_operator_role() {
+        let l = ledger().await;
+        let role = crate::roles::Role {
+            name: "boss".into(),
+            description: "d".into(),
+            model: None,
+            effort: None,
+            hermetic: None,
+            working_dir: None,
+            allowed_tools: Vec::new(),
+            max_turns: None,
+            rotate_after_turns: None,
+            loopback: true,
+            surface: Some("operator".into()),
+            arguments: Vec::new(),
+            system_prompt: "s".into(),
+        };
+        let roles = crate::roles::Roles::new(vec![role], "agent.json")
+            .with_operator_mcp_config("operator.json");
+        let spawn_role = crate::roles::tools_with_depth(roles, l.clone(), 3, false)
+            .into_iter()
+            .find(|t| t.definition().name == "spawn_role")
+            .expect("spawn_role");
+        let out = spawn_role
+            .call_with_context(
+                ctx_as(None),
+                serde_json::json!({"role": "boss", "arguments": {}}),
+            )
+            .await;
+        assert!(rendered(&out).contains("may not spawn it"));
+        assert!(l.list_agents().await.expect("list").is_empty());
     }
 }

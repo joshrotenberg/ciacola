@@ -327,6 +327,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "toml",
  "tower-mcp",
  "tracing",
  "ulid",

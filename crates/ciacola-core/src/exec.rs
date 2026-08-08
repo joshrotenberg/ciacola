@@ -168,7 +168,7 @@ fn rotation_preamble(name: &str, turns: i64) -> String {
     )
 }
 
-/// The agent's MCP config, with its token in every server's headers.
+/// The agent's MCP config, with its token on ciacola's own server entry.
 ///
 /// The base file names the surface (agent or operator mount) and is
 /// shared; the token is per agent and secret; the file the provider
@@ -189,7 +189,7 @@ fn token_scoped_mcp_config(
     let Some(servers) = config.get_mut("mcpServers").and_then(|s| s.as_object_mut()) else {
         return Err(format!("mcp config {base_path}: no mcpServers object").into());
     };
-    for (_, server) in servers.iter_mut() {
+    if let Some(server) = servers.get_mut("ciacola") {
         let headers = server
             .as_object_mut()
             .ok_or_else(|| format!("mcp config {base_path}: server entry is not an object"))?
@@ -397,7 +397,7 @@ mod config_injection_tests {
     /// The base names the surface and is shared; the token is secret
     /// and per agent; the provider must read a file carrying both.
     #[test]
-    fn the_token_landss_in_every_servers_headers() {
+    fn the_token_lands_only_in_ciacolas_headers() {
         let dir = std::env::temp_dir();
         let base = dir.join(format!("ciacola-test-base-{}.json", std::process::id()));
         std::fs::write(
@@ -416,13 +416,16 @@ mod config_injection_tests {
         std::fs::remove_file(&base).ok();
         std::fs::remove_file(&path).ok();
 
-        for name in ["ciacola", "other"] {
-            assert_eq!(
-                out["mcpServers"][name]["headers"][crate::identity::TOKEN_HEADER],
-                serde_json::json!("sekrit"),
-                "server {name} must carry the token"
-            );
-        }
+        assert_eq!(
+            out["mcpServers"]["ciacola"]["headers"][crate::identity::TOKEN_HEADER],
+            serde_json::json!("sekrit"),
+            "the loopback server must carry the token"
+        );
+        assert_eq!(
+            out["mcpServers"]["other"]["headers"][crate::identity::TOKEN_HEADER],
+            serde_json::Value::Null,
+            "an unrelated server must never receive ciacola's bearer secret"
+        );
         assert_eq!(
             out["mcpServers"]["other"]["headers"]["keep"],
             serde_json::json!("me"),

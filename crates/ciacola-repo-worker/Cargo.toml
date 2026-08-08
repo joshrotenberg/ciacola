@@ -19,3 +19,6 @@ tower-mcp = { workspace = true }
 tracing = { workspace = true }
 git-spawn = { workspace = true }
 ulid = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }

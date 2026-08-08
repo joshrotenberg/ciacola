@@ -370,7 +370,9 @@ pub fn tools_with_depth(
                     // letting any authenticated caller instantiate a
                     // role that carries it would make every agent one
                     // spawn away from kill and open_pr.
-                    if caller.is_some() && role.surface.as_deref() == Some("operator") {
+                    if role.surface.as_deref() == Some("operator")
+                        && (caller.is_some() || !operator_surface)
+                    {
                         return Ok(CallToolResult::error(format!(
                             "role '{}' carries the operator surface, and agents may \
                              not spawn it; ask the operator",
@@ -386,6 +388,23 @@ pub fn tools_with_depth(
                         return Ok(CallToolResult::error(format!(
                             "role '{}' needs arguments {missing:?}",
                             role.name
+                        )));
+                    }
+                    let grant = match crate::identity::grant_child_tools(
+                        &ledger,
+                        caller.as_deref(),
+                        role.allowed_tools.clone(),
+                    )
+                    .await
+                    {
+                        Ok(grant) => grant,
+                        Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                    };
+                    if !grant.denied.is_empty() {
+                        return Ok(CallToolResult::error(format!(
+                            "role '{}' needs tools its parent does not hold: {}",
+                            role.name,
+                            grant.denied.join(", ")
                         )));
                     }
                     if let Some(reason) =
@@ -410,7 +429,11 @@ pub fn tools_with_depth(
                             // fill it in now that one exists.
                             def.system_prompt =
                                 def.system_prompt.replace("{{agent_id}}", &agent_id);
-                            let _ = ledger.update_agent_def(&agent_id, &def).await;
+                            if let Err(e) = ledger.update_agent_def(&agent_id, &def).await {
+                                return Ok(CallToolResult::error(format!(
+                                    "created agent '{agent_id}' but could not finish its definition: {e}"
+                                )));
+                            }
                             Ok(CallToolResult::json(json!({
                                 "agent_id": agent_id,
                                 "role": role.name,
@@ -513,7 +536,11 @@ impl Plugin for RolesPlugin {
 
     fn setup<'a>(&'a mut self, ctx: &'a PluginContext) -> BoxFut<'a, Result<(), FlatError>> {
         Box::pin(async move {
-            let mut roles = Roles::new(self.declared.clone(), ctx.loopback_mcp_config.clone());
+            let mut roles = Roles::with_runtime(
+                self.declared.clone(),
+                ctx.loopback_mcp_config.clone(),
+                ctx.runtime.clone(),
+            );
             if !ctx.operator_mcp_config.is_empty() {
                 roles = roles.with_operator_mcp_config(ctx.operator_mcp_config.clone());
             }
