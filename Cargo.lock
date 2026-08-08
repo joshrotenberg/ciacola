@@ -200,6 +200,7 @@ dependencies = [
  "serde",
  "sqlx",
  "tokio",
+ "tokio-util",
  "toml",
  "tower-mcp",
  "tracing",
@@ -218,6 +219,9 @@ dependencies = [
  "sqlx",
  "tokio",
  "tokio-stream",
+ "tokio-util",
+ "toml",
+ "tower-mcp",
  "tracing",
 ]
 

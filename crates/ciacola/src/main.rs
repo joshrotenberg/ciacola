@@ -22,6 +22,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
+
 use ciacola_core::health::{
     Health, operator_tools as health_operator_tools, resources as health_resources,
     tools as health_tools,
@@ -236,6 +238,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         agent_router = agent_router.resource(resource);
     }
 
+    // Shared with the drain below, so the HTTP side and the turn
+    // executor wind down on the same signal: a request in flight when
+    // the server stops finishes rather than getting cut, and an agent
+    // mid-call against the loopback `/mcp` sees a response rather than
+    // a connection error.
+    let shutdown = CancellationToken::new();
+
     let http = HttpTransport::new(agent_router)
         .into_router_at("/mcp")
         // The board is optional by construction: nothing in core knows
@@ -244,10 +253,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ledger,
             host,
             declared.limits,
+            shutdown.clone(),
         ));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, http).await {
+    let http_shutdown = shutdown.clone();
+    let http_handle = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, http)
+            .with_graceful_shutdown(async move { http_shutdown.cancelled().await })
+            .await
+        {
             eprintln!("[ciacola] http: {e}");
         }
     });
@@ -262,8 +276,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         result = transport.run() => { result?; }
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\n[ciacola] draining, in-flight turns finish (Ctrl-C again to abandon them)");
+            // Same signal, so the HTTP side and the executor wind down
+            // together: this stops the axum server from accepting new
+            // connections and lets `/board/events` end its stream, so
+            // graceful shutdown does not itself hang on a long-lived
+            // response.
+            shutdown.cancel();
             tokio::select! {
-                left = drain_exec.drain(Duration::from_secs(600)) => {
+                left = async {
+                    let (left, _) = tokio::join!(
+                        drain_exec.drain(Duration::from_secs(600)),
+                        http_handle,
+                    );
+                    left
+                } => {
                     if left > 0 {
                         eprintln!("[ciacola] gave up with {left} turn(s) still running; recovery will adjudicate them");
                     } else {
