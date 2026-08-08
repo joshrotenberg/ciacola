@@ -18,7 +18,6 @@ use serde::Deserialize;
 use ciacola_core::agent::{AgentDef, FlatError};
 use ciacola_core::ledger::Ledger;
 use ciacola_core::roles::{Role, Roles};
-use ciacola_schedule::Schedules;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -64,14 +63,11 @@ pub struct ConfigAgent {
     /// Hand this agent the server's own tools over loopback HTTP.
     #[serde(default)]
     pub loopback: bool,
-    pub schedule: Option<ConfigSchedule>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConfigSchedule {
-    pub every_secs: i64,
-    pub text: String,
+    /// Config belonging to plugins, keyed by plugin name. Core does
+    /// not read these; each plugin is offered its own and parses it
+    /// itself. See `Plugin::agent_config`.
+    #[serde(default)]
+    pub plugins: std::collections::BTreeMap<String, toml::Value>,
 }
 
 fn empty_table() -> toml::Value {
@@ -88,7 +84,7 @@ pub fn load(path: &str) -> Result<Config, FlatError> {
 pub async fn apply(
     config: &Config,
     ledger: &Ledger,
-    schedules: &Schedules,
+    host: &ciacola_core::plugin::PluginHost,
     loopback_mcp_config: &str,
 ) -> Result<Vec<String>, FlatError> {
     let house_rules = config.runtime.resolved_house_rules()?;
@@ -155,28 +151,28 @@ pub async fn apply(
         def.system_prompt = def.system_prompt.replace("{agent_id}", &agent_id);
         ledger.update_agent_def(&agent_id, &def).await?;
 
-        // One schedule per config agent: replace whatever is there so
-        // the file is the truth for the wake as well as the def.
-        for schedule in schedules.list().await? {
-            if schedule.agent_id == agent_id {
-                schedules.delete(&schedule.schedule_id).await?;
-            }
-        }
-        if let Some(wake) = &declared.schedule {
-            schedules
-                .create(&agent_id, &wake.text, wake.every_secs)
-                .await?;
-        }
+        // Whatever the declaration says that is not core's business
+        // goes to whichever plugin owns it. This pass used to hold a
+        // Schedules handle to do one plugin's work, which core could
+        // never have offered to a plugin it had not been compiled
+        // against.
+        host.apply_agent_config(&agent_id, &declared.plugins)
+            .await?;
 
-        report.push(format!(
-            "{verb} {} ({agent_id}){}",
-            declared.name,
-            declared
-                .schedule
-                .as_ref()
-                .map(|w| format!(", wakes every {}s", w.every_secs))
-                .unwrap_or_default()
-        ));
+        let claimed = if declared.plugins.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " [{}]",
+                declared
+                    .plugins
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        report.push(format!("{verb} {} ({agent_id}){claimed}", declared.name));
     }
     Ok(report)
 }

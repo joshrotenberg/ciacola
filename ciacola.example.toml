@@ -56,6 +56,8 @@ repos = ["joshrotenberg/mdbook-lint"]
 # name = "tower-mcp-manager"
 # role = "repo-manager"
 #
-# [agents.schedule]
+# Config belonging to a plugin goes under its name. Core does not read
+# these; the named plugin is handed its own section and parses it.
+# [agents.plugins.schedule]
 # every_secs = 1800
 # text = "Wake up. Run your wake list."

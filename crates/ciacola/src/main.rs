@@ -40,7 +40,6 @@ use ciacola_memory::MemoryPlugin;
 use ciacola_refs::RefsPlugin;
 use ciacola_repo_worker::RepoWorkerPlugin;
 use ciacola_schedule::SchedulePlugin;
-use ciacola_schedule::Schedules;
 use ciacola_tuning::TuningPlugin;
 use ciacola_webhook::WebhookPlugin;
 use sqlx::SqlitePool;
@@ -177,14 +176,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let host = Arc::new(PluginHost::setup(plugins, &ctx).await?);
     eprintln!("[ciacola] plugins: {}", host.names().join(", "));
 
-    // Known boundary crossing: agent config declares schedules, so
-    // core's config pass needs a handle to a plugin's table. Setup is
-    // idempotent DDL, so a second handle is harmless, but a real design
-    // would give plugins a config hook instead.
+    // The config pass knows about agents and nothing else. Anything a
+    // declaration says that belongs to a plugin is handed to that
+    // plugin by name, so this no longer needs a handle per plugin it
+    // might encounter.
     for line in config::apply(
         &declared,
         &ledger,
-        &Schedules::setup(pool.clone()).await?,
+        host.as_ref(),
         &mcp_config_path.display().to_string(),
     )
     .await?
