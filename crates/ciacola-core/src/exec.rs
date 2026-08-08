@@ -506,6 +506,58 @@ impl TurnExecutor for HandExecutor {
 mod config_injection_tests {
     use super::*;
 
+    struct FakeProvider {
+        seen: Arc<Mutex<Option<ciacola_agent::TurnIntent>>>,
+    }
+
+    impl ciacola_agent::Provider for FakeProvider {
+        fn key(&self) -> ciacola_agent::ProviderKey {
+            ciacola_agent::ProviderKey::new("fake")
+        }
+
+        fn capabilities(&self) -> ciacola_agent::Capabilities {
+            let mut capabilities =
+                ciacola_agent::Capabilities::none(ciacola_agent::ProviderKey::new("fake"));
+            capabilities.client_assigned_resume = true;
+            capabilities.allowed_tools = true;
+            capabilities.reports_cost = true;
+            capabilities.reports_token_usage = true;
+            capabilities.reports_provider_turns = true;
+            capabilities
+        }
+
+        fn run<'a>(
+            &'a self,
+            intent: &'a ciacola_agent::TurnIntent,
+            events: &'a dyn ciacola_agent::TurnEvents,
+        ) -> ciacola_agent::BoxFut<'a, Result<ciacola_agent::TurnOutcome, ciacola_agent::AgentError>>
+        {
+            *self.seen.lock().expect("seen lock") = Some(intent.clone());
+            Box::pin(async move {
+                let resume = ciacola_agent::ResumeId::ProviderAssigned("fake-session".to_string());
+                events.resume_id(&resume).await;
+                Ok(ciacola_agent::TurnOutcome {
+                    reply: "provider reply".to_string(),
+                    resume: Some(resume),
+                    cost: ciacola_agent::Cost::Reported { micro_usd: 321 },
+                    usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage {
+                        input: 12,
+                        output: 3,
+                        cached_input: 7,
+                    }),
+                    provider_turns: Some(4),
+                    elapsed: Duration::from_millis(25),
+                    metadata: Default::default(),
+                    failure: None,
+                })
+            })
+        }
+
+        fn owns_process(&self, ps_line: &str) -> bool {
+            ps_line.contains("fake-provider")
+        }
+    }
+
     fn endpoint<'a>(
         scope: &'a ciacola_agent::McpScope,
         name: &str,
@@ -515,6 +567,81 @@ mod config_injection_tests {
             .iter()
             .find(|e| e.name == name)
             .unwrap_or_else(|| panic!("no endpoint '{name}'"))
+    }
+
+    /// The integration proof for the runtime seam: selection comes out
+    /// of the persisted definition, the registry resolves it, the
+    /// provider receives neutral intent and emits a session event, and
+    /// the complete portable outcome lands back in the ledger.
+    #[tokio::test]
+    async fn a_claimed_turn_runs_through_the_selected_provider_and_settles() {
+        let seen = Arc::new(Mutex::new(None));
+        let providers = ciacola_agent::ProviderRegistry::new()
+            .with(Arc::new(FakeProvider { seen: seen.clone() }))
+            .expect("unique provider");
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool)
+            .await
+            .expect("ledger")
+            .with_providers(providers);
+        let agent_id = ledger
+            .create_agent(
+                &crate::agent::AgentDef::new("a", "system").provider("fake"),
+                None,
+            )
+            .await
+            .expect("agent");
+        let assigned = ledger
+            .get_agent(&agent_id)
+            .await
+            .expect("get")
+            .expect("agent row")
+            .session
+            .expect("preassigned session");
+        let seq = ledger.enqueue_turn(&agent_id, "do it").await.expect("turn");
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+
+        run_turn(&ledger, &Notifier(tx), &agent_id, seq).await;
+
+        let intent = seen.lock().expect("seen lock").clone().expect("ran");
+        assert_eq!(intent.prompt, "do it");
+        assert_eq!(intent.allowed_tools, Some(Vec::new()));
+        assert_eq!(
+            intent.resume,
+            Some(ciacola_agent::ResumeId::ClientAssigned(assigned))
+        );
+
+        let turn = ledger
+            .get_turn(&agent_id, seq)
+            .await
+            .expect("turn query")
+            .expect("turn row");
+        assert_eq!(turn.state, "ok");
+        assert_eq!(turn.reply.as_deref(), Some("provider reply"));
+        assert_eq!(
+            (turn.cost_micro_usd, turn.cost_state.as_str()),
+            (321, "reported")
+        );
+        assert_eq!(
+            (
+                turn.tokens_in,
+                turn.tokens_out,
+                turn.tokens_cached,
+                turn.usage_state.as_str(),
+                turn.provider_turns,
+            ),
+            (12, 3, 7, "reported", Some(4))
+        );
+        let agent = ledger
+            .get_agent(&agent_id)
+            .await
+            .expect("agent query")
+            .expect("agent row");
+        assert_eq!(agent.session.as_deref(), Some("fake-session"));
+        assert_eq!(agent.session_started_seq, seq);
+        assert_eq!(agent.cost_micro_usd, 321);
     }
 
     /// The base names the surface and is shared; the token is secret
