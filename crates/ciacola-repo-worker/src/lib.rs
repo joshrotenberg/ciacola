@@ -135,23 +135,28 @@ impl Repos {
             // This shipped. Four agents worked issues against a `main`
             // three merges behind, and it surfaced only because one of
             // them reasoned about a file that had changed since.
-            // No `--prune`. It looks harmless next to a refspec and is
-            // the opposite: `refs/heads/*` here contains this plugin's
-            // own `agent/*` branches, which by definition do not exist
-            // on origin until `open_pr` pushes them, so pruning deletes
-            // them. Git does that even while a worktree has one checked
-            // out, and the worktree's HEAD then dangles, so the agent's
-            // next commit has no parent at all.
+            // Fetch into remote-tracking refs, which is what a normal
+            // clone configures and what `git clone --bare` does not.
             //
-            // It was present before the refspec was and did nothing,
-            // because a bare clone configures no refspec for prune to
-            // work against. Supplying one armed it. Two batches ran
-            // before the orphan commits were noticed.
+            // The obvious refspec, `+refs/heads/*:refs/heads/*`, is
+            // wrong here in three separate ways, all of them found the
+            // hard way. It prunes this plugin's own `agent/*` branches,
+            // because they do not exist on origin until open_pr pushes
+            // them. It refuses to run at all once a worktree has one
+            // checked out, since git will not fetch into a checked-out
+            // branch. And it makes local branches the same namespace as
+            // the remote's, so the two collide by design.
+            //
+            // Mapping to `refs/remotes/origin/*` avoids all three: local
+            // branches are never written, so nothing collides, nothing
+            // is pruned, and no worktree can block it.
             let mut fetch = bare_repo(&bare).fetch();
-            fetch.remote("origin").refspec("+refs/heads/*:refs/heads/*");
-            // Nor is the result optional. A discarded error here reads
-            // exactly like a refresh that worked, which is the other
-            // half of why the above went unnoticed.
+            fetch
+                .remote("origin")
+                .refspec("+refs/heads/*:refs/remotes/origin/*");
+            // The result is not optional. A discarded error here reads
+            // exactly like a refresh that worked, which is how a frozen
+            // clone went unnoticed for two batches.
             fetch
                 .execute()
                 .await
@@ -182,11 +187,12 @@ impl Repos {
         if path.exists() {
             return Ok((path, branch));
         }
-        // A bare clone's local heads are the remote's, so `origin/main`
-        // does not resolve here the way it would in a working clone.
-        // Base off the branch directly.
+        // `origin/main` rather than `main`: the refresh writes
+        // remote-tracking refs, so this is the one that moves. A local
+        // `main` in this clone would be a stale copy at best, and
+        // nothing here creates one.
         let mut add = WorktreeCommand::add(&path);
-        add.new_branch(&branch).commit_ish(base);
+        add.new_branch(&branch).commit_ish(format!("origin/{base}"));
         bare_repo(&bare)
             .worktree(add)
             .execute()
@@ -899,7 +905,7 @@ mod tests {
 
         let got = String::from_utf8_lossy(
             &tokio::process::Command::new("git")
-                .args(["rev-parse", "main"])
+                .args(["rev-parse", "origin/main"])
                 .current_dir(&bare)
                 .output()
                 .await
@@ -970,5 +976,51 @@ mod tests {
             refs.lines().any(|r| r == branch),
             "refresh deleted the in-flight branch {branch}; refs were:\n{refs}"
         );
+    }
+
+    /// The refresh must work while a worktree is checked out.
+    ///
+    /// `+refs/heads/*:refs/heads/*` does not: git refuses to fetch into
+    /// a branch some worktree has checked out, so the whole refresh
+    /// aborts and every later start_issue fails. Mapping to
+    /// remote-tracking refs never writes a local branch, so there is
+    /// nothing to refuse.
+    #[tokio::test]
+    async fn refreshing_works_while_a_worktree_is_checked_out() {
+        let tmp = std::env::temp_dir().join(format!("ciacola-live-{}", ulid::Ulid::new()));
+        let origin = tmp.join("origin");
+        std::fs::create_dir_all(&origin).expect("mkdir");
+        git(&origin, &["init", "-q", "-b", "main"]).await;
+        git(&origin, &["config", "user.email", "t@example.com"]).await;
+        git(&origin, &["config", "user.name", "t"]).await;
+        std::fs::write(origin.join("a"), "one").expect("write");
+        git(&origin, &["add", "."]).await;
+        git(&origin, &["commit", "-qm", "one"]).await;
+
+        let repos = Repos {
+            root: tmp.join("root"),
+            allowed: Arc::new(vec!["local/repo".into()]),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        std::fs::create_dir_all(&repos.root).expect("mkdir root");
+        let bare = repos.bare("local/repo");
+        CloneCommand::new(format!("file://{}", origin.display()))
+            .bare()
+            .directory(&bare)
+            .execute()
+            .await
+            .expect("clone");
+        repos
+            .add_worktree("local/repo", "local-repo-1", "main")
+            .await
+            .expect("worktree");
+
+        // The branch that worktree holds is now pushed, so a refspec
+        // writing local heads would try to update it and be refused.
+        git(&origin, &["config", "receive.denyCurrentBranch", "ignore"]).await;
+
+        let refreshed = repos.ensure_clone("local/repo").await;
+        std::fs::remove_dir_all(&tmp).ok();
+        refreshed.expect("refresh must not be blocked by a live worktree");
     }
 }
