@@ -42,6 +42,13 @@ pub struct AgentDef {
     /// than as a parse error or a fresh conversation.
     #[serde(default)]
     pub provider: ProviderKey,
+    /// Whether the storage boundary should replace `provider` with the
+    /// server-wide default. New definitions start inherited; selecting a
+    /// provider makes it explicit. Stored definitions omit this transient
+    /// bit, so changing a default never moves an existing conversation to a
+    /// different backend by accident.
+    #[serde(default, skip_serializing)]
+    provider_inherited: bool,
     /// Provider model. `None` means the provider's default.
     pub model: Option<String>,
     /// How hard to think: low, medium, high, xhigh, max. Paired with
@@ -52,6 +59,16 @@ pub struct AgentDef {
     pub effort: Option<String>,
     /// Tools the agent may use. Empty means none beyond conversation.
     pub allowed_tools: Vec<String>,
+    /// Use the provider's native tool and execution policy instead of a
+    /// Claude-style named grant. Required for providers whose controls are
+    /// not the same vocabulary; explicit because it hands policy to the
+    /// adapter rather than pretending an empty Claude list is enforced.
+    #[serde(default)]
+    pub inherit_provider_tools: bool,
+    /// Filesystem and network containment: read-only, workspace-write,
+    /// workspace-write-no-network, or none.
+    #[serde(default)]
+    pub sandbox: Option<String>,
     /// Where the agent works. `None` means it does not touch a filesystem.
     pub working_dir: Option<PathBuf>,
     /// Cap on provider-internal turns per prompt. `None` means provider
@@ -80,7 +97,7 @@ pub struct AgentDef {
     /// so its behaviour depends on files nobody remembered were there.
     #[serde(default)]
     pub hermetic: Option<String>,
-    /// Provider config and session directory (`CLAUDE_CONFIG_DIR`).
+    /// Provider config, authentication, and session directory.
     ///
     /// Pointing it at the server's own directory keeps transcripts with
     /// the run that produced them rather than mixed into the operator's
@@ -92,8 +109,8 @@ pub struct AgentDef {
     /// be logged in separately before this is usable, which is why it
     /// is off by default and warned about at boot rather than quietly
     /// breaking the first turn.
-    #[serde(default)]
-    pub claude_home: Option<String>,
+    #[serde(default, alias = "claude_home")]
+    pub config_home: Option<String>,
     /// Operator house rules, prepended to every agent's system prompt.
     ///
     /// A hermetic agent inherits no ambient `CLAUDE.md`, which is the
@@ -107,12 +124,9 @@ pub struct AgentDef {
     /// Name of an environment variable holding a long-lived token, read
     /// from the server's own environment and passed to the provider.
     ///
-    /// This is what makes `claude_home` usable: `CLAUDE_CONFIG_DIR`
-    /// isolates the login along with the session data, so a fresh
-    /// directory authenticates as nobody. `claude setup-token` mints a
-    /// token for exactly this, and `CLAUDE_CODE_OAUTH_TOKEN` is where
-    /// the provider looks for it, ahead of the subscription login it
-    /// can no longer find.
+    /// This makes an isolated provider home usable without storing a
+    /// credential in TOML. The adapter maps the source variable onto the
+    /// environment name its CLI accepts.
     ///
     /// The *name* rather than the value, so a token never lands in the
     /// config file, the ledger, or the board.
@@ -126,24 +140,37 @@ impl AgentDef {
             name: name.into(),
             system_prompt: system_prompt.into(),
             provider: ProviderKey::claude(),
+            provider_inherited: true,
             model: None,
             effort: None,
             allowed_tools: Vec::new(),
+            inherit_provider_tools: false,
+            sandbox: None,
             working_dir: None,
             max_turns: None,
             mcp_config: None,
             rotate_after_turns: None,
             hermetic: None,
-            claude_home: None,
+            config_home: None,
             house_rules: None,
             token_env: None,
         }
     }
 
-    /// Choose the backend. Omitted means [`ProviderKey::claude`].
+    /// Choose the backend. Omitted definitions inherit the server default at
+    /// the storage boundary; legacy stored definitions remain Claude.
     pub fn provider(mut self, provider: impl Into<ProviderKey>) -> Self {
         self.provider = provider.into();
+        self.provider_inherited = false;
         self
+    }
+
+    /// Resolve an inherited provider at the storage boundary.
+    pub(crate) fn resolve_provider(&mut self, provider: impl Into<ProviderKey>) {
+        if self.provider_inherited {
+            self.provider = provider.into();
+            self.provider_inherited = false;
+        }
     }
 
     pub fn model(mut self, model: impl Into<String>) -> Self {
@@ -162,6 +189,19 @@ impl AgentDef {
         S: Into<String>,
     {
         self.allowed_tools = tools.into_iter().map(Into::into).collect();
+        self.inherit_provider_tools = false;
+        self
+    }
+
+    /// Use the provider's native tool policy rather than a named grant.
+    pub fn inherit_provider_tools(mut self) -> Self {
+        self.allowed_tools.clear();
+        self.inherit_provider_tools = true;
+        self
+    }
+
+    pub fn sandbox(mut self, sandbox: impl Into<String>) -> Self {
+        self.sandbox = Some(sandbox.into());
         self
     }
 
@@ -190,8 +230,8 @@ impl AgentDef {
         self
     }
 
-    pub fn claude_home(mut self, dir: impl Into<String>) -> Self {
-        self.claude_home = Some(dir.into());
+    pub fn config_home(mut self, dir: impl Into<String>) -> Self {
+        self.config_home = Some(dir.into());
         self
     }
 
@@ -316,7 +356,12 @@ session. Some consequences that do not hold elsewhere:
 /// means the description cannot drift from the grant.
 fn capability_block(def: &AgentDef) -> String {
     let mut lines = vec![format!("You are '{}'.", def.name)];
-    if def.allowed_tools.is_empty() {
+    if def.inherit_provider_tools {
+        lines.push(
+            "Your tool and command policy is the provider-native policy selected for this agent."
+                .into(),
+        );
+    } else if def.allowed_tools.is_empty() {
         lines.push(
             "You have NO tools: no file access, no shell, no network. You \
              can only reason and reply. If a task needs any of those, say \
@@ -483,7 +528,16 @@ pub(crate) fn intent_for(
     // agent with no tools is precisely the pre-migration bug: the
     // system prompt told it that it had none while the command carried
     // no restriction at all.
-    intent.allowed_tools = Some(def.allowed_tools.clone());
+    intent.allowed_tools = (!def.inherit_provider_tools).then(|| def.allowed_tools.clone());
+    if let Some(sandbox) = &def.sandbox {
+        match ciacola_agent::Sandbox::parse(sandbox) {
+            Some(parsed) => intent.sandbox = parsed,
+            None => {
+                eprintln!("[agent] unknown sandbox '{sandbox}', falling back to read-only");
+                intent.sandbox = ciacola_agent::Sandbox::ReadOnly;
+            }
+        }
+    }
     intent.max_provider_turns = def.max_turns;
     intent.mcp = mcp;
     if let Some(scope) = &def.hermetic {
@@ -492,9 +546,18 @@ pub(crate) fn intent_for(
             None => eprintln!("[agent] unknown hermetic scope '{scope}', inheriting ambient"),
         }
     }
-    intent.config_home = def.claude_home.clone();
+    intent.config_home = def.config_home.as_deref().map(expand_home_path);
     intent.token_env = def.token_env.clone();
     intent
+}
+
+fn expand_home_path(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => std::env::var("HOME")
+            .map(|home| format!("{home}/{rest}"))
+            .unwrap_or_else(|_| path.to_string()),
+        None => path.to_string(),
+    }
 }
 
 /// Record a completed turn in the provider-neutral shape the ledger
@@ -663,6 +726,21 @@ mod migration_tests {
         let def: AgentDef = serde_json::from_str(legacy).expect("a pre-provider row still parses");
         assert_eq!(def.provider, ProviderKey::claude());
         assert_eq!(def.name, "ciacola-manager");
+        assert!(
+            !def.provider_inherited,
+            "a stored legacy definition must not follow a new runtime default"
+        );
+    }
+
+    #[test]
+    fn provider_policy_modes_replace_each_other() {
+        let native = def().allowed_tools(["Read"]).inherit_provider_tools();
+        assert!(native.inherit_provider_tools);
+        assert!(native.allowed_tools.is_empty());
+
+        let named = native.allowed_tools(["Read"]);
+        assert!(!named.inherit_provider_tools);
+        assert_eq!(named.allowed_tools, ["Read"]);
     }
 
     /// The three session cases, which are the ones that break live
@@ -713,6 +791,19 @@ mod migration_tests {
         d.allowed_tools = vec!["Read".into()];
         let intent = intent_for(&d, None, None, false, "go");
         assert_eq!(intent.allowed_tools, Some(vec!["Read".to_string()]));
+    }
+
+    #[test]
+    fn unknown_sandbox_fails_closed_and_tilde_homes_expand() {
+        let mut d = def().sandbox("typo").config_home("~/.ciacola-test-home");
+        d.inherit_provider_tools = true;
+        let intent = intent_for(&d, None, None, false, "go");
+        assert_eq!(intent.sandbox, ciacola_agent::Sandbox::ReadOnly);
+        assert_eq!(intent.allowed_tools, None);
+        let expected = std::env::var("HOME")
+            .map(|home| format!("{home}/.ciacola-test-home"))
+            .unwrap_or_else(|_| "~/.ciacola-test-home".into());
+        assert_eq!(intent.config_home.as_deref(), Some(expected.as_str()));
     }
 
     /// A capped run keeps its spend and its session, which is what makes

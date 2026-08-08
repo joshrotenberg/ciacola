@@ -148,10 +148,11 @@ forbid. House rules are now an explicit layer of the system prompt.
    one client is the wrong direction, so this is filed upstream as
    [mcp-repl#87](https://github.com/joshrotenberg/mcp-repl/issues/87)
    and nothing here changes.
-4. **Cost is Claude-only.** codex reports tokens and no price at all
-   and deliberately refuses to synthesize one, which is why tokens are
-   in the ledger beside cost. A second provider will find `cost_usd`
-   optional in practice but not in shape.
+4. **The dollar breaker cannot bound unpriced Codex turns.** Codex reports
+   tokens and no price at all, and the adapter deliberately refuses to
+   synthesize one. Token usage is durable and visible, but admission still
+   needs provider/token limits before an unattended Codex schedule has a
+   meaningful circuit breaker.
 
 ## What to do next, roughly in order
 
@@ -164,26 +165,29 @@ thin template, the kanban assumes discrete items, `git` simply goes
 quiet. Whether the primitive holds outside code is the interesting
 unknown.
 
-**The codex provider seam.** `run_exchange` is the only place that
-touches a provider, so the seam is one function wide. The recon already
-mapped the disagreements: no system-prompt setter, no cost, `thread_id`
-rather than `session_id`, resume as a separate builder, and `is_error`
-derivable only from the event stream. `ciacola-tuning` is already keyed
-on provider so cross-provider comparison works the day it lands.
+**Dogfood the Codex provider.** The adapter is now a separate crate behind
+the same registry as Claude. It preserves Codex thread ids as soon as the
+JSONL stream announces them, resumes through the provider's separate command,
+records real tokens as unpriced, applies strict scoped MCP with env-backed
+identity headers, and treats sandbox plus native execution policy as Codex's
+authority surface. Scripted tests cover the contract; the next proof is a
+small supervised repository task. Add a token breaker before scheduling one
+unattended.
 
-**Session mining.** `claude_home` makes the server's transcripts a
-separate, complete, attributable corpus, which is what makes mining
-them meaningful. `solito` already extracts prompts and tool uses into
-SQLite. The sharp first question is not clustering but **granted versus
-used tools**: which tools does a role grant that its agents never call,
-and does an agent that reports verifying actually have the tool call to
-show for it. Findings are self-report; transcripts are observed
-behaviour, and the gap between them is the interesting signal.
+**Session mining.** Provider-specific `claude_home` and `codex_home` make
+the server's transcripts a separate, attributable corpus, which is what makes
+mining them meaningful. `solito` already extracts Claude prompts and tool uses
+into SQLite. The sharp first question is not clustering but **granted versus
+used tools**: which tools does a role grant that its agents never call, and
+does an agent that reports verifying actually have the tool call to show for
+it. Findings are self-report; transcripts are observed behaviour, and the gap
+between them is the interesting signal.
 
-**Streaming, scoped.** Not token text, which nobody is watching. Tool
-calls and phase transitions, recorded as turn events and rendered,
-which answers "is it doing something sensible" without reading
-anything. Blocked upstream in both wrappers today.
+**Streaming, scoped.** Not token text, which nobody is watching. Tool calls
+and phase transitions, recorded as turn events and rendered, answer "is it
+doing something sensible" without reading everything. Codex JSONL now arrives
+live, but the provider-neutral event sink carries only a session id; widen that
+contract deliberately before exposing provider-specific event shapes.
 
 **The board, properly.** It is 355 lines of hand-rolled HTML with a
 five-second meta refresh, and it has carried further than it deserves

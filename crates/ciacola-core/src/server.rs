@@ -30,12 +30,17 @@ struct SpawnArgs {
     name: String,
     /// The agent's standing knowledge: who it is, what good looks like.
     system_prompt: String,
-    /// Backend key. Omit for Claude.
+    /// Backend key. Omit for the server-wide default.
     provider: Option<String>,
     /// Provider model, e.g. "haiku". Omit for the provider default.
     model: Option<String>,
     /// Tool names the agent may use. Omit for none.
     allowed_tools: Option<Vec<String>>,
+    /// Use the provider's native tool policy. Operator surface only.
+    #[serde(default)]
+    inherit_provider_tools: bool,
+    /// Filesystem/network containment. Operator surface only.
+    sandbox: Option<String>,
     /// Cap on provider-internal turns per prompt.
     max_turns: Option<u32>,
     /// Path to an MCP config file for the agent's own tools. Point it
@@ -261,6 +266,31 @@ fn spawn_tool(ledger: Ledger, max_depth: i64, operator_surface: bool) -> tower_m
                     }
                     if let Some(max_turns) = args.max_turns {
                         def = def.max_turns(max_turns);
+                    }
+                    if let Some(sandbox) = args.sandbox.as_deref()
+                        && ciacola_agent::Sandbox::parse(sandbox).is_none()
+                    {
+                        return Ok(CallToolResult::error(format!(
+                            "unknown sandbox '{sandbox}'; expected read-only, workspace-write, workspace-write-no-network, or none"
+                        )));
+                    }
+                    if (args.inherit_provider_tools || args.sandbox.is_some()) && !operator_surface {
+                        return Ok(CallToolResult::error(
+                            "provider-native tool and sandbox policy can only be selected on the operator surface; use a server-configured role for agent-spawned children"
+                                .to_string(),
+                        ));
+                    }
+                    if args.inherit_provider_tools {
+                        if args.allowed_tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+                            return Ok(CallToolResult::error(
+                                "inherit_provider_tools and allowed_tools are mutually exclusive"
+                                    .to_string(),
+                            ));
+                        }
+                        def = def.inherit_provider_tools();
+                    }
+                    if let Some(sandbox) = args.sandbox {
+                        def = def.sandbox(sandbox);
                     }
 
                     // The capability ceiling. A child's tools are at
@@ -720,6 +750,8 @@ mod identity_tests {
                     "name": "child",
                     "system_prompt": "s",
                     "provider": "codex",
+                    "inherit_provider_tools": true,
+                    "sandbox": "workspace-write-no-network",
                     "spawned_by": parent
                 }),
             )
@@ -731,6 +763,49 @@ mod identity_tests {
         let child = l.get_agent(&child_id).await.expect("get").expect("row");
         assert_eq!(child.spawned_by.as_deref(), Some(parent.as_str()));
         assert_eq!(child.def.provider.as_str(), "codex");
+        assert!(child.def.inherit_provider_tools);
+        assert_eq!(
+            child.def.sandbox.as_deref(),
+            Some("workspace-write-no-network")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_surface_cannot_select_native_provider_policy() {
+        let l = ledger().await;
+        let spawn = spawn_tool(l.clone(), 3, false);
+        let out = spawn
+            .call_with_context(
+                ctx_as(None),
+                serde_json::json!({
+                    "name": "child",
+                    "system_prompt": "s",
+                    "provider": "codex",
+                    "inherit_provider_tools": true,
+                    "sandbox": "read-only"
+                }),
+            )
+            .await;
+        assert!(rendered(&out).contains("operator surface"));
+        assert!(l.list_agents().await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn operator_spawn_rejects_an_unknown_sandbox() {
+        let l = ledger().await;
+        let spawn = spawn_tool(l.clone(), 3, true);
+        let out = spawn
+            .call_with_context(
+                ctx_as(None),
+                serde_json::json!({
+                    "name": "child",
+                    "system_prompt": "s",
+                    "sandbox": "workspcae-write"
+                }),
+            )
+            .await;
+        assert!(rendered(&out).contains("unknown sandbox"));
+        assert!(l.list_agents().await.expect("list").is_empty());
     }
 
     /// The ceiling: a child's tools are at most its parent's, and what
@@ -813,6 +888,8 @@ mod identity_tests {
             hermetic: None,
             working_dir: None,
             allowed_tools: Vec::new(),
+            inherit_provider_tools: false,
+            sandbox: None,
             max_turns: None,
             rotate_after_turns: None,
             loopback: true,
@@ -858,6 +935,8 @@ mod identity_tests {
             hermetic: None,
             working_dir: None,
             allowed_tools: vec!["Read".into(), "Edit".into()],
+            inherit_provider_tools: false,
+            sandbox: None,
             max_turns: None,
             rotate_after_turns: None,
             loopback: false,
@@ -898,6 +977,8 @@ mod identity_tests {
             hermetic: None,
             working_dir: None,
             allowed_tools: Vec::new(),
+            inherit_provider_tools: false,
+            sandbox: None,
             max_turns: None,
             rotate_after_turns: None,
             loopback: true,

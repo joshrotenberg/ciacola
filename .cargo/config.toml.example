@@ -18,5 +18,8 @@ tower-mcp = { path = "../tower-mcp/crates/tower-mcp" }
 [patch."https://github.com/joshrotenberg/claude-wrapper"]
 claude-wrapper = { path = "../claude-wrapper" }
 
+[patch."https://github.com/joshrotenberg/codex-wrapper"]
+codex-wrapper = { path = "../codex-wrapper/crates/codex-wrapper" }
+
 [patch."https://github.com/joshrotenberg/git-spawn"]
 git-spawn = { path = "../git-spawn" }

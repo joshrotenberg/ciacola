@@ -20,6 +20,7 @@ sqlx = { workspace = true }
 # wrapper itself.
 ciacola-agent = { workspace = true }
 ciacola-agent-claude = { workspace = true }
+ciacola-agent-codex = { workspace = true }
 ciacola-core = { workspace = true }
 ciacola-board = { path = "../ciacola-board" }
 ciacola-findings = { path = "../ciacola-findings" }

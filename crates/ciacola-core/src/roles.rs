@@ -45,7 +45,7 @@ pub struct Role {
     /// What this role is for. Shown in prompts/list, so write it for
     /// whoever is choosing: "read-only analyst for one GitHub issue".
     pub description: String,
-    /// Backend key. Omit for Claude, preserving every existing role.
+    /// Backend key. Omit for the server-wide default.
     #[serde(default)]
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -60,6 +60,11 @@ pub struct Role {
     pub working_dir: Option<String>,
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+    /// Use the backend's native tool policy instead of `allowed_tools`.
+    #[serde(default)]
+    pub inherit_provider_tools: bool,
+    /// read-only, workspace-write, workspace-write-no-network, or none.
+    pub sandbox: Option<String>,
     pub max_turns: Option<u32>,
     /// Start a fresh provider session after this many turns. The
     /// agent's durable state lives in the kanban, memory, and
@@ -97,11 +102,17 @@ pub struct Role {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Runtime {
+    /// Backend used by definitions that do not select one. Omit for Claude.
+    pub default_provider: Option<String>,
     /// Applied to every agent that does not set its own.
     pub hermetic: Option<String>,
+    /// Applied to every agent that does not set its own.
+    pub sandbox: Option<String>,
     /// Provider config and session directory for every agent. Must be
-    /// logged in separately; see `AgentDef::claude_home`.
+    /// logged in separately.
     pub claude_home: Option<String>,
+    /// Dedicated Codex config, auth, and session directory.
+    pub codex_home: Option<String>,
     /// Standing rules prepended to every system prompt.
     pub house_rules: Option<String>,
     /// A file to read them from instead, typically the operator's own
@@ -111,6 +122,8 @@ pub struct Runtime {
     /// use with an isolated `claude_home`. Mint one with
     /// `claude setup-token`. The name, never the value.
     pub token_env: Option<String>,
+    /// Environment variable holding a Codex API key for isolated runs.
+    pub codex_token_env: Option<String>,
 }
 
 impl Runtime {
@@ -118,23 +131,41 @@ impl Runtime {
     /// login, rather than letting the first turn fail on it. The check
     /// is a heuristic (the CLI may keep credentials in a keychain), so
     /// it warns and continues.
-    pub fn check_claude_home(&self) {
-        let Some(home) = &self.claude_home else {
-            return;
-        };
-        let dir = std::path::Path::new(home);
-        if self.token_env.is_some() {
-            return;
+    pub fn check_provider_homes(&self) {
+        if let Some(home) = &self.claude_home {
+            let expanded = expand_home_path(home);
+            let dir = std::path::Path::new(&expanded);
+            if self.token_env.is_none() && !dir.join(".credentials.json").exists() {
+                eprintln!(
+                    "[runtime] warning: claude_home {home} has no .credentials.json. \
+                     CLAUDE_CONFIG_DIR isolates the login as well as the session data, \
+                     so agents may fail with \"Not logged in\". Either mint a token \
+                     with `claude setup-token` and point [runtime] token_env at the \
+                     variable holding it, or unset claude_home."
+                );
+            }
         }
-        if dir.exists() && !dir.join(".credentials.json").exists() {
-            eprintln!(
-                "[runtime] warning: claude_home {home} has no .credentials.json. \
-                 CLAUDE_CONFIG_DIR isolates the login as well as the session data, \
-                 so agents may fail with \"Not logged in\". Either mint a token \
-                 with `claude setup-token` and point [runtime] token_env at the \
-                 variable holding it, or unset claude_home."
-            );
+
+        if let Some(home) = &self.codex_home {
+            let expanded = expand_home_path(home);
+            let dir = std::path::Path::new(&expanded);
+            if self.codex_token_env.is_none() && !dir.join("auth.json").exists() {
+                eprintln!(
+                    "[runtime] warning: codex_home {home} has no auth.json and no \
+                     codex_token_env. CODEX_HOME isolates login state, so Codex agents \
+                     may fail to authenticate. Log that home in separately, configure \
+                     codex_token_env, or unset codex_home."
+                );
+            }
         }
+    }
+
+    /// The configured default, preserving Claude when omitted.
+    pub fn default_provider_key(&self) -> ciacola_agent::ProviderKey {
+        self.default_provider
+            .as_deref()
+            .map(ciacola_agent::ProviderKey::new)
+            .unwrap_or_else(ciacola_agent::ProviderKey::claude)
     }
 
     /// Inline rules plus the file, resolved once at boot so a missing
@@ -159,6 +190,15 @@ impl Runtime {
             }
         }
         Ok((!parts.is_empty()).then(|| parts.join("\n\n")))
+    }
+}
+
+fn expand_home_path(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => std::env::var("HOME")
+            .map(|home| format!("{home}/{rest}"))
+            .unwrap_or_else(|_| path.to_string()),
+        None => path.to_string(),
     }
 }
 
@@ -262,6 +302,12 @@ impl Roles {
         if !role.allowed_tools.is_empty() {
             def = def.allowed_tools(role.allowed_tools.clone());
         }
+        if role.inherit_provider_tools {
+            def = def.inherit_provider_tools();
+        }
+        if let Some(sandbox) = role.sandbox.as_ref().or(self.runtime.sandbox.as_ref()) {
+            def = def.sandbox(sandbox);
+        }
         if let Some(max_turns) = role.max_turns {
             def = def.max_turns(max_turns);
         }
@@ -284,8 +330,21 @@ impl Roles {
         if let Some(scope) = role.hermetic.as_ref().or(self.runtime.hermetic.as_ref()) {
             def = def.hermetic(scope);
         }
-        if let Some(home) = &self.runtime.claude_home {
-            def = def.claude_home(home);
+        let provider = role
+            .provider
+            .as_deref()
+            .or(self.runtime.default_provider.as_deref())
+            .unwrap_or(ciacola_agent::ProviderKey::CLAUDE);
+        let (home, token_env) = if provider == "codex" {
+            (&self.runtime.codex_home, &self.runtime.codex_token_env)
+        } else {
+            (&self.runtime.claude_home, &self.runtime.token_env)
+        };
+        if let Some(home) = home {
+            def = def.config_home(home);
+        }
+        if let Some(token_env) = token_env {
+            def = def.token_env(token_env);
         }
         if let Some(rules) = self.house_rules.as_ref() {
             def = def.house_rules(rules.as_str());
@@ -294,14 +353,16 @@ impl Roles {
     }
 }
 
-fn role_json(role: &Role) -> serde_json::Value {
+fn role_json(role: &Role, default_provider: &str) -> serde_json::Value {
     json!({
         "name": role.name,
         "description": role.description,
-        "provider": role.provider.as_deref().unwrap_or(ciacola_agent::ProviderKey::CLAUDE),
+        "provider": role.provider.as_deref().unwrap_or(default_provider),
         "model": role.model,
         "effort": role.effort,
         "allowed_tools": role.allowed_tools,
+        "inherit_provider_tools": role.inherit_provider_tools,
+        "sandbox": role.sandbox,
         "max_turns": role.max_turns,
         "rotate_after_turns": role.rotate_after_turns,
         "arguments": role.arguments,
@@ -386,6 +447,12 @@ pub fn tools_with_depth(
                             role.name
                         )));
                     }
+                    if role.inherit_provider_tools && (caller.is_some() || !operator_surface) {
+                        return Ok(CallToolResult::error(format!(
+                            "role '{}' inherits its provider's native tool policy, which an agent cannot bound; ask the operator to spawn it",
+                            role.name
+                        )));
+                    }
                     let missing: Vec<&String> = role
                         .arguments
                         .iter()
@@ -461,8 +528,13 @@ pub fn tools_with_depth(
             .no_params_handler(move || {
                 let roles = roles.clone();
                 async move {
+                    let default_provider = roles.runtime.default_provider_key();
                     Ok(CallToolResult::json(json!({
-                        "roles": roles.all().iter().map(role_json).collect::<Vec<_>>()
+                        "roles": roles
+                            .all()
+                            .iter()
+                            .map(|role| role_json(role, default_provider.as_str()))
+                            .collect::<Vec<_>>()
                     })))
                 }
             })
@@ -597,6 +669,8 @@ mod surface_tests {
             hermetic: None,
             working_dir: None,
             allowed_tools: Vec::new(),
+            inherit_provider_tools: false,
+            sandbox: None,
             max_turns: None,
             rotate_after_turns: None,
             loopback: true,
@@ -635,6 +709,12 @@ mod surface_tests {
         let defaults = Roles::new(vec![role(None)], "agent.json");
         let def = defaults.to_def(defaults.get("r").unwrap(), &HashMap::new());
         assert_eq!(def.provider, ciacola_agent::ProviderKey::claude());
+    }
+
+    #[test]
+    fn role_catalog_reports_the_runtime_default_provider() {
+        let value = role_json(&role(None), "codex");
+        assert_eq!(value["provider"], "codex");
     }
 
     /// Before the binary supplies the operator path, asking for it gets

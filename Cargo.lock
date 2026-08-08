@@ -188,6 +188,7 @@ dependencies = [
  "axum",
  "ciacola-agent",
  "ciacola-agent-claude",
+ "ciacola-agent-codex",
  "ciacola-board",
  "ciacola-core",
  "ciacola-findings",
@@ -226,6 +227,18 @@ dependencies = [
  "claude-wrapper",
  "serde_json",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ciacola-agent-codex"
+version = "0.0.1"
+dependencies = [
+ "ciacola-agent",
+ "codex-wrapper",
+ "serde_json",
+ "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -411,6 +424,20 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "which",
+]
+
+[[package]]
+name = "codex-wrapper"
+version = "0.3.0"
+source = "git+https://github.com/joshrotenberg/codex-wrapper?rev=a63a0d383af82d4cb72879a48293869548248715#a63a0d383af82d4cb72879a48293869548248715"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

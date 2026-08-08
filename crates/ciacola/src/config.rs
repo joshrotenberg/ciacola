@@ -61,7 +61,7 @@ impl Default for Config {
 #[serde(deny_unknown_fields)]
 pub struct ConfigAgent {
     pub name: String,
-    /// Backend key. Omit for Claude.
+    /// Backend key. Omit for the server-wide default.
     pub provider: Option<String>,
     /// Instantiate this role instead of spelling out a definition. The
     /// fields below still override what the role provides.
@@ -75,9 +75,13 @@ pub struct ConfigAgent {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub hermetic: Option<String>,
+    pub sandbox: Option<String>,
     pub working_dir: Option<String>,
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+    /// Use the selected provider's native policy instead of Claude tool names.
+    #[serde(default)]
+    pub inherit_provider_tools: bool,
     pub max_turns: Option<u32>,
     /// Start a fresh provider session after this many turns.
     pub rotate_after_turns: Option<u32>,
@@ -96,7 +100,7 @@ fn empty_table() -> toml::Value {
 }
 
 pub fn load(path: &str) -> Result<Config, FlatError> {
-    Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
+    parse(&std::fs::read_to_string(path)?)
 }
 
 pub const DEFAULT_PATH: &str = "ciacola.toml";
@@ -112,11 +116,54 @@ fn load_startup_at(explicit_path: Option<&str>, default_path: &str) -> Result<Co
     match explicit_path {
         Some(path) => load(path),
         None => match std::fs::read_to_string(default_path) {
-            Ok(text) => Ok(toml::from_str(&text)?),
+            Ok(text) => parse(&text),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(Config::default()),
             Err(error) => Err(error.into()),
         },
     }
+}
+
+fn parse(text: &str) -> Result<Config, FlatError> {
+    let config: Config = toml::from_str(text)?;
+    validate(&config)?;
+    Ok(config)
+}
+
+fn validate(config: &Config) -> Result<(), FlatError> {
+    validate_sandbox("runtime", config.runtime.sandbox.as_deref())?;
+    for role in &config.roles {
+        if role.inherit_provider_tools && !role.allowed_tools.is_empty() {
+            return Err(format!(
+                "role '{}': inherit_provider_tools and allowed_tools are mutually exclusive",
+                role.name
+            )
+            .into());
+        }
+        validate_sandbox(&format!("role '{}'", role.name), role.sandbox.as_deref())?;
+    }
+    for agent in &config.agents {
+        if agent.inherit_provider_tools && !agent.allowed_tools.is_empty() {
+            return Err(format!(
+                "agent '{}': inherit_provider_tools and allowed_tools are mutually exclusive",
+                agent.name
+            )
+            .into());
+        }
+        validate_sandbox(&format!("agent '{}'", agent.name), agent.sandbox.as_deref())?;
+    }
+    Ok(())
+}
+
+fn validate_sandbox(owner: &str, sandbox: Option<&str>) -> Result<(), FlatError> {
+    if let Some(sandbox) = sandbox
+        && ciacola_agent::Sandbox::parse(sandbox).is_none()
+    {
+        return Err(format!(
+            "{owner}: unknown sandbox '{sandbox}'; expected read-only, workspace-write, workspace-write-no-network, or none"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn role_definition(
@@ -179,8 +226,13 @@ fn role_definition(
     if let Some(dir) = &declared.working_dir {
         def = def.working_dir(dir);
     }
-    if !declared.allowed_tools.is_empty() {
+    if declared.inherit_provider_tools {
+        def = def.inherit_provider_tools();
+    } else if !declared.allowed_tools.is_empty() {
         def = def.allowed_tools(declared.allowed_tools.clone());
+    }
+    if let Some(sandbox) = &declared.sandbox {
+        def = def.sandbox(sandbox);
     }
     if let Some(max_turns) = declared.max_turns {
         def = def.max_turns(max_turns);
@@ -198,8 +250,27 @@ fn role_definition(
     {
         def = def.hermetic(scope);
     }
-    if let Some(home) = &config.runtime.claude_home {
-        def = def.claude_home(home);
+    let provider = declared
+        .provider
+        .as_deref()
+        .or_else(|| {
+            declared
+                .role
+                .as_ref()
+                .and_then(|name| roles.get(name).and_then(|role| role.provider.as_deref()))
+        })
+        .or(config.runtime.default_provider.as_deref())
+        .unwrap_or(ciacola_agent::ProviderKey::CLAUDE);
+    let (home, token_env) = if provider == "codex" {
+        (&config.runtime.codex_home, &config.runtime.codex_token_env)
+    } else {
+        (&config.runtime.claude_home, &config.runtime.token_env)
+    };
+    if let Some(home) = home {
+        def = def.config_home(home);
+    }
+    if let Some(token_env) = token_env {
+        def = def.token_env(token_env);
     }
     Ok(def)
 }
@@ -290,6 +361,66 @@ mod tests {
         let error = load_startup_at(Some(&path), "ignored")
             .expect_err("an explicit typo must not silently become an empty server");
         assert!(error.to_string().contains("No such file"), "{error}");
+    }
+
+    #[test]
+    fn codex_runtime_defaults_and_native_policy_parse_as_a_product_surface() {
+        let config = parse(
+            r#"
+                [runtime]
+                default_provider = "codex"
+                sandbox = "workspace-write-no-network"
+                codex_home = "~/.local/share/ciacola/codex"
+                codex_token_env = "CIACOLA_CODEX_TOKEN"
+
+                [[roles]]
+                name = "implementer"
+                description = "writes code"
+                inherit_provider_tools = true
+                model = "gpt-5.6-sol"
+                system_prompt = "Implement it"
+
+                [[agents]]
+                name = "worker"
+                role = "implementer"
+            "#,
+        )
+        .expect("codex config");
+        let roles = Roles::with_runtime(config.roles.clone(), "agent.json", config.runtime.clone());
+        let def =
+            role_definition(&config, &config.agents[0], &roles, "agent.json").expect("definition");
+        assert!(def.inherit_provider_tools);
+        assert_eq!(def.sandbox.as_deref(), Some("workspace-write-no-network"));
+        assert_eq!(
+            def.config_home.as_deref(),
+            Some("~/.local/share/ciacola/codex")
+        );
+        assert_eq!(def.token_env.as_deref(), Some("CIACOLA_CODEX_TOKEN"));
+    }
+
+    #[test]
+    fn conflicting_tool_policy_and_unknown_sandbox_fail_at_parse_time() {
+        let conflict = parse(
+            r#"
+                [[roles]]
+                name = "broken"
+                description = "broken"
+                allowed_tools = ["Read"]
+                inherit_provider_tools = true
+                system_prompt = "broken"
+            "#,
+        )
+        .expect_err("conflicting authority must fail");
+        assert!(conflict.to_string().contains("mutually exclusive"));
+
+        let sandbox = parse(
+            r#"
+                [runtime]
+                sandbox = "workspcae-write"
+            "#,
+        )
+        .expect_err("a typo must not remove containment");
+        assert!(sandbox.to_string().contains("unknown sandbox"));
     }
 
     #[test]

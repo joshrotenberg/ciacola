@@ -30,8 +30,10 @@ use crate::outcome::TurnOutcome;
 pub struct ProviderKey(String);
 
 impl ProviderKey {
-    /// The default and, for now, only backend.
+    /// The backwards-compatible default backend.
     pub const CLAUDE: &'static str = "claude";
+    /// The Codex backend.
+    pub const CODEX: &'static str = "codex";
 
     /// A key from a string. Not validated against the registry here;
     /// resolution is [`ProviderRegistry::get`], and its failure names
@@ -43,6 +45,11 @@ impl ProviderKey {
     /// The default backend.
     pub fn claude() -> Self {
         Self(Self::CLAUDE.to_string())
+    }
+
+    /// The Codex backend.
+    pub fn codex() -> Self {
+        Self(Self::CODEX.to_string())
     }
 
     /// The key as written.

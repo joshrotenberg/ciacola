@@ -14,11 +14,12 @@ authors = ["Josh Rotenberg <joshrotenberg@gmail.com>"]
 # The provider boundary, and everything that nothing works without.
 # `ciacola-agent` depends on no wrapper and on no other crate here,
 # which is the property that makes it a boundary rather than a layer.
-# `ciacola-agent-claude` is the first adapter against it, preserving
-# today's live Claude behavior; `ciacola-core` does not depend on it,
-# and never should -- the binary wires adapters to the registry.
+# The Claude and Codex adapters implement that boundary; `ciacola-core`
+# does not depend on either, and never should -- the binary wires adapters
+# to the registry.
 ciacola-agent = { path = "crates/ciacola-agent" }
 ciacola-agent-claude = { path = "crates/ciacola-agent-claude" }
+ciacola-agent-codex = { path = "crates/ciacola-agent-codex" }
 ciacola-core = { path = "crates/ciacola-core" }
 
 # Ours. Git revs rather than path deps, so this builds anywhere: in CI,
@@ -26,16 +27,17 @@ ciacola-core = { path = "crates/ciacola-core" }
 # where a sibling checkout does not exist.
 #
 # Revs rather than branches because once agents build this, the build has
-# to be reproducible: a path dep resolved to whatever three sibling
+# to be reproducible: a path dep resolved to whatever four sibling
 # checkouts happened to contain. Published versions do not work yet
 # (claude-wrapper is 20 commits past v0.13.5 and ciacola needs
 # `QueryResult::usage` from one of them); switch to versions once the
-# three settle enough to release.
+# four settle enough to release.
 #
 # `.cargo/config.toml` overrides these back to the siblings for local
 # work. See CONTRIBUTING.md.
 tower-mcp = { git = "https://github.com/joshrotenberg/tower-mcp", rev = "9c8b53973e650a140fe4c180e6c3fad4a6e65b9b", features = ["http"] }
 claude-wrapper = { git = "https://github.com/joshrotenberg/claude-wrapper", rev = "22484531ecbec0789c16ee10f8abaa95d5501596" }
+codex-wrapper = { git = "https://github.com/joshrotenberg/codex-wrapper", rev = "a63a0d383af82d4cb72879a48293869548248715" }
 git-spawn = { git = "https://github.com/joshrotenberg/git-spawn", rev = "ea2826b9da416cc9396ce79f2af7f9770cd50ac1" }
 
 axum = "0.8"

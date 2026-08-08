@@ -52,13 +52,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - name: Unpin the three
+      - name: Unpin the four
         run: |
           python3 - <<'PY'
           import pathlib, re
           p = pathlib.Path("Cargo.toml")
           s, n = re.subn(r'rev = "[0-9a-f]{40}"', 'branch = "main"', p.read_text())
-          assert n == 3, f"expected 3 pinned revs, rewrote {n}"
+          assert n == 4, f"expected 4 pinned revs, rewrote {n}"
           p.write_text(s)
           print(s[s.index("tower-mcp = "):s.index("git-spawn = ") + 120])
           PY

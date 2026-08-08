@@ -24,15 +24,15 @@ run *ARGS:
 repl:
     mcp-repl -- cargo run -p ciacola
 
-# Develop against ../tower-mcp, ../claude-wrapper, ../git-spawn instead
-# of the pinned revs. The config itself is gitignored, so it never
-# reaches CI or an agent. What it produces can: see `unlink`.
+# Develop against ../tower-mcp, ../claude-wrapper, ../codex-wrapper, and
+# ../git-spawn instead of the pinned revs. The config itself is gitignored,
+# so it never reaches CI or an agent. What it produces can: see `unlink`.
 link:
     cp .cargo/config.toml.example .cargo/config.toml
     @echo "siblings patched in; run 'just unlink' before committing"
 
 # Drops the patch and repairs Cargo.lock, which is the part that bites.
-# Building while linked rewrites the three entries to local paths by
+# Building while linked rewrites the four entries to local paths by
 # dropping their `source` line, and a lockfile like that builds on
 # exactly one machine: the one that produced it.
 unlink:
@@ -41,7 +41,7 @@ unlink:
     @git diff --quiet Cargo.lock || echo "Cargo.lock repaired; commit it"
 
 # What the nightly drift lane does: are the pins still good against the
-# three mains? Answers without touching the checked-in Cargo.toml.
+# four mains? Answers without touching the checked-in Cargo.toml.
 drift:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -51,7 +51,7 @@ drift:
     import pathlib, re
     p = pathlib.Path('$tmp/Cargo.toml')
     s, n = re.subn(r'rev = \"[0-9a-f]{40}\"', 'branch = \"main\"', p.read_text())
-    assert n == 3, f'expected 3 pinned revs, rewrote {n}'
+    assert n == 4, f'expected 4 pinned revs, rewrote {n}'
     p.write_text(s)"
     cargo build --manifest-path "$tmp/Cargo.toml" --workspace
     rm -rf "$tmp"
