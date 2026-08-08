@@ -373,6 +373,7 @@ mod tests {
             notify,
             db_path: String::new(),
             loopback_mcp_config: String::new(),
+            operator_mcp_config: String::new(),
             plugin_config: toml::Value::Table(toml::map::Map::new()),
             limits: Default::default(),
             runtime: Default::default(),

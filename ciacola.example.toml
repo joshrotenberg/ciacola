@@ -43,6 +43,13 @@ repos = ["joshrotenberg/mdbook-lint"]
 
 # Reusable agent definitions, exposed as MCP prompts and to spawn_role.
 # Plugins ship their own; these win on a name collision.
+#
+# `surface` picks which loopback mount a role with `loopback = true` is
+# handed: "agent" (the default; spawn, send, wait and friends) or
+# "operator", which adds the tools that act on the world (kill, open_pr,
+# prune). Reserve "operator" for roles that supervise rather than
+# implement; the shipped repo-manager has it, the issue-implementer
+# never should.
 # [[roles]]
 # name = "summarizer"
 # description = "Summarizes one PR in five bullets."

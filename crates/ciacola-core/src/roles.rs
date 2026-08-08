@@ -64,6 +64,24 @@ pub struct Role {
     /// Hand this role the server's own tools over loopback.
     #[serde(default)]
     pub loopback: bool,
+    /// Which loopback surface, when `loopback` is set. `agent` is the
+    /// default and is what almost everything should have. `operator`
+    /// additionally grants the tools that act on the world: `kill`,
+    /// `open_pr`, `prune`, `resolve_finding`.
+    ///
+    /// This is capability by endpoint. The two surfaces are separate
+    /// mounts, and an agent is handed the URL of exactly one of them in
+    /// an MCP config applied strictly, so it cannot add the other. That
+    /// holds only while a role's tools cannot make arbitrary HTTP
+    /// requests: granting `Bash(curl:*)` alongside `agent` would hand it
+    /// the operator surface too, since the URL is the whole grant.
+    ///
+    /// Reserve it for roles that supervise rather than implement. The
+    /// point of an implementer not having `open_pr` is that something
+    /// looks at the work before it reaches the world; a manager with
+    /// this is that something, not a bypass of it.
+    #[serde(default)]
+    pub surface: Option<String>,
     /// Placeholder names substituted into `system_prompt` as
     /// `{{name}}`. `agent_id` is always available.
     #[serde(default)]
@@ -144,6 +162,11 @@ impl Runtime {
 pub struct Roles {
     roles: Arc<Vec<Role>>,
     loopback_mcp_config: Arc<String>,
+    /// The same server, mounted where the destructive tools live. Empty
+    /// unless the binary supplies it, in which case a role asking for
+    /// the operator surface falls back to the agent one rather than
+    /// getting no tools at all.
+    operator_mcp_config: Arc<String>,
     runtime: Arc<Runtime>,
     /// Resolved once, so every agent gets the same text and a broken
     /// path fails at boot rather than per spawn.
@@ -164,12 +187,27 @@ impl Roles {
             eprintln!("[roles] {e}");
             None
         });
+        let loopback = loopback_mcp_config.into();
         Self {
             roles: Arc::new(roles),
-            loopback_mcp_config: Arc::new(loopback_mcp_config.into()),
+            // Defaults to the agent surface, so a role asking for the
+            // operator one before the binary supplies its path gets the
+            // safe surface rather than none.
+            operator_mcp_config: Arc::new(loopback.clone()),
+            loopback_mcp_config: Arc::new(loopback),
             runtime: Arc::new(runtime),
             house_rules: Arc::new(house_rules),
         }
+    }
+
+    /// Point roles asking for the operator surface at its own mount.
+    ///
+    /// The binary calls this once it knows the port. Until it does, such
+    /// a role gets the agent surface, which is the safe direction.
+    #[must_use]
+    pub fn with_operator_mcp_config(mut self, path: impl Into<String>) -> Self {
+        self.operator_mcp_config = Arc::new(path.into());
+        self
     }
 
     pub fn runtime(&self) -> &Runtime {
@@ -224,7 +262,17 @@ impl Roles {
             def = def.rotate_after_turns(rotate);
         }
         if role.loopback {
-            def = def.mcp_config(self.loopback_mcp_config.as_str());
+            let config = match role.surface.as_deref() {
+                Some("operator") => self.operator_mcp_config.as_str(),
+                Some(other) => {
+                    // A typo grants less rather than more, which is the
+                    // right failure, but silently is not: say so.
+                    eprintln!("[roles] unknown surface '{other}', using the agent surface");
+                    self.loopback_mcp_config.as_str()
+                }
+                None => self.loopback_mcp_config.as_str(),
+            };
+            def = def.mcp_config(config);
         }
         if let Some(scope) = role.hermetic.as_ref().or(self.runtime.hermetic.as_ref()) {
             def = def.hermetic(scope);
@@ -435,10 +483,11 @@ impl Plugin for RolesPlugin {
 
     fn setup<'a>(&'a mut self, ctx: &'a PluginContext) -> BoxFut<'a, Result<(), FlatError>> {
         Box::pin(async move {
-            self.roles = Some(Roles::new(
-                self.declared.clone(),
-                ctx.loopback_mcp_config.clone(),
-            ));
+            let mut roles = Roles::new(self.declared.clone(), ctx.loopback_mcp_config.clone());
+            if !ctx.operator_mcp_config.is_empty() {
+                roles = roles.with_operator_mcp_config(ctx.operator_mcp_config.clone());
+            }
+            self.roles = Some(roles);
             self.ledger = Some(ctx.ledger.clone());
             self.max_depth = ctx.limits.max_spawn_depth;
             Ok(())
@@ -463,5 +512,65 @@ impl Plugin for RolesPlugin {
 
     fn health(&self) -> BoxFut<'_, serde_json::Value> {
         Box::pin(async move { json!({ "roles": self.declared.len() }) })
+    }
+}
+
+#[cfg(test)]
+mod surface_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn role(surface: Option<&str>) -> Role {
+        Role {
+            name: "r".into(),
+            description: "d".into(),
+            model: None,
+            effort: None,
+            hermetic: None,
+            working_dir: None,
+            allowed_tools: Vec::new(),
+            max_turns: None,
+            rotate_after_turns: None,
+            loopback: true,
+            surface: surface.map(Into::into),
+            arguments: Vec::new(),
+            system_prompt: "s".into(),
+        }
+    }
+
+    /// Which mount a role is pointed at is the whole of its authority,
+    /// so the routing is worth pinning tightly.
+    #[test]
+    fn operator_surface_gets_the_operator_config() {
+        let roles = Roles::new(vec![role(Some("operator"))], "agent.json")
+            .with_operator_mcp_config("operator.json");
+        let def = roles.to_def(roles.get("r").unwrap(), &HashMap::new());
+        assert_eq!(def.mcp_config.as_deref(), Some("operator.json"));
+    }
+
+    #[test]
+    fn default_surface_gets_the_agent_config() {
+        let roles =
+            Roles::new(vec![role(None)], "agent.json").with_operator_mcp_config("operator.json");
+        let def = roles.to_def(roles.get("r").unwrap(), &HashMap::new());
+        assert_eq!(def.mcp_config.as_deref(), Some("agent.json"));
+    }
+
+    /// Before the binary supplies the operator path, asking for it gets
+    /// the agent surface rather than nothing: fail toward less.
+    #[test]
+    fn operator_surface_without_a_supplied_path_falls_back() {
+        let roles = Roles::new(vec![role(Some("operator"))], "agent.json");
+        let def = roles.to_def(roles.get("r").unwrap(), &HashMap::new());
+        assert_eq!(def.mcp_config.as_deref(), Some("agent.json"));
+    }
+
+    /// A typo grants less, never more, and warns on stderr.
+    #[test]
+    fn unknown_surface_falls_back_to_the_agent_config() {
+        let roles = Roles::new(vec![role(Some("opreator"))], "agent.json")
+            .with_operator_mcp_config("operator.json");
+        let def = roles.to_def(roles.get("r").unwrap(), &HashMap::new());
+        assert_eq!(def.mcp_config.as_deref(), Some("agent.json"));
     }
 }

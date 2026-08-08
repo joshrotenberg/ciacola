@@ -229,6 +229,11 @@ pub struct PluginContext {
     /// Path to the MCP config pointing back at this server, for
     /// plugins that provision agents with loopback access.
     pub loopback_mcp_config: String,
+    /// The same server at its operator mount, where the tools that act
+    /// on the world live (`kill`, `open_pr`, `prune`). Empty when the
+    /// binary has not supplied one, and a role asking for it then falls
+    /// back to the agent surface, which is the safe direction.
+    pub operator_mcp_config: String,
     /// The `[plugins]` table from config, so a plugin reads its own
     /// settings without `main` knowing its shape. This is what makes a
     /// third-party plugin installable rather than wired in by hand.
@@ -685,6 +690,7 @@ mod tests {
             notify,
             db_path: String::new(),
             loopback_mcp_config: String::new(),
+            operator_mcp_config: String::new(),
             plugin_config: toml::Value::Table(toml::map::Map::new()),
             limits: Default::default(),
             runtime: Default::default(),
