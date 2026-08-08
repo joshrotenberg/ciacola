@@ -1,13 +1,25 @@
 //! The core operation: define an agent, prompt it, prompt it again.
 //!
-//! Deliberately a thin wrapper over `claude-wrapper`. The only state this
-//! layer adds is the session id (which makes the second prompt a
-//! continuation rather than a fresh conversation) and the record of what
-//! each turn cost. Everything else is passthrough.
+//! Deliberately thin over [`ciacola_agent`], the provider contract. The
+//! only state this layer adds is the session id (which makes the second
+//! prompt a continuation rather than a fresh conversation) and the
+//! record of what each turn cost. Everything else is translation.
+//!
+//! # What this module no longer knows
+//!
+//! Which backend runs the turn. An [`AgentDef`] carries a
+//! [`ProviderKey`], a [`ProviderRegistry`] resolves it to an adapter,
+//! and the adapter owns every CLI flag, wire format, and process.
+//! Nothing here imports a wrapper, which is the property issue 53
+//! exists to establish: a second backend arrives as an adapter crate
+//! and a key, not as another round of conditionals in this file.
 
 use std::path::PathBuf;
 
-use claude_wrapper::{Claude, QueryCommand};
+use ciacola_agent::{
+    AgentError, Effort, Isolation, McpScope, ProviderKey, ProviderRegistry, ResumeId, TurnEvents,
+    TurnIntent, TurnOutcome,
+};
 use serde::{Deserialize, Serialize};
 
 /// Errors are boxed strings for now; this is a spike, and nothing
@@ -20,6 +32,16 @@ pub type FlatError = Box<dyn std::error::Error + Send + Sync>;
 pub struct AgentDef {
     pub name: String,
     pub system_prompt: String,
+    /// Which backend runs this agent's turns.
+    ///
+    /// `#[serde(default)]` over a type whose `Default` is `claude` is
+    /// the whole of the migration story for the live ledger: every
+    /// agent row and every config file written before this field
+    /// existed has no `provider` key at all, and each one must come
+    /// back as a Claude agent that resumes its existing session rather
+    /// than as a parse error or a fresh conversation.
+    #[serde(default)]
+    pub provider: ProviderKey,
     /// Provider model. `None` means the provider's default.
     pub model: Option<String>,
     /// How hard to think: low, medium, high, xhigh, max. Paired with
@@ -103,6 +125,7 @@ impl AgentDef {
         Self {
             name: name.into(),
             system_prompt: system_prompt.into(),
+            provider: ProviderKey::claude(),
             model: None,
             effort: None,
             allowed_tools: Vec::new(),
@@ -115,6 +138,12 @@ impl AgentDef {
             house_rules: None,
             token_env: None,
         }
+    }
+
+    /// Choose the backend. Omitted means [`ProviderKey::claude`].
+    pub fn provider(mut self, provider: impl Into<ProviderKey>) -> Self {
+        self.provider = provider.into();
+        self
     }
 
     pub fn model(mut self, model: impl Into<String>) -> Self {
@@ -333,6 +362,7 @@ pub fn compose_system_prompt(def: &AgentDef) -> String {
     skip_all,
     fields(
         agent = %def.name,
+        provider = %def.provider,
         model = def.model.as_deref().unwrap_or("default"),
         effort = def.effort.as_deref().unwrap_or("default"),
         resumed = started && session.is_some(),
@@ -341,202 +371,244 @@ pub fn compose_system_prompt(def: &AgentDef) -> String {
     )
 )]
 pub async fn run_exchange(
+    providers: &ProviderRegistry,
     def: &AgentDef,
+    mcp: Option<McpScope>,
     session: Option<&str>,
     started: bool,
     text: &str,
+    events: &dyn TurnEvents,
 ) -> Result<Exchange, FlatError> {
-    let mut builder = Claude::builder();
-    if let Some(dir) = &def.working_dir {
-        builder = builder.working_dir(dir);
-    }
-    if let Some(home) = &def.claude_home {
-        // The CLI reads its config and writes its sessions here.
-        std::fs::create_dir_all(home)?;
-        builder = builder.env("CLAUDE_CONFIG_DIR", home);
-    }
-    if let Some(var) = &def.token_env {
-        match std::env::var(var) {
-            Ok(token) if !token.is_empty() => {
-                builder = builder.env("CLAUDE_CODE_OAUTH_TOKEN", token);
-            }
-            _ => {
-                tracing::warn!(var, "token_env is set but the variable is empty or unset");
-            }
-        }
-    }
-    let claude = builder.build()?;
+    let provider = providers.get(&def.provider)?;
+    let intent = intent_for(def, mcp, session, started, text);
 
-    let mut command = query_for_session(def, session, started, text);
-    if let Some(model) = &def.model {
-        command = command.model(model);
+    // Fail closed on anything that would widen what this agent can
+    // reach or see; say the rest out loud and carry on. Where that line
+    // falls is the contract's decision, not ours: see
+    // `ciacola_agent::Constraint::security`.
+    let validation = provider.capabilities().validate(&intent);
+    if let Some(blocking) = validation.blocking() {
+        return Err(AgentError::Unsupported {
+            provider: def.provider.clone(),
+            constraint: blocking.constraint,
+            detail: blocking.detail.clone(),
+        }
+        .into());
     }
+    for warning in validation.warnings() {
+        tracing::warn!(
+            agent = %def.name,
+            provider = %def.provider,
+            constraint = ?warning.constraint,
+            detail = %warning.detail,
+            "provider cannot honour part of this turn; running without it"
+        );
+    }
+
+    match provider.run(&intent, events).await {
+        Ok(outcome) => Ok(exchange_from(def, outcome)),
+        // A failure that still knows what it spent comes back as an
+        // exchange that errored, which is the path that already banks
+        // spend and a session id. `Err` is reserved for a turn that
+        // genuinely did not happen, because that is the only one with
+        // nothing to bank.
+        Err(e) => match partial_exchange(&e) {
+            Some(exchange) => Ok(exchange),
+            None => Err(e.into()),
+        },
+    }
+}
+
+/// Translate a definition and one thing to say into provider-neutral
+/// intent.
+///
+/// Public to the crate so the ledger-to-provider resume invariant can be
+/// tested without a provider, which is what the old `query_for_session`
+/// existed for.
+pub(crate) fn intent_for(
+    def: &AgentDef,
+    mcp: Option<McpScope>,
+    session: Option<&str>,
+    started: bool,
+    text: &str,
+) -> TurnIntent {
+    let mut intent = TurnIntent::new(text);
+
+    // The three session cases, unchanged from the pre-migration path.
+    // `started` is whether the conversation has been opened at the
+    // provider; an id is assigned before the first turn runs, so its
+    // presence says nothing about that on its own.
+    intent.resume = match (session, started) {
+        // Open: continue it. The transcript already carries everything.
+        (Some(id), true) => Some(ResumeId::ProviderAssigned(id.to_string())),
+        // Named but not yet opened: this turn opens it under that name.
+        (Some(id), false) => Some(ResumeId::ClientAssigned(id.to_string())),
+        // Agents created before ids were assigned have none, and pick
+        // one up from the provider.
+        (None, _) => None,
+    };
+    // An open conversation already carries the instructions it was
+    // opened with, and resending them would be a second system prompt.
+    if !matches!(intent.resume, Some(ResumeId::ProviderAssigned(_))) {
+        intent.instructions = Some(compose_system_prompt(def));
+    }
+
+    intent.model = def.model.clone();
     if let Some(effort) = &def.effort {
-        match effort.to_ascii_lowercase().as_str() {
-            "low" => command = command.effort(claude_wrapper::Effort::Low),
-            "medium" => command = command.effort(claude_wrapper::Effort::Medium),
-            "high" => command = command.effort(claude_wrapper::Effort::High),
-            "xhigh" => command = command.effort(claude_wrapper::Effort::Xhigh),
-            "max" => command = command.effort(claude_wrapper::Effort::Max),
+        match Effort::parse(effort) {
+            Some(parsed) => intent.effort = Some(parsed),
             // Unknown values are ignored rather than fatal: config
             // should not brick an agent over a typo in an optional hint.
-            other => eprintln!("[agent] unknown effort '{other}', using provider default"),
+            None => eprintln!("[agent] unknown effort '{effort}', using provider default"),
         }
     }
-    if !def.allowed_tools.is_empty() {
-        command = command.allowed_tools(def.allowed_tools.clone());
-    }
-    if let Some(max_turns) = def.max_turns {
-        command = command.max_turns(max_turns);
-    }
-    if let Some(mcp_config) = &def.mcp_config {
-        command = command.mcp_config(mcp_config).strict_mcp_config();
-    }
+    intent.working_dir = def.working_dir.clone();
+    // Always `Some`, including `Some(empty)`. Every definition this
+    // server produces is an explicit grant, and `None` would mean
+    // "inherit whatever the backend gives you". Sending `None` for an
+    // agent with no tools is precisely the pre-migration bug: the
+    // system prompt told it that it had none while the command carried
+    // no restriction at all.
+    intent.allowed_tools = Some(def.allowed_tools.clone());
+    intent.max_provider_turns = def.max_turns;
+    intent.mcp = mcp;
     if let Some(scope) = &def.hermetic {
-        match scope.to_ascii_lowercase().as_str() {
-            "full" | "true" => {
-                command = command.hermetic_scoped(claude_wrapper::HermeticScope::Full)
-            }
-            "project" => command = command.hermetic_scoped(claude_wrapper::HermeticScope::Project),
-            "none" | "false" => {}
-            other => eprintln!("[agent] unknown hermetic scope '{other}', inheriting ambient"),
+        match Isolation::parse(scope) {
+            Some(parsed) => intent.isolation = parsed,
+            None => eprintln!("[agent] unknown hermetic scope '{scope}', inheriting ambient"),
         }
     }
+    intent.config_home = def.claude_home.clone();
+    intent.token_env = def.token_env.clone();
+    intent
+}
 
-    let started = std::time::Instant::now();
-    let result = match command.execute_json(&claude).await {
-        Ok(result) => result,
-        Err(e) => match capped(&e, started.elapsed().as_millis() as u64, session) {
-            Some(exchange) => return Ok(exchange),
-            None => return Err(e.into()),
-        },
-    };
+/// Record a completed turn in the shape the ledger stores.
+///
+/// The ledger's columns are plain integers that predate [`Cost`] and
+/// [`Usage`], so the three-state distinction is lost here. It is lost
+/// *once*, in one place, and never quietly: a provider that prices its
+/// work and reported nothing says so on the way past, while one that
+/// never prices says nothing because it has nothing to report.
+fn exchange_from(def: &AgentDef, outcome: TurnOutcome) -> Exchange {
+    if outcome.cost.is_missing() {
+        tracing::warn!(
+            agent = %def.name,
+            provider = %def.provider,
+            "provider prices its work but reported no cost for this turn; \
+             recording zero, which the spend limit cannot tell from free"
+        );
+    }
+    if outcome.usage.is_missing() {
+        tracing::warn!(
+            agent = %def.name,
+            provider = %def.provider,
+            "provider counts tokens but reported none for this turn; recording zero"
+        );
+    }
+    let cost_micro_usd = outcome.cost.micro_usd_or_zero();
+    let tokens = outcome.usage.tokens().unwrap_or_default();
+    let elapsed_ms = outcome.elapsed.as_millis() as u64;
 
-    let usage = result.usage.unwrap_or_default();
     let span = tracing::Span::current();
-    span.record(
-        "cost_micro_usd",
-        result
-            .cost_usd
-            .map(|u| (u * 1e6) as u64)
-            .unwrap_or_default(),
-    );
-    span.record("tokens_out", usage.output_tokens.unwrap_or_default());
+    span.record("cost_micro_usd", cost_micro_usd);
+    span.record("tokens_out", tokens.output);
     // An explicit event as well as the span fields: the span carries
     // structure for a real collector later, the event is what a person
     // reading stderr today actually sees.
     tracing::info!(
         agent = %def.name,
+        provider = %def.provider,
         model = def.model.as_deref().unwrap_or("default"),
-        cost_micro_usd = result.cost_usd.map(|u| (u * 1e6) as u64).unwrap_or_default(),
-        tokens_in = usage.input_tokens.unwrap_or_default(),
-        tokens_out = usage.output_tokens.unwrap_or_default(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        is_error = result.is_error,
+        cost_micro_usd,
+        tokens_in = tokens.input,
+        tokens_out = tokens.output,
+        elapsed_ms,
+        is_error = !outcome.succeeded(),
         "exchange complete"
     );
-    Ok(Exchange {
-        error: result.is_error.then(|| result.result.trim().to_string()),
-        reply: result.result.trim().to_string(),
-        session: result.session_id,
-        cost_micro_usd: result
-            .cost_usd
-            .map(|usd| (usd * 1_000_000.0) as u64)
-            .unwrap_or_default(),
-        tokens_in: usage.input_tokens.unwrap_or_default(),
-        tokens_out: usage.output_tokens.unwrap_or_default(),
-        tokens_cached: usage.cached_input_tokens.unwrap_or_default(),
-        num_turns: result.num_turns.unwrap_or_default(),
-        elapsed_ms: started.elapsed().as_millis() as u64,
-    })
-}
 
-/// Apply the one session-state choice before adding the rest of an
-/// agent's provider options. Kept separate so the ledger-to-provider
-/// resume invariant can be tested without spawning the CLI.
-pub(crate) fn query_for_session(
-    def: &AgentDef,
-    session: Option<&str>,
-    started: bool,
-    text: &str,
-) -> QueryCommand {
-    match (session, started) {
-        // The session carries the system prompt and everything said so
-        // far; the resumed prompt is just the next thing we say.
-        (Some(session), true) => QueryCommand::new(text).resume(session),
-        // Assigned but not yet opened: name it, and send the system
-        // prompt that the session will carry from here on.
-        (Some(session), false) => QueryCommand::new(text)
-            .session_id(session)
-            .system_prompt(compose_system_prompt(def)),
-        // Agents created before ids were assigned have none. They keep
-        // the old behaviour and pick one up from the provider.
-        (None, _) => QueryCommand::new(text).system_prompt(compose_system_prompt(def)),
+    Exchange {
+        error: outcome.failure_message().map(str::to_string),
+        reply: outcome.reply,
+        session: outcome
+            .resume
+            .as_ref()
+            .map(|r| r.value().to_string())
+            .unwrap_or_default(),
+        cost_micro_usd,
+        tokens_in: tokens.input,
+        tokens_out: tokens.output,
+        tokens_cached: tokens.cached_input,
+        num_turns: outcome.provider_turns.unwrap_or_default(),
+        elapsed_ms,
     }
 }
 
-/// A run that hit a ceiling we set, rendered as the exchange it was.
+/// A failure that still knows what it spent, rendered as the exchange it
+/// was.
 ///
-/// The provider ran, at length, and stopped at a cap. That is not the
-/// same as failing to run, and the difference is worth real money: the
-/// wrapper keeps `cost_usd` and `session_id` off the terminal result
-/// event, and stringifying the error throws both away. A five minute
-/// run then lands in the ledger as costing nothing, which is invisible
-/// to the spend limit and to anything reading the board.
-///
-/// Returning an `Exchange` with `error` set routes it through the path
-/// that already records spend for a run that errored, rather than
-/// adding a second one. Both variants are `#[non_exhaustive]`, hence
-/// the `..`.
-fn capped(
-    e: &claude_wrapper::Error,
-    elapsed_ms: u64,
-    assigned_session: Option<&str>,
-) -> Option<Exchange> {
-    let (cost_usd, num_turns, session_id) = match e {
-        claude_wrapper::Error::MaxTurnsExceeded {
-            cost_usd,
-            num_turns,
-            session_id,
-            ..
-        }
-        | claude_wrapper::Error::MaxBudgetExceeded {
-            cost_usd,
-            num_turns,
-            session_id,
-            ..
-        } => (*cost_usd, *num_turns, session_id.clone()),
-        _ => return None,
-    };
+/// A cancelled or timed-out run may have worked for twenty minutes and
+/// opened a conversation. Reporting it as `Err` and nothing else would
+/// throw both away, which is the bug that made a long capped run land in
+/// the ledger as free and unresumable. `None` means the turn really did
+/// not happen: no process, no spend, nothing to record but the failure
+/// itself.
+fn partial_exchange(error: &AgentError) -> Option<Exchange> {
+    let partial = error.partial()?;
+    if partial.is_empty() {
+        return None;
+    }
+    let tokens = partial.usage.unwrap_or_default();
     Some(Exchange {
-        error: Some(e.to_string()),
+        error: Some(error.to_string()),
         reply: String::new(),
-        // A cap is a terminal provider result, so it proves that the
-        // assigned session was opened even if this CLI version omitted
-        // the id from its error payload.
-        session: session_id
-            .or_else(|| assigned_session.map(str::to_string))
+        session: partial
+            .resume
+            .as_ref()
+            .map(|r| r.value().to_string())
             .unwrap_or_default(),
-        cost_micro_usd: cost_usd
-            .map(|u| (u * 1_000_000.0) as u64)
+        cost_micro_usd: partial
+            .cost
+            .map(|c| c.micro_usd_or_zero())
             .unwrap_or_default(),
-        // The cap events carry no usage breakdown, so tokens stay zero
-        // rather than being invented. Cost is the number that matters
-        // here and it is real.
-        tokens_in: 0,
-        tokens_out: 0,
-        tokens_cached: 0,
-        num_turns: num_turns.unwrap_or_default(),
-        elapsed_ms,
+        tokens_in: tokens.input,
+        tokens_out: tokens.output,
+        tokens_cached: tokens.cached_input,
+        // The contract carries no provider-turn count on a partial, and
+        // inventing one would be worse than admitting the gap.
+        num_turns: 0,
+        elapsed_ms: partial
+            .elapsed
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default(),
     })
 }
 
 /// Prompt the agent once. Resumes its session if it has one, starts the
 /// conversation if not. On success the turn is recorded on the agent and
 /// returned.
-pub async fn prompt<'a>(agent: &'a mut Agent, text: &str) -> Result<&'a Turn, FlatError> {
+///
+/// The cap handling that used to live beside this function is gone from
+/// core, not lost: recognising a run that stopped at a ceiling is the
+/// backend's job now, and the adapter returns it as a [`TurnOutcome`]
+/// carrying its spend and its resume id rather than as an error.
+pub async fn prompt<'a>(
+    providers: &ProviderRegistry,
+    agent: &'a mut Agent,
+    text: &str,
+) -> Result<&'a Turn, FlatError> {
     let started = agent.session.is_some();
-    let exchange = run_exchange(&agent.def, agent.session.as_deref(), started, text).await?;
+    let exchange = run_exchange(
+        providers,
+        &agent.def,
+        None,
+        agent.session.as_deref(),
+        started,
+        text,
+        &ciacola_agent::NoEvents,
+    )
+    .await?;
     if let Some(error) = exchange.error {
         return Err(error.into());
     }
@@ -557,73 +629,155 @@ pub async fn prompt<'a>(agent: &'a mut Agent, text: &str) -> Result<&'a Turn, Fl
 }
 
 #[cfg(test)]
-mod cap_tests {
+mod migration_tests {
     use super::*;
+    use ciacola_agent::{Cost, PartialTelemetry, TokenUsage, TurnFailure, Usage};
+    use std::time::Duration;
 
-    /// Built through the wrapper's own classifier rather than by naming
-    /// the variant, which is `#[non_exhaustive]` and cannot be
-    /// constructed here anyway. The upside is that this drives the real
-    /// detection path from the bytes the CLI actually emits, so it also
-    /// fails if that classification ever changes shape.
-    fn capped_error(result_json: &str) -> claude_wrapper::Error {
-        claude_wrapper::Error::from_command_failure(
-            "claude -p ...".into(),
-            1,
-            result_json.into(),
-            String::new(),
-            None,
-        )
+    fn def() -> AgentDef {
+        AgentDef::new("spoke", "do the thing")
     }
 
-    /// The bug this exists for: a run that worked for minutes and hit
-    /// its cap was recorded as costing nothing, which is invisible to
-    /// the spend limit.
+    /// The load-bearing compatibility property: every agent row and
+    /// every config table written before this field existed has no
+    /// `provider` key, and each one must come back as Claude rather than
+    /// as a parse error.
     #[test]
-    fn a_capped_run_keeps_its_spend_and_session() {
-        let e = capped_error(
-            r#"{"type":"result","subtype":"error_max_turns","is_error":true,
-                "total_cost_usd":1.25,"num_turns":60,"session_id":"sess-1",
-                "errors":["Reached maximum number of turns (60)"]}"#,
-        );
-        let x = capped(&e, 323_000, None).expect("a cap is an exchange, not a failure to run");
-        assert_eq!(x.cost_micro_usd, 1_250_000, "spend must survive the cap");
+    fn an_agent_def_without_a_provider_deserializes_as_claude() {
+        let legacy = r#"{
+            "name": "ciacola-manager",
+            "system_prompt": "supervise",
+            "model": null,
+            "allowed_tools": ["Read"],
+            "working_dir": null,
+            "max_turns": null
+        }"#;
+        let def: AgentDef = serde_json::from_str(legacy).expect("a pre-provider row still parses");
+        assert_eq!(def.provider, ProviderKey::claude());
+        assert_eq!(def.name, "ciacola-manager");
+    }
+
+    /// The three session cases, which are the ones that break live
+    /// conversations if they move. An id we assigned but never opened is
+    /// not the same request as one the provider already knows.
+    #[test]
+    fn the_three_session_cases_keep_their_exact_meaning() {
+        let opened = intent_for(&def(), None, Some("sess-1"), true, "next");
         assert_eq!(
-            x.session, "sess-1",
-            "session must survive, so it can resume"
+            opened.resume,
+            Some(ResumeId::ProviderAssigned("sess-1".into()))
         );
+        assert!(
+            opened.instructions.is_none(),
+            "an open conversation already carries its instructions"
+        );
+
+        let assigned = intent_for(&def(), None, Some("sess-1"), false, "first");
         assert_eq!(
-            x.elapsed_ms, 323_000,
-            "wall clock is measured here regardless"
+            assigned.resume,
+            Some(ResumeId::ClientAssigned("sess-1".into()))
         );
+        assert!(
+            assigned.instructions.is_some(),
+            "the turn that opens a conversation carries the system prompt"
+        );
+
+        let fresh = intent_for(&def(), None, None, false, "first");
+        assert!(fresh.resume.is_none());
+        assert!(fresh.instructions.is_some());
+    }
+
+    /// The bug this migration fixes on the way past: a toolless agent
+    /// was told it had no tools and then handed a command with no
+    /// restriction on it. `None` means "inherit"; every definition here
+    /// is an explicit grant, including the empty one.
+    #[test]
+    fn a_toolless_agent_sends_an_explicit_empty_grant_not_an_inherited_one() {
+        let mut d = def();
+        d.allowed_tools = Vec::new();
+        let intent = intent_for(&d, None, None, false, "go");
+        assert_eq!(
+            intent.allowed_tools,
+            Some(Vec::new()),
+            "an explicit empty grant, never None"
+        );
+
+        d.allowed_tools = vec!["Read".into()];
+        let intent = intent_for(&d, None, None, false, "go");
+        assert_eq!(intent.allowed_tools, Some(vec!["Read".to_string()]));
+    }
+
+    /// A capped run keeps its spend and its session, which is what makes
+    /// it resumable and what keeps it visible to the spend limit. The
+    /// recognition now happens in the adapter; this pins that core still
+    /// records what comes back.
+    #[test]
+    fn a_failed_outcome_keeps_its_spend_and_session_in_the_ledger_shape() {
+        let outcome = TurnOutcome {
+            failure: Some(TurnFailure::limit("reached maximum number of turns (60)")),
+            cost: Cost::Reported {
+                micro_usd: 1_250_000,
+            },
+            usage: Usage::Reported(TokenUsage {
+                input: 900,
+                output: 12,
+                cached_input: 0,
+            }),
+            resume: Some(ResumeId::ProviderAssigned("sess-1".into())),
+            provider_turns: Some(60),
+            elapsed: Duration::from_millis(323_000),
+            ..TurnOutcome::ok("")
+        };
+        let x = exchange_from(&def(), outcome);
+        assert_eq!(x.cost_micro_usd, 1_250_000, "spend must survive");
+        assert_eq!(x.session, "sess-1", "session must survive, so it resumes");
+        assert_eq!(x.elapsed_ms, 323_000);
+        assert_eq!(x.num_turns, 60);
+        assert_eq!(x.tokens_in, 900);
         assert!(
             x.error.is_some(),
             "it still failed, and must read as failed"
         );
     }
 
-    /// Cost is reported only when the result event carried it. Absent
-    /// means zero, not a panic and not an invented number.
+    /// A cancelled or timed-out run that already spent money is banked
+    /// through the same path, rather than thrown away because it came
+    /// back as `Err`.
     #[test]
-    fn a_capped_run_without_a_reported_cost_is_zero() {
-        let e = capped_error(
-            r#"{"type":"result","subtype":"error_max_turns","is_error":true,
-                "errors":["Reached maximum number of turns (60)"]}"#,
-        );
-        let x = capped(&e, 10, Some("assigned-1")).expect("still an exchange");
-        assert_eq!(x.cost_micro_usd, 0);
-        assert_eq!(
-            x.session, "assigned-1",
-            "the cap itself proves the preassigned session opened"
-        );
+    fn a_partial_failure_is_banked_rather_than_discarded() {
+        let e = AgentError::Cancelled {
+            provider: ProviderKey::claude(),
+            partial: PartialTelemetry {
+                resume: Some(ResumeId::ProviderAssigned("sess-mid".into())),
+                cost: Some(Cost::Reported { micro_usd: 900_000 }),
+                usage: None,
+                elapsed: Some(Duration::from_secs(1_200)),
+            }
+            .into(),
+        };
+        let x = partial_exchange(&e).expect("a run that spent money is an exchange");
+        assert_eq!(x.cost_micro_usd, 900_000);
+        assert_eq!(x.session, "sess-mid");
+        assert_eq!(x.elapsed_ms, 1_200_000);
         assert!(x.error.is_some());
     }
 
-    /// Everything else is still a failure to run and must keep
-    /// propagating, or a real error would be quietly downgraded into an
-    /// empty exchange that looks like it merely errored.
+    /// A turn that genuinely did not happen has nothing to bank, and
+    /// must keep propagating as an error rather than being downgraded
+    /// into an empty exchange that merely looks like it failed.
     #[test]
-    fn an_ordinary_failure_is_not_treated_as_an_exchange() {
-        let e = capped_error("command not found");
-        assert!(capped(&e, 10, Some("unopened")).is_none());
+    fn a_pre_launch_failure_is_not_treated_as_an_exchange() {
+        let e = AgentError::NotFound {
+            provider: ProviderKey::claude(),
+            detail: "no binary".into(),
+        };
+        assert!(partial_exchange(&e).is_none());
+
+        // Present but empty is also nothing to bank.
+        let empty = AgentError::Cancelled {
+            provider: ProviderKey::claude(),
+            partial: PartialTelemetry::none().into(),
+        };
+        assert!(partial_exchange(&empty).is_none());
     }
 }

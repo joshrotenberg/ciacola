@@ -95,13 +95,27 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
         notify.turn(LogLevel::Error, agent_id, seq, state, &error);
     };
 
-    let (def, session, started, prompt) = match load(ledger, agent_id, seq).await {
+    let (def, mcp, session, started, prompt) = match load(ledger, agent_id, seq).await {
         Ok(loaded) => loaded,
         Err(e) => return fail("failed", e.to_string(), 0, 0, None).await,
     };
 
     let wall = std::time::Instant::now();
-    match run_exchange(&def, session.as_deref(), started, &prompt).await {
+    let events = SessionSink {
+        ledger: ledger.clone(),
+        agent_id: agent_id.to_string(),
+    };
+    match run_exchange(
+        ledger.providers(),
+        &def,
+        mcp,
+        session.as_deref(),
+        started,
+        &prompt,
+        &events,
+    )
+    .await
+    {
         Ok(exchange) => {
             if let Some(error) = &exchange.error {
                 // The provider ran and failed. The spend and any session
@@ -153,6 +167,32 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
     }
 }
 
+/// Persists a conversation id the moment a backend reveals one.
+///
+/// Ciacola assigns ids up front, so for Claude this usually confirms an
+/// id already in the ledger and writes nothing new. It exists for the
+/// case up-front assignment cannot cover: a backend that names its own
+/// conversation tells us partway through a turn that may still have
+/// twenty minutes to run, and a crash in those twenty minutes would
+/// otherwise lose the id and make "send again" start over.
+///
+/// Never fails a turn. An id that cannot be written is worth a log line,
+/// not an abandoned run that has already been paid for.
+struct SessionSink {
+    ledger: Ledger,
+    agent_id: String,
+}
+
+impl ciacola_agent::TurnEvents for SessionSink {
+    fn resume_id<'a>(&'a self, id: &'a ciacola_agent::ResumeId) -> ciacola_agent::BoxFut<'a, ()> {
+        Box::pin(async move {
+            if let Err(e) = self.ledger.assign_session(&self.agent_id, id.value()).await {
+                eprintln!("[exec] persist session {}: {e}", self.agent_id);
+            }
+        })
+    }
+}
+
 /// The preamble a rotated agent gets in place of its lost transcript.
 /// Deliberately short: it says where the durable state is, and the
 /// role's system prompt (re-sent with the fresh session) says the rest.
@@ -168,52 +208,90 @@ fn rotation_preamble(name: &str, turns: i64) -> String {
     )
 }
 
-/// The agent's MCP config, with its token on ciacola's own server entry.
+/// The agent's MCP endpoints, with its token on ciacola's own entry.
 ///
 /// The base file names the surface (agent or operator mount) and is
-/// shared; the token is per agent and secret; the file the provider
-/// actually reads is therefore written per agent, here, at the last
-/// moment before the turn runs. Failing loudly is deliberate: a base
-/// config that cannot be parsed is an operator error, and a turn that
-/// ran anonymously *instead* would be the kind of quiet downgrade this
-/// codebase keeps paying for.
-fn token_scoped_mcp_config(
-    agent_id: &str,
+/// shared; the token is per agent and secret. This reads the shared file
+/// and returns *intent*: a list of endpoints the backend materialises
+/// however its own CLI wants them.
+///
+/// That is the fix for a real weakness, not a refactor. Core used to
+/// write the merged config itself, to the predictable path
+/// `$TMPDIR/ciacola-agent-<id>.json`, with `std::fs::write` and
+/// therefore mode 0644. The agent's bearer token sat in that file, world
+/// readable, at a path anyone could guess from an agent id visible on
+/// the board. The Claude adapter writes it through `tempfile` instead:
+/// randomized name, mode 0600, removed when the turn ends.
+///
+/// Failing loudly is deliberate and unchanged: a base config that cannot
+/// be parsed is an operator error, and a turn that ran anonymously
+/// *instead* would be the kind of quiet downgrade this codebase keeps
+/// paying for.
+fn token_scoped_mcp_scope(
     token: &str,
     base_path: &str,
-) -> Result<String, crate::agent::FlatError> {
+) -> Result<ciacola_agent::McpScope, crate::agent::FlatError> {
     let raw =
         std::fs::read_to_string(base_path).map_err(|e| format!("mcp config {base_path}: {e}"))?;
-    let mut config: serde_json::Value =
+    let config: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("mcp config {base_path}: {e}"))?;
-    let Some(servers) = config.get_mut("mcpServers").and_then(|s| s.as_object_mut()) else {
+    let Some(servers) = config.get("mcpServers").and_then(|s| s.as_object()) else {
         return Err(format!("mcp config {base_path}: no mcpServers object").into());
     };
-    if let Some(server) = servers.get_mut("ciacola") {
-        let headers = server
-            .as_object_mut()
-            .ok_or_else(|| format!("mcp config {base_path}: server entry is not an object"))?
-            .entry("headers")
-            .or_insert_with(|| serde_json::json!({}));
-        headers
-            .as_object_mut()
-            .ok_or_else(|| format!("mcp config {base_path}: headers is not an object"))?
-            .insert(
-                crate::identity::TOKEN_HEADER.into(),
-                serde_json::Value::String(token.into()),
-            );
+
+    let mut endpoints = Vec::new();
+    for (name, server) in servers {
+        let server = server
+            .as_object()
+            .ok_or_else(|| format!("mcp config {base_path}: '{name}' is not an object"))?;
+        // Only loopback HTTP has ever been emitted here, and the
+        // contract carries only that. A stdio or otherwise-shaped entry
+        // is refused rather than silently dropped: dropping it would
+        // hand the agent a config missing a server it was granted.
+        let url = server.get("url").and_then(|u| u.as_str()).ok_or_else(|| {
+            format!("mcp config {base_path}: '{name}' has no url; only http servers are supported")
+        })?;
+        let mut headers: std::collections::BTreeMap<String, String> = server
+            .get("headers")
+            .and_then(|h| h.as_object())
+            .map(|h| {
+                h.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if name == "ciacola" {
+            headers.insert(crate::identity::TOKEN_HEADER.into(), token.into());
+        }
+        endpoints.push(ciacola_agent::McpEndpoint {
+            name: name.clone(),
+            url: url.to_string(),
+            headers,
+        });
     }
-    let path = std::env::temp_dir().join(format!("ciacola-agent-{agent_id}.json"));
-    std::fs::write(&path, serde_json::to_string(&config)?)
-        .map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(path.display().to_string())
+
+    // Strict, as before: the endpoint an agent was handed is the whole
+    // of its authority, and a non-exclusive list is not that list.
+    Ok(ciacola_agent::McpScope {
+        endpoints,
+        strict: true,
+    })
 }
 
 async fn load(
     ledger: &Ledger,
     agent_id: &str,
     seq: i64,
-) -> Result<(crate::agent::AgentDef, Option<String>, bool, String), crate::agent::FlatError> {
+) -> Result<
+    (
+        crate::agent::AgentDef,
+        Option<ciacola_agent::McpScope>,
+        Option<String>,
+        bool,
+        String,
+    ),
+    crate::agent::FlatError,
+> {
     let agent = ledger
         .get_agent(agent_id)
         .await?
@@ -241,13 +319,12 @@ async fn load(
     // backfilled at boot; a missing one here means only that the call
     // will arrive anonymous, which is survivable, unlike failing the
     // turn of an agent that worked yesterday.
-    let mut def = agent.def;
-    if let Some(base) = def.mcp_config.clone() {
+    let mut mcp = None;
+    if let Some(base) = agent.def.mcp_config.clone() {
         if let Some(token) = ledger.token_of(agent_id).await? {
-            def.mcp_config = Some(token_scoped_mcp_config(agent_id, &token, &base)?);
+            mcp = Some(token_scoped_mcp_scope(&token, &base)?);
         }
     }
-    let agent = crate::ledger::AgentRow { def, ..agent };
 
     if rotating {
         eprintln!("[exec] rotating {agent_id} after {in_session} turns in session");
@@ -259,12 +336,13 @@ async fn load(
         let preamble = rotation_preamble(&agent.def.name, in_session);
         return Ok((
             agent.def,
+            mcp,
             Some(next),
             false,
             format!("{preamble}{}", turn.prompt),
         ));
     }
-    Ok((agent.def, agent.session, started, turn.prompt))
+    Ok((agent.def, mcp, agent.session, started, turn.prompt))
 }
 
 type Kills = Arc<Mutex<HashMap<(String, i64), CancellationToken>>>;
@@ -272,8 +350,10 @@ type Kills = Arc<Mutex<HashMap<(String, i64), CancellationToken>>>;
 /// The default executor: everything a work queue would do for us,
 /// written out. A channel is the queue, a semaphore is the
 /// concurrency limit, a cancellation token is the kill switch. Dropping
-/// the turn's future kills the provider process group (claude-wrapper
-/// sets kill_on_drop and its own process group per child).
+/// the turn's future kills the provider's process group, which is the
+/// adapter's guarantee rather than this file's: core drops the future
+/// and the backend owns what that costs its children. The Claude
+/// adapter documents how it holds up its end.
 pub struct HandExecutor {
     tx: mpsc::UnboundedSender<(String, i64)>,
     kills: Kills,
@@ -393,10 +473,20 @@ impl TurnExecutor for HandExecutor {
 #[cfg(test)]
 mod config_injection_tests {
     use super::*;
-    use claude_wrapper::ClaudeCommand;
+
+    fn endpoint<'a>(
+        scope: &'a ciacola_agent::McpScope,
+        name: &str,
+    ) -> &'a ciacola_agent::McpEndpoint {
+        scope
+            .endpoints
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("no endpoint '{name}'"))
+    }
 
     /// The base names the surface and is shared; the token is secret
-    /// and per agent; the provider must read a file carrying both.
+    /// and per agent; the backend must receive both.
     #[test]
     fn the_token_lands_only_in_ciacolas_headers() {
         let dir = std::env::temp_dir();
@@ -410,52 +500,96 @@ mod config_injection_tests {
         )
         .expect("write base");
 
-        let path = token_scoped_mcp_config("agent-1", "sekrit", &base.display().to_string())
-            .expect("inject");
-        let out: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        let scope =
+            token_scoped_mcp_scope("sekrit", &base.display().to_string()).expect("build scope");
         std::fs::remove_file(&base).ok();
-        std::fs::remove_file(&path).ok();
 
         assert_eq!(
-            out["mcpServers"]["ciacola"]["headers"][crate::identity::TOKEN_HEADER],
-            serde_json::json!("sekrit"),
+            endpoint(&scope, "ciacola").headers[crate::identity::TOKEN_HEADER],
+            "sekrit",
             "the loopback server must carry the token"
         );
-        assert_eq!(
-            out["mcpServers"]["other"]["headers"][crate::identity::TOKEN_HEADER],
-            serde_json::Value::Null,
+        assert!(
+            !endpoint(&scope, "other")
+                .headers
+                .contains_key(crate::identity::TOKEN_HEADER),
             "an unrelated server must never receive ciacola's bearer secret"
         );
         assert_eq!(
-            out["mcpServers"]["other"]["headers"]["keep"],
-            serde_json::json!("me"),
+            endpoint(&scope, "other").headers["keep"],
+            "me",
             "existing headers survive"
         );
         assert_eq!(
-            out["mcpServers"]["ciacola"]["url"],
-            serde_json::json!("http://127.0.0.1:1/mcp"),
+            endpoint(&scope, "ciacola").url,
+            "http://127.0.0.1:1/mcp",
             "everything else is untouched"
+        );
+        assert!(
+            scope.strict,
+            "the endpoint list an agent was handed is the whole of its authority"
+        );
+    }
+
+    /// Core hands the backend intent and never writes the secret itself.
+    /// The old path wrote it to `$TMPDIR/ciacola-agent-<id>.json` at mode
+    /// 0644, world readable at a guessable path; the adapter now writes
+    /// a randomized 0600 file instead. This pins the half core owns:
+    /// the value is carried, and it does not survive a debug print.
+    #[test]
+    fn the_secret_is_carried_as_intent_and_never_printed() {
+        let dir = std::env::temp_dir();
+        let base = dir.join(format!("ciacola-test-print-{}.json", std::process::id()));
+        std::fs::write(
+            &base,
+            r#"{"mcpServers": {"ciacola": {"type": "http", "url": "http://127.0.0.1:1/mcp"}}}"#,
+        )
+        .expect("write base");
+        let scope =
+            token_scoped_mcp_scope("top-secret", &base.display().to_string()).expect("scope");
+        std::fs::remove_file(&base).ok();
+
+        let printed = format!("{scope:?}");
+        assert!(
+            !printed.contains("top-secret"),
+            "the token must not reach a log line or panic message: {printed}"
         );
     }
 
     /// Loud, not lenient: a base config that cannot be parsed is an
     /// operator error, and a turn that ran anonymously instead would be
-    /// a quiet downgrade.
+    /// a quiet downgrade. Same for a server shape the contract cannot
+    /// carry, which must be refused rather than silently dropped from
+    /// the list the agent was granted.
     #[test]
     fn a_broken_base_config_fails_rather_than_degrading() {
         let dir = std::env::temp_dir();
         let base = dir.join(format!("ciacola-test-broken-{}.json", std::process::id()));
         std::fs::write(&base, "not json").expect("write");
-        let out = token_scoped_mcp_config("agent-1", "t", &base.display().to_string());
+        let out = token_scoped_mcp_scope("t", &base.display().to_string());
         std::fs::remove_file(&base).ok();
         assert!(out.is_err());
+
+        let stdio = dir.join(format!("ciacola-test-stdio-{}.json", std::process::id()));
+        std::fs::write(
+            &stdio,
+            r#"{"mcpServers": {"local": {"command": "some-server", "args": []}}}"#,
+        )
+        .expect("write");
+        let out = token_scoped_mcp_scope("t", &stdio.display().to_string());
+        std::fs::remove_file(&stdio).ok();
+        assert!(
+            out.is_err(),
+            "a server the contract cannot express must be refused, not dropped"
+        );
     }
 
     /// The complete regression from the dogfood run: a capped first
     /// turn is failed in the ledger, then the next queued prompt must
-    /// render `--resume`, never a second `--session-id` for the id the
-    /// provider already created.
+    /// ask to *resume* the id the provider already created, never to
+    /// open it a second time. Asserted on the intent rather than on
+    /// argv, because which flag that becomes is the adapter's business
+    /// now; the meaning is core's, and the meaning is what broke.
     #[tokio::test]
     async fn a_capped_first_turn_makes_the_second_query_resume() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:")
@@ -498,19 +632,55 @@ mod config_injection_tests {
             .enqueue_turn(&agent_id, "continue")
             .await
             .expect("second turn");
-        let (def, session, started, prompt) =
+        let (def, mcp, session, started, prompt) =
             load(&ledger, &agent_id, second).await.expect("load second");
-        let args =
-            crate::agent::query_for_session(&def, session.as_deref(), started, &prompt).args();
+        let intent = crate::agent::intent_for(&def, mcp, session.as_deref(), started, &prompt);
 
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--resume", assigned.as_str()]),
-            "second query did not resume: {args:?}"
+        assert_eq!(
+            intent.resume,
+            Some(ciacola_agent::ResumeId::ProviderAssigned(assigned.clone())),
+            "the second turn must continue the conversation the cap opened"
         );
         assert!(
-            !args.iter().any(|arg| arg == "--session-id"),
-            "second query tried to recreate the session: {args:?}"
+            intent.instructions.is_none(),
+            "an open conversation already carries its instructions"
+        );
+    }
+
+    /// The opening turn is the other half of the same invariant: an id
+    /// we assigned but the provider has not seen yet must be sent as a
+    /// request to open that conversation, carrying the system prompt.
+    #[tokio::test]
+    async fn a_first_turn_opens_the_preassigned_session_with_instructions() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool).await.expect("ledger");
+        let agent_id = ledger
+            .create_agent(&crate::agent::AgentDef::new("a", "sys"), None)
+            .await
+            .expect("agent");
+        let assigned = ledger
+            .get_agent(&agent_id)
+            .await
+            .expect("get")
+            .expect("agent row")
+            .session
+            .expect("preassigned session");
+
+        let first = ledger.enqueue_turn(&agent_id, "first").await.expect("turn");
+        let (def, mcp, session, started, prompt) =
+            load(&ledger, &agent_id, first).await.expect("load first");
+        let intent = crate::agent::intent_for(&def, mcp, session.as_deref(), started, &prompt);
+
+        assert_eq!(
+            intent.resume,
+            Some(ciacola_agent::ResumeId::ClientAssigned(assigned)),
+            "the opening turn names the conversation it is about to open"
+        );
+        assert!(
+            intent.instructions.is_some(),
+            "the turn that opens a conversation carries the system prompt"
         );
     }
 }

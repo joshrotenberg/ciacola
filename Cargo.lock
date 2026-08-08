@@ -186,6 +186,8 @@ name = "ciacola"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "ciacola-agent",
+ "ciacola-agent-claude",
  "ciacola-board",
  "ciacola-core",
  "ciacola-findings",
@@ -250,7 +252,7 @@ name = "ciacola-core"
 version = "0.0.1"
 dependencies = [
  "axum",
- "claude-wrapper",
+ "ciacola-agent",
  "schemars",
  "serde",
  "serde_json",

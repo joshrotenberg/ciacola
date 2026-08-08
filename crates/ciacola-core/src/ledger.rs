@@ -29,6 +29,14 @@ pub struct Ledger {
     /// lesson as the spend limit: a guard on some paths is not a guard.
     runtime: crate::roles::Runtime,
     house_rules: Option<String>,
+    /// The backends this server was built with, by key.
+    ///
+    /// Held here because the ledger already reaches every path that runs
+    /// or recovers a turn, and threading a second handle through all of
+    /// them would be churn for its own sake. Core never constructs an
+    /// adapter; the binary assembles this and hands it over, which is
+    /// what keeps core free of any wrapper dependency.
+    providers: ciacola_agent::ProviderRegistry,
 }
 
 /// An agent as the ledger sees it: definition plus everything learned.
@@ -251,6 +259,7 @@ impl Ledger {
             pool,
             runtime: Default::default(),
             house_rules: None,
+            providers: Default::default(),
         };
         ledger.backfill_tokens().await?;
         Ok(ledger)
@@ -283,6 +292,21 @@ impl Ledger {
         self.house_rules = runtime.resolved_house_rules()?;
         self.runtime = runtime;
         Ok(self)
+    }
+
+    /// Attach the backends this build was assembled with. Called once at
+    /// boot by the binary, which is the only place that knows which
+    /// adapter crates were linked in.
+    pub fn with_providers(mut self, providers: ciacola_agent::ProviderRegistry) -> Self {
+        self.providers = providers;
+        self
+    }
+
+    /// The registered backends. An empty one cannot run a turn, and
+    /// every attempt says so by name through
+    /// [`ciacola_agent::AgentError::UnknownProvider`].
+    pub fn providers(&self) -> &ciacola_agent::ProviderRegistry {
+        &self.providers
     }
 }
 

@@ -147,9 +147,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "[ciacola] config: {}",
         config_path.as_deref().unwrap_or(config::DEFAULT_PATH)
     );
+    // Runtime assembly. This is the only place in the workspace that
+    // names a backend: core resolves an agent's `provider` key through
+    // this registry and never learns what is behind it. A second
+    // adapter is one more line here plus one more dependency, which is
+    // the whole point of the seam.
+    let providers = ciacola_agent::ProviderRegistry::new()
+        .with(std::sync::Arc::new(ciacola_agent_claude::ClaudeProvider))
+        .map_err(|e| -> ciacola_core::FlatError { e.to_string().into() })?;
+    eprintln!("[ciacola] providers: {}", providers.keys().join(", "));
+
     let ledger = Ledger::setup(pool.clone())
         .await?
-        .with_runtime(declared_early.runtime.clone())?;
+        .with_runtime(declared_early.runtime.clone())?
+        .with_providers(providers);
 
     let (tx, rx) = notification_channel(64);
     let notify = Notifier(tx);
@@ -278,7 +289,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         eprintln!("[ciacola] config: {line}");
     }
 
-    let health = Health::new(pool, database.path.display().to_string()).with_host(host.clone());
+    let health = Health::new(pool, database.path.display().to_string())
+        .with_providers(ledger.providers())
+        .with_host(host.clone());
 
     // Core verbs, then every plugin's contribution for this surface.
     // Live values for completion/complete, so a generic REPL completes

@@ -10,7 +10,11 @@ authors.workspace = true
 
 [dependencies]
 axum = { workspace = true }
-claude-wrapper = { workspace = true }
+# The provider contract, not any adapter. Core resolves a backend by the
+# key an agent's definition carries; the binary decides what that key
+# resolves to. Adding an adapter dependency here would put core back
+# where issue 53 found it.
+ciacola-agent = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

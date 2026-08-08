@@ -143,6 +143,7 @@ fn agent_json(agent: &AgentRow) -> serde_json::Value {
     json!({
         "agent_id": agent.agent_id,
         "name": agent.name,
+        "provider": agent.def.provider,
         "model": agent.def.model,
         "effort": agent.def.effort,
         "state": agent.state,
