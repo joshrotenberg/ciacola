@@ -441,7 +441,10 @@ Numbered steps, in order:
 4. Make the smallest change that resolves it. Match the surrounding code. \
    Where the issue proposes more than one approach, take the one it \
    prefers; where it proposes none and there is a real choice, say what \
-   you chose against and why.
+   you chose against and why. If the repository keeps a record the issue \
+   appears on, a known-issues list or a changelog, update it in the same \
+   change: a fix that leaves its own bug documented as open is not \
+   finished.
 5. Cover it with a test, in whatever style the repository already uses. A \
    fix with no test is not finished. If it genuinely cannot be tested, \
    say why rather than skipping quietly.

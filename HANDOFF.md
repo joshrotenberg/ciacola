@@ -123,9 +123,7 @@ forbid. House rules are now an explicit layer of the system prompt.
 4. **`CLAUDE_CONFIG_DIR` isolates the login.** A fresh `claude_home`
    authenticates as nobody. `claude setup-token` plus `token_env` is
    the route through, and the server warns at boot.
-5. **No graceful shutdown for the HTTP side.** `drain` handles
-   in-flight turns; the axum server is dropped.
-6. **`wait` is shadowed in mcp-repl.** `wait` is one of the six verbs
+5. **`wait` is shadowed in mcp-repl.** `wait` is one of the six verbs
    and also an mcp-repl built-in (wait for a background task), and the
    built-in wins: typing `wait` gets "no tasks in this session to wait
    for". `find wait` lists both, so the client knows about the clash
@@ -134,7 +132,7 @@ forbid. House rules are now an explicit layer of the system prompt.
    one client is the wrong direction, so this is filed upstream as
    [mcp-repl#87](https://github.com/joshrotenberg/mcp-repl/issues/87)
    and nothing here changes.
-7. **Cost is Claude-only.** codex reports tokens and no price at all
+6. **Cost is Claude-only.** codex reports tokens and no price at all
    and deliberately refuses to synthesize one, which is why tokens are
    in the ledger beside cost. A second provider will find `cost_usd`
    optional in practice but not in shape.
