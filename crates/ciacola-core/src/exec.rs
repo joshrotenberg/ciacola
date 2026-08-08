@@ -168,6 +168,47 @@ fn rotation_preamble(name: &str, turns: i64) -> String {
     )
 }
 
+/// The agent's MCP config, with its token in every server's headers.
+///
+/// The base file names the surface (agent or operator mount) and is
+/// shared; the token is per agent and secret; the file the provider
+/// actually reads is therefore written per agent, here, at the last
+/// moment before the turn runs. Failing loudly is deliberate: a base
+/// config that cannot be parsed is an operator error, and a turn that
+/// ran anonymously *instead* would be the kind of quiet downgrade this
+/// codebase keeps paying for.
+fn token_scoped_mcp_config(
+    agent_id: &str,
+    token: &str,
+    base_path: &str,
+) -> Result<String, crate::agent::FlatError> {
+    let raw =
+        std::fs::read_to_string(base_path).map_err(|e| format!("mcp config {base_path}: {e}"))?;
+    let mut config: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("mcp config {base_path}: {e}"))?;
+    let Some(servers) = config.get_mut("mcpServers").and_then(|s| s.as_object_mut()) else {
+        return Err(format!("mcp config {base_path}: no mcpServers object").into());
+    };
+    for (_, server) in servers.iter_mut() {
+        let headers = server
+            .as_object_mut()
+            .ok_or_else(|| format!("mcp config {base_path}: server entry is not an object"))?
+            .entry("headers")
+            .or_insert_with(|| serde_json::json!({}));
+        headers
+            .as_object_mut()
+            .ok_or_else(|| format!("mcp config {base_path}: headers is not an object"))?
+            .insert(
+                crate::identity::TOKEN_HEADER.into(),
+                serde_json::Value::String(token.into()),
+            );
+    }
+    let path = std::env::temp_dir().join(format!("ciacola-agent-{agent_id}.json"));
+    std::fs::write(&path, serde_json::to_string(&config)?)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path.display().to_string())
+}
+
 async fn load(
     ledger: &Ledger,
     agent_id: &str,
@@ -194,6 +235,19 @@ async fn load(
         .def
         .rotate_after_turns
         .is_some_and(|limit| started && in_session > limit as i64);
+
+    // Identity rides in the config, so the config becomes per agent
+    // the moment the agent has a token. Agents that predate tokens are
+    // backfilled at boot; a missing one here means only that the call
+    // will arrive anonymous, which is survivable, unlike failing the
+    // turn of an agent that worked yesterday.
+    let mut def = agent.def;
+    if let Some(base) = def.mcp_config.clone() {
+        if let Some(token) = ledger.token_of(agent_id).await? {
+            def.mcp_config = Some(token_scoped_mcp_config(agent_id, &token, &base)?);
+        }
+    }
+    let agent = crate::ledger::AgentRow { def, ..agent };
 
     if rotating {
         eprintln!("[exec] rotating {agent_id} after {in_session} turns in session");
@@ -333,5 +387,64 @@ impl TurnExecutor for HandExecutor {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod config_injection_tests {
+    use super::*;
+
+    /// The base names the surface and is shared; the token is secret
+    /// and per agent; the provider must read a file carrying both.
+    #[test]
+    fn the_token_landss_in_every_servers_headers() {
+        let dir = std::env::temp_dir();
+        let base = dir.join(format!("ciacola-test-base-{}.json", std::process::id()));
+        std::fs::write(
+            &base,
+            r#"{"mcpServers": {
+                "ciacola": {"type": "http", "url": "http://127.0.0.1:1/mcp"},
+                "other": {"type": "http", "url": "http://x/", "headers": {"keep": "me"}}
+            }}"#,
+        )
+        .expect("write base");
+
+        let path = token_scoped_mcp_config("agent-1", "sekrit", &base.display().to_string())
+            .expect("inject");
+        let out: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        std::fs::remove_file(&base).ok();
+        std::fs::remove_file(&path).ok();
+
+        for name in ["ciacola", "other"] {
+            assert_eq!(
+                out["mcpServers"][name]["headers"][crate::identity::TOKEN_HEADER],
+                serde_json::json!("sekrit"),
+                "server {name} must carry the token"
+            );
+        }
+        assert_eq!(
+            out["mcpServers"]["other"]["headers"]["keep"],
+            serde_json::json!("me"),
+            "existing headers survive"
+        );
+        assert_eq!(
+            out["mcpServers"]["ciacola"]["url"],
+            serde_json::json!("http://127.0.0.1:1/mcp"),
+            "everything else is untouched"
+        );
+    }
+
+    /// Loud, not lenient: a base config that cannot be parsed is an
+    /// operator error, and a turn that ran anonymously instead would be
+    /// a quiet downgrade.
+    #[test]
+    fn a_broken_base_config_fails_rather_than_degrading() {
+        let dir = std::env::temp_dir();
+        let base = dir.join(format!("ciacola-test-broken-{}.json", std::process::id()));
+        std::fs::write(&base, "not json").expect("write");
+        let out = token_scoped_mcp_config("agent-1", "t", &base.display().to_string());
+        std::fs::remove_file(&base).ok();
+        assert!(out.is_err());
     }
 }

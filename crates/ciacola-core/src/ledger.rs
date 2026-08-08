@@ -237,13 +237,44 @@ impl Ledger {
                 "0008_turns_tokens_cached",
                 "ALTER TABLE turns ADD COLUMN tokens_cached INTEGER NOT NULL DEFAULT 0",
             ),
+            Migration::new(
+                "0009_agents_token",
+                "ALTER TABLE agents ADD COLUMN token TEXT",
+            ),
+            Migration::new(
+                "0010_agents_token_index",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_token ON agents(token)",
+            ),
         ];
         crate::plugin::apply_migrations(&pool, "core", MIGRATIONS).await?;
-        Ok(Self {
+        let ledger = Self {
             pool,
             runtime: Default::default(),
             house_rules: None,
-        })
+        };
+        ledger.backfill_tokens().await?;
+        Ok(ledger)
+    }
+
+    /// Agents that predate identity get a token at the next boot.
+    ///
+    /// Sqlite cannot mint one per row in the migration itself, and an
+    /// agent without a token cannot be recognised on the loopback: its
+    /// calls would arrive anonymous forever, which is the state this
+    /// whole mechanism exists to end.
+    async fn backfill_tokens(&self) -> Result<(), FlatError> {
+        let missing: Vec<(String,)> =
+            sqlx::query_as("SELECT agent_id FROM agents WHERE token IS NULL")
+                .fetch_all(&self.pool)
+                .await?;
+        for (agent_id,) in missing {
+            sqlx::query("UPDATE agents SET token = ?2 WHERE agent_id = ?1")
+                .bind(&agent_id)
+                .bind(new_token())
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Attach the server-wide defaults. Called once at boot, before any
@@ -253,6 +284,18 @@ impl Ledger {
         self.runtime = runtime;
         Ok(self)
     }
+}
+
+/// A per-agent secret for the loopback.
+///
+/// Two ulids side by side: 160 bits of randomness against a loopback
+/// listener on a laptop, which is plenty, without adding a crate for
+/// it. It is a bearer secret, so it lives in the agents table and in
+/// the one MCP config file written for its agent, and deliberately
+/// never on [`AgentRow`]: what is not on the row cannot be serialized
+/// into a tool result or a board page by accident.
+pub fn new_token() -> String {
+    format!("{}{}", ulid::Ulid::new(), ulid::Ulid::new()).to_lowercase()
 }
 
 /// A session id we choose, rather than one we learn.
@@ -277,6 +320,32 @@ pub fn new_session_id() -> String {
 }
 
 impl Ledger {
+    /// The caller behind a loopback token, if the token is real.
+    ///
+    /// This is the whole of authentication: the transport layer maps a
+    /// header to an agent id with this, and everything downstream
+    /// trusts the id because it was derived rather than claimed.
+    pub async fn agent_id_by_token(&self, token: &str) -> Result<Option<String>, FlatError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT agent_id FROM agents WHERE token = ?1 AND retired = 0")
+                .bind(token)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(id,)| id))
+    }
+
+    /// An agent's own token, for writing its MCP config. Deliberately a
+    /// separate query rather than a field on [`AgentRow`]; see
+    /// [`new_token`].
+    pub async fn token_of(&self, agent_id: &str) -> Result<Option<String>, FlatError> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT token FROM agents WHERE agent_id = ?1")
+                .bind(agent_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|(t,)| t))
+    }
+
     /// Point an agent at a session it has not used yet.
     ///
     /// `session_started_seq` goes back to 0, which is what marks the id
@@ -318,14 +387,15 @@ impl Ledger {
             def.token_env = self.runtime.token_env.clone();
         }
         sqlx::query(
-            "INSERT INTO agents (agent_id, name, def, spawned_by, session) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO agents (agent_id, name, def, spawned_by, session, token) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind(&agent_id)
         .bind(&def.name)
         .bind(serde_json::to_string(&def)?)
         .bind(spawned_by)
         .bind(new_session_id())
+        .bind(new_token())
         .execute(&self.pool)
         .await?;
         Ok(agent_id)
@@ -832,6 +902,57 @@ mod session_tests {
             a.session.as_deref(),
             Some(assigned.as_str()),
             "the session must survive an orphaned turn"
+        );
+    }
+
+    /// The loopback credential, end to end: minted at birth, resolves
+    /// to its agent, stops resolving at retirement, never repeats.
+    #[tokio::test]
+    async fn tokens_are_minted_resolved_and_die_with_retirement() {
+        let l = ledger().await;
+        let a = l
+            .create_agent(&AgentDef::new("a", "s"), None)
+            .await
+            .expect("create");
+        let b = l
+            .create_agent(&AgentDef::new("b", "s"), None)
+            .await
+            .expect("create");
+        let ta = l.token_of(&a).await.expect("q").expect("a has a token");
+        let tb = l.token_of(&b).await.expect("q").expect("b has a token");
+        assert_ne!(ta, tb);
+        assert_eq!(
+            l.agent_id_by_token(&ta).await.expect("q").as_deref(),
+            Some(a.as_str())
+        );
+        assert_eq!(l.agent_id_by_token("no-such-token").await.expect("q"), None);
+
+        l.retire_agent(&a).await.expect("retire");
+        assert_eq!(
+            l.agent_id_by_token(&ta).await.expect("q"),
+            None,
+            "a retired agent's token must stop authenticating"
+        );
+    }
+
+    /// Agents that predate the token column get one at boot, because a
+    /// tokenless agent would be anonymous on the loopback forever.
+    #[tokio::test]
+    async fn setup_backfills_agents_that_predate_tokens() {
+        let l = ledger().await;
+        let a = l
+            .create_agent(&AgentDef::new("old", "s"), None)
+            .await
+            .expect("create");
+        sqlx::query("UPDATE agents SET token = NULL WHERE agent_id = ?1")
+            .bind(&a)
+            .execute(&l.pool)
+            .await
+            .expect("null out");
+        let l2 = Ledger::setup(l.pool.clone()).await.expect("re-setup");
+        assert!(
+            l2.token_of(&a).await.expect("q").is_some(),
+            "boot must mint the missing token"
         );
     }
 }

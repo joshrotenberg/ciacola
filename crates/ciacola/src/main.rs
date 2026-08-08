@@ -281,7 +281,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // a connection error.
     let shutdown = CancellationToken::new();
 
+    // The whole of loopback authentication: a header carries a
+    // per-agent secret, the ledger says whose it is, and the identity
+    // rides the request into every tool handler via the transport's
+    // extension bridge. No token, no identity; an unknown token is
+    // treated as no token rather than an error, because the ledger is
+    // also consulted by requests that legitimately have none (mcp-repl
+    // against localhost) and a stale token from a retired agent should
+    // degrade to anonymous, which can claim nothing, rather than break.
+    let identity_ledger = ledger.clone();
+    let attach_identity = axum::middleware::from_fn(
+        move |mut request: axum::extract::Request, next: axum::middleware::Next| {
+            let ledger = identity_ledger.clone();
+            async move {
+                let token = request
+                    .headers()
+                    .get(ciacola_core::TOKEN_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                if let Some(token) = token {
+                    if let Ok(Some(agent_id)) = ledger.agent_id_by_token(&token).await {
+                        request
+                            .extensions_mut()
+                            .insert(ciacola_core::AgentIdentity(agent_id));
+                    }
+                }
+                next.run(request).await
+            }
+        },
+    );
+
     let http = HttpTransport::new(agent_router)
+        .bridge_extension::<ciacola_core::AgentIdentity>()
         .into_router_at("/mcp")
         // Capability by endpoint: which of the two mounts an agent is
         // pointed at is the whole of what it may do, because its MCP
@@ -289,7 +320,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // arbitrary HTTP requests. Anything local can reach this mount,
         // but that has always been true of `/mcp` too; the listener is
         // loopback-only and the threat model is a laptop.
-        .merge(HttpTransport::new(operator_router).into_router_at("/mcp-operator"))
+        .merge(
+            HttpTransport::new(operator_router)
+                .bridge_extension::<ciacola_core::AgentIdentity>()
+                .into_router_at("/mcp-operator"),
+        )
         // The board is optional by construction: nothing in core knows
         // about it, so leaving it out is leaving out a merge.
         .merge(ciacola_board::router_with_limits(
@@ -297,7 +332,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             host,
             declared.limits,
             shutdown.clone(),
-        ));
+        ))
+        .layer(attach_identity);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let http_shutdown = shutdown.clone();
     let http_handle = tokio::spawn(async move {

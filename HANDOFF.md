@@ -120,20 +120,18 @@ forbid. House rules are now an explicit layer of the system prompt.
 
 ## Known broken, in the order it will annoy you
 
-1. **`spawned_by` is honour-system.** The loopback has no caller
-   identity, so an agent reports its own parentage and could lie.
-   Designed in ciacola#7: a per-agent token minted in `create_agent`,
-   carried in that agent's MCP config, resolved to an id by a layer.
-   Blocked on tower-mcp#1242, which asks for a way to get anything a
-   layer knows into a tool handler.
-2. **No capability ceiling.** A spawned helper's tools are not required
-   to be a subset of its parent's. Depth is capped; breadth is not.
-   Falls out of the item above: once the caller is known rather than
-   claimed, `spawn` can intersect the child's tools with the parent's.
-3. **`CLAUDE_CONFIG_DIR` isolates the login.** A fresh `claude_home`
+1. **The operator mount takes anonymous local callers at their word.**
+   Agents authenticate by token now, and an authenticated caller cannot
+   lie about parentage or out-reach its parent. But a local process
+   holding no token can still hit `/mcp-operator` and be treated as the
+   operator, including its claimed `spawned_by`. Containment is that no
+   agent's tool list includes a way to make arbitrary HTTP requests;
+   the fix is requiring a token on the operator mount, which needs a
+   notion of which agents hold operator rights.
+2. **`CLAUDE_CONFIG_DIR` isolates the login.** A fresh `claude_home`
    authenticates as nobody. `claude setup-token` plus `token_env` is
    the route through, and the server warns at boot.
-4. **`wait` is shadowed in mcp-repl.** `wait` is one of the six verbs
+3. **`wait` is shadowed in mcp-repl.** `wait` is one of the six verbs
    and also an mcp-repl built-in (wait for a background task), and the
    built-in wins: typing `wait` gets "no tasks in this session to wait
    for". `find wait` lists both, so the client knows about the clash
@@ -142,7 +140,7 @@ forbid. House rules are now an explicit layer of the system prompt.
    one client is the wrong direction, so this is filed upstream as
    [mcp-repl#87](https://github.com/joshrotenberg/mcp-repl/issues/87)
    and nothing here changes.
-5. **Cost is Claude-only.** codex reports tokens and no price at all
+4. **Cost is Claude-only.** codex reports tokens and no price at all
    and deliberately refuses to synthesize one, which is why tokens are
    in the ledger beside cost. A second provider will find `cost_usd`
    optional in practice but not in shape.

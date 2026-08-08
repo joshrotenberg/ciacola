@@ -35,6 +35,7 @@ use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
+use tower_mcp::extract::{Context, Json, State};
 use tower_mcp::{CallToolResult, Tool, ToolBuilder};
 
 use git_spawn::{CloneCommand, GitCommand, Repository, WorktreeCommand};
@@ -547,6 +548,7 @@ to do, on purpose."
     }
 
     fn tools(&self, surface: Surface) -> Vec<Tool> {
+        let operator_surface = surface == Surface::Operator;
         let (Some(repos), Some(ctx), Some(roles)) =
             (self.repos.clone(), self.ctx.clone(), self.roles.clone())
         else {
@@ -562,9 +564,22 @@ to do, on purpose."
                      implementer pointed at it. Returns the agent to send to.",
                 )
                 .non_destructive()
-                .handler(move |args: StartIssueArgs| {
-                    let (repos, ctx, roles) = (repos.clone(), ctx.clone(), roles.clone());
-                    async move {
+                .extractor_handler(
+                    (repos.clone(), ctx.clone(), roles.clone()),
+                    move |State((repos, ctx, roles)): State<(Repos, PluginContext, Roles)>,
+                          mcp: Context,
+                          Json(args): Json<StartIssueArgs>| async move {
+                        // Same policy as spawn: an authenticated caller
+                        // is the parent whatever it claims; only the
+                        // operator's terminal is taken at its word.
+                        let caller = mcp
+                            .extension::<ciacola_core::AgentIdentity>()
+                            .map(|i| i.0.clone());
+                        let spawned_by = match (&caller, operator_surface) {
+                            (Some(id), _) => Some(id.clone()),
+                            (None, true) => args.spawned_by.clone(),
+                            (None, false) => None,
+                        };
                         if !repos.allows(&args.repo) {
                             return Ok(CallToolResult::error(format!(
                                 "repository '{}' is not in the configured list",
@@ -606,11 +621,7 @@ to do, on purpose."
                         let mut def = roles.to_def(role, &args_map);
                         def.name = format!("impl-{slug}");
 
-                        match ctx
-                            .ledger
-                            .create_agent(&def, args.spawned_by.as_deref())
-                            .await
-                        {
+                        match ctx.ledger.create_agent(&def, spawned_by.as_deref()).await {
                             Ok(agent_id) => {
                                 let assignment = Assignment {
                                     repo: args.repo.clone(),
@@ -638,8 +649,8 @@ to do, on purpose."
                             }
                             Err(e) => Ok(CallToolResult::error(e.to_string())),
                         }
-                    }
-                })
+                    },
+                )
                 .build()
         };
 
