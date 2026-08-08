@@ -30,6 +30,15 @@ use ciacola_core::ledger::Ledger;
 const MIN_EVERY_SECS: i64 = 10;
 const MAX_EVERY_SECS: i64 = 86_400;
 
+/// The shape of `[agents.plugins.schedule]`. Owned here rather than by
+/// the binary's config types, which is the point of the hook.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSchedule {
+    pub every_secs: i64,
+    pub text: String,
+}
+
 #[derive(Clone)]
 pub struct Schedules {
     pool: SqlitePool,
@@ -388,6 +397,42 @@ impl Plugin for SchedulePlugin {
         Box::pin(async move {
             self.schedules = Some(Schedules::new(ctx.pool.clone()));
             self.ledger = Some(ctx.ledger.clone());
+            Ok(())
+        })
+    }
+
+    /// The wake belongs here, not in the binary's config pass.
+    ///
+    /// `[agents.plugins.schedule]` is written where the agent is
+    /// declared because that is where a person wants it, and it is this
+    /// plugin's data. Until this hook existed, `config::apply` held a
+    /// `Schedules` handle to do it, which is a privileged path core
+    /// could not have offered a plugin it had never heard of.
+    ///
+    /// Replaces rather than adds, so the file stays the truth for the
+    /// wake as it is for the definition, and so booting twice does not
+    /// leave an agent with two.
+    fn agent_config<'a>(
+        &'a self,
+        agent_id: &'a str,
+        section: &'a toml::Value,
+    ) -> BoxFut<'a, Result<(), FlatError>> {
+        Box::pin(async move {
+            let Some(schedules) = self.schedules.as_ref() else {
+                return Err("schedule plugin has no handle; setup did not run".into());
+            };
+            let wake: ConfigSchedule = section
+                .clone()
+                .try_into()
+                .map_err(|e| -> FlatError { format!("[agents.plugins.schedule]: {e}").into() })?;
+            for existing in schedules.list().await? {
+                if existing.agent_id == agent_id {
+                    schedules.delete(&existing.schedule_id).await?;
+                }
+            }
+            schedules
+                .create(agent_id, &wake.text, wake.every_secs)
+                .await?;
             Ok(())
         })
     }

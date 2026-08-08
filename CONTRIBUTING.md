@@ -73,6 +73,14 @@ that needs it.
   orientation and the known-broken list.
 - New behaviour comes with a test. The workspace is thin on them and
   the direction is one way.
+- **A fix updates the records that track it.** If what you fixed is
+  listed in `HANDOFF.md`'s known-broken section, remove it in the same
+  change. A fix that leaves its own bug documented as open is not
+  finished.
+
+  This rule was written into the dispatched-agent prompt first and
+  broken four times running by the person who wrote it, because it
+  lived somewhere only agents read. Hence its being here.
 
 ## Tests
 

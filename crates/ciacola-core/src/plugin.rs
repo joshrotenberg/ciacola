@@ -385,6 +385,32 @@ pub trait Plugin: Send + Sync {
         Vec::new()
     }
 
+    /// Claim part of a declared agent's configuration.
+    ///
+    /// `[[agents]]` describes an agent, and some of what it describes is
+    /// not core's business. A schedule is the standing example: it is
+    /// written where the agent is declared because that is where a
+    /// person wants it, and it belongs to the schedule plugin.
+    ///
+    /// Without this the binary's config pass has to hold a handle to
+    /// each plugin whose config it might encounter, which is a
+    /// privileged path of exactly the kind this trait exists to avoid,
+    /// and which core cannot extend to a plugin it has never heard of.
+    ///
+    /// Called once per declared agent, after the agent exists, with the
+    /// value under `[agents.plugins.<name>]` if there is one. Absent
+    /// means nothing to do, so the default is to do nothing.
+    ///
+    /// Should be idempotent: config is applied at every boot, and the
+    /// agent it describes may already carry the result of the last one.
+    fn agent_config<'a>(
+        &'a self,
+        _agent_id: &'a str,
+        _section: &'a toml::Value,
+    ) -> BoxFut<'a, Result<(), FlatError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn resources(&self) -> Vec<Resource> {
         Vec::new()
     }
@@ -442,6 +468,39 @@ pub struct PluginHost {
 }
 
 impl PluginHost {
+    /// Offer one declared agent's plugin sections to the plugins that
+    /// own them.
+    ///
+    /// The binary calls this rather than holding a handle per plugin.
+    /// A section naming a plugin that is not loaded is an error rather
+    /// than a shrug: it is almost always a typo, and silently ignoring
+    /// it means a schedule that never fires and no way to find out why.
+    pub async fn apply_agent_config(
+        &self,
+        agent_id: &str,
+        sections: &std::collections::BTreeMap<String, toml::Value>,
+    ) -> Result<(), FlatError> {
+        for (name, section) in sections {
+            let plugin = self
+                .plugins
+                .iter()
+                .find(|p| p.name() == name)
+                .ok_or_else(|| -> FlatError {
+                    format!(
+                        "agent config names plugin '{name}', which is not loaded.                          Loaded: {}",
+                        self.plugins
+                            .iter()
+                            .map(|p| p.name())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                    .into()
+                })?;
+            plugin.agent_config(agent_id, section).await?;
+        }
+        Ok(())
+    }
+
     /// Set every plugin up in registration order, then start their
     /// background work. Setup is separated from start so a plugin's
     /// loop can rely on every other plugin's tables existing.
@@ -686,5 +745,74 @@ mod tests {
                 .expect("second"),
             0
         );
+    }
+
+    /// A plugin gets its own section and no one else's.
+    #[tokio::test]
+    async fn agent_config_reaches_the_plugin_that_owns_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static SEEN: AtomicUsize = AtomicUsize::new(0);
+
+        struct Claimer;
+        impl Plugin for Claimer {
+            fn name(&self) -> &'static str {
+                "claimer"
+            }
+            fn setup<'a>(&'a mut self, _c: &'a PluginContext) -> BoxFut<'a, Result<(), FlatError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn agent_config<'a>(
+                &'a self,
+                _agent_id: &'a str,
+                section: &'a toml::Value,
+            ) -> BoxFut<'a, Result<(), FlatError>> {
+                Box::pin(async move {
+                    assert_eq!(section.get("k").and_then(|v| v.as_str()), Some("v"));
+                    SEEN.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        }
+
+        let ctx = ctx().await;
+        let host = PluginHost::setup(
+            vec![Box::new(Claimer), Box::new(Fake("bystander", &[]))],
+            &ctx,
+        )
+        .await
+        .expect("setup");
+
+        let mut sections = std::collections::BTreeMap::new();
+        sections.insert(
+            "claimer".to_string(),
+            toml::from_str::<toml::Value>("k = \"v\"").expect("value"),
+        );
+        host.apply_agent_config("agent-1", &sections)
+            .await
+            .expect("apply");
+        assert_eq!(
+            SEEN.load(Ordering::SeqCst),
+            1,
+            "the owner sees it exactly once"
+        );
+    }
+
+    /// Naming a plugin that is not loaded is a typo, and a typo that is
+    /// ignored is a schedule that never fires with nothing to explain
+    /// why.
+    #[tokio::test]
+    async fn agent_config_for_an_unknown_plugin_is_refused() {
+        let ctx = ctx().await;
+        let host = PluginHost::setup(vec![Box::new(Fake("real", &[]))], &ctx)
+            .await
+            .expect("setup");
+        let mut sections = std::collections::BTreeMap::new();
+        sections.insert("shcedule".to_string(), toml::Value::Boolean(true));
+        let err = host
+            .apply_agent_config("agent-1", &sections)
+            .await
+            .expect_err("a typo must not pass silently");
+        assert!(format!("{err}").contains("shcedule"), "names the offender");
     }
 }
