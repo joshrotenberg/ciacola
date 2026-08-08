@@ -135,11 +135,20 @@ impl Repos {
             // This shipped. Four agents worked issues against a `main`
             // three merges behind, and it surfaced only because one of
             // them reasoned about a file that had changed since.
+            // No `--prune`. It looks harmless next to a refspec and is
+            // the opposite: `refs/heads/*` here contains this plugin's
+            // own `agent/*` branches, which by definition do not exist
+            // on origin until `open_pr` pushes them, so pruning deletes
+            // them. Git does that even while a worktree has one checked
+            // out, and the worktree's HEAD then dangles, so the agent's
+            // next commit has no parent at all.
+            //
+            // It was present before the refspec was and did nothing,
+            // because a bare clone configures no refspec for prune to
+            // work against. Supplying one armed it. Two batches ran
+            // before the orphan commits were noticed.
             let mut fetch = bare_repo(&bare).fetch();
-            fetch
-                .remote("origin")
-                .refspec("+refs/heads/*:refs/heads/*")
-                .prune();
+            fetch.remote("origin").refspec("+refs/heads/*:refs/heads/*");
             // Nor is the result optional. A discarded error here reads
             // exactly like a refresh that worked, which is the other
             // half of why the above went unnoticed.
@@ -902,5 +911,64 @@ mod tests {
 
         std::fs::remove_dir_all(&tmp).ok();
         assert_eq!(got, want, "the clone's main did not follow origin's");
+    }
+
+    /// The refresh must not delete the branches this plugin creates.
+    ///
+    /// `agent/*` exists only locally until `open_pr` pushes it, so any
+    /// prune against `refs/heads/*` removes it, and git will do that
+    /// even while a worktree has it checked out. The worktree's HEAD
+    /// then dangles and the agent's next commit is an orphan with no
+    /// ancestry, which cannot be merged and does not look wrong until
+    /// someone reads the history.
+    #[tokio::test]
+    async fn refreshing_does_not_delete_an_agent_branch() {
+        let tmp = std::env::temp_dir().join(format!("ciacola-prune-{}", ulid::Ulid::new()));
+        let origin = tmp.join("origin");
+        std::fs::create_dir_all(&origin).expect("mkdir");
+        git(&origin, &["init", "-q", "-b", "main"]).await;
+        git(&origin, &["config", "user.email", "t@example.com"]).await;
+        git(&origin, &["config", "user.name", "t"]).await;
+        std::fs::write(origin.join("a"), "one").expect("write");
+        git(&origin, &["add", "."]).await;
+        git(&origin, &["commit", "-qm", "one"]).await;
+
+        let repos = Repos {
+            root: tmp.join("root"),
+            allowed: Arc::new(vec!["local/repo".into()]),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        std::fs::create_dir_all(&repos.root).expect("mkdir root");
+        let bare = repos.bare("local/repo");
+        CloneCommand::new(format!("file://{}", origin.display()))
+            .bare()
+            .directory(&bare)
+            .execute()
+            .await
+            .expect("clone");
+
+        // One unit of work in flight, exactly as a batch has.
+        let (_wt, branch) = repos
+            .add_worktree("local/repo", "local-repo-1", "main")
+            .await
+            .expect("worktree");
+
+        // A second `start_issue` refreshes the clone while the first is
+        // still working. That is where the branch used to disappear.
+        repos.ensure_clone("local/repo").await.expect("refresh");
+
+        let refs = tokio::process::Command::new("git")
+            .args(["for-each-ref", "--format=%(refname:short)"])
+            .current_dir(&bare)
+            .output()
+            .await
+            .expect("for-each-ref");
+        let refs = String::from_utf8_lossy(&refs.stdout).to_string();
+
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(
+            refs.lines().any(|r| r == branch),
+            "refresh deleted the in-flight branch {branch}; refs were:\n{refs}"
+        );
     }
 }
