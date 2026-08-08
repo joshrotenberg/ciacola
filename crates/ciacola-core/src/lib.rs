@@ -11,7 +11,8 @@
 //! Whatever nothing works without: the provider seam ([`agent`]), the
 //! ledger of agents and turns ([`ledger`]), an executor ([`exec`]),
 //! notifications ([`notify`]), startup recovery ([`recover`]), the six
-//! verbs ([`server`]), and the board shell ([`board`]).
+//! verbs ([`server`]), and the page shell a board renders
+//! through ([`render`]).
 //!
 //! [`plugin::PluginContext`] is the precise statement of that line. If
 //! a plugin needs something not on that struct, either it belongs here

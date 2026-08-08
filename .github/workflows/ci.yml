@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Pinned revs go stale silently. This says so once a day.
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+      - name: Documentation
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+
+  # The point of the git revs is that this builds with no sibling
+  # checkouts present. A `.cargo/config.toml` on a contributor's machine
+  # hides a break here, so prove it in the one place that never has one.
+  drift:
+    name: Siblings at main
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Unpin the three
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+          p = pathlib.Path("Cargo.toml")
+          s, n = re.subn(r'rev = "[0-9a-f]{40}"', 'branch = "main"', p.read_text())
+          assert n == 3, f"expected 3 pinned revs, rewrote {n}"
+          p.write_text(s)
+          print(s[s.index("tower-mcp = "):s.index("git-spawn = ") + 120])
+          PY
+      - name: Build against their mains
+        run: cargo build --workspace

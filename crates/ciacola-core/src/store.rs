@@ -2,7 +2,7 @@
 //!
 //! Offered, not enforced. A plugin that needs UPSERT-with-COALESCE,
 //! `MAX(seq) + 1`, LIKE search, or an aggregate still takes
-//! [`PluginContext::pool`] and writes exactly the SQL it needs; that is
+//! [`crate::plugin::PluginContext::pool`] and writes exactly the SQL it needs; that is
 //! why the pool is on the context at all. This is for everything else.
 //!
 //! What it buys, concretely: a plugin using only [`Store`] declares no

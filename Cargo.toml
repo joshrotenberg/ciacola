@@ -13,10 +13,22 @@ authors = ["Josh Rotenberg <joshrotenberg@gmail.com>"]
 [workspace.dependencies]
 ciacola-core = { path = "crates/ciacola-core" }
 
-# Ours, path deps while everything moves together.
-tower-mcp = { path = "../tower-mcp/crates/tower-mcp", features = ["http"] }
-claude-wrapper = { path = "../claude-wrapper" }
-git-spawn = { path = "../git-spawn" }
+# Ours. Git revs rather than path deps, so this builds anywhere: in CI,
+# and in the agents' own clones, which live under the repo-worker root
+# where a sibling checkout does not exist.
+#
+# Revs rather than branches because once agents build this, the build has
+# to be reproducible: a path dep resolved to whatever three sibling
+# checkouts happened to contain. Published versions do not work yet
+# (claude-wrapper is 20 commits past v0.13.5 and ciacola needs
+# `QueryResult::usage` from one of them); switch to versions once the
+# three settle enough to release.
+#
+# `.cargo/config.toml` overrides these back to the siblings for local
+# work. See CONTRIBUTING.md.
+tower-mcp = { git = "https://github.com/joshrotenberg/tower-mcp", rev = "a63cb73c5c2b912894f5af6f8158d4c499763aba", features = ["http"] }
+claude-wrapper = { git = "https://github.com/joshrotenberg/claude-wrapper", rev = "22484531ecbec0789c16ee10f8abaa95d5501596" }
+git-spawn = { git = "https://github.com/joshrotenberg/git-spawn", rev = "ea2826b9da416cc9396ce79f2af7f9770cd50ac1" }
 
 axum = "0.8"
 schemars = "1"
