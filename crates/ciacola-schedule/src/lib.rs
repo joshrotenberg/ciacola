@@ -168,11 +168,32 @@ impl Schedules {
     }
 }
 
-/// The loop. Wakes once a second; everything due becomes an ordinary
-/// send. Deleting a schedule mid-sleep takes effect within a tick.
+/// Fire one due schedule and advance past it (fired or skipped). Split
+/// out of [`spawn_scheduler`]'s loop so the invariant that matters,
+/// that busy skips rather than queues and `next_fire_unix` advances
+/// either way, can be driven directly by a test without waiting on the
+/// one-second tick.
+async fn fire(schedules: &Schedules, ctx: &PluginContext, schedule: &ScheduleRow) -> Submission {
+    let outcome = ctx
+        .submit_turn(
+            &schedule.agent_id,
+            &schedule.text,
+            &format!("schedule {}", schedule.schedule_id),
+        )
+        .await;
+    // A skip is counted, not retried: next_fire advances either way so
+    // a busy agent cannot build a backlog.
+    let skipped = outcome.submitted().is_none();
+    if let Err(e) = schedules.advance(&schedule.schedule_id, skipped).await {
+        eprintln!("[cron] advance {}: {e}", schedule.schedule_id);
+    }
+    outcome
+}
+
 /// The loop. Wakes once a second; everything due is poked through
 /// [`PluginContext::submit_turn`], which is the same call a webhook or
 /// a file watcher makes. Cron's only distinctive job is deciding *when*.
+/// Deleting a schedule mid-sleep takes effect within a tick.
 pub fn spawn_scheduler(schedules: Schedules, ctx: PluginContext) {
     tokio::spawn(async move {
         loop {
@@ -185,19 +206,7 @@ pub fn spawn_scheduler(schedules: Schedules, ctx: PluginContext) {
                 }
             };
             for schedule in due {
-                let outcome = ctx
-                    .submit_turn(
-                        &schedule.agent_id,
-                        &schedule.text,
-                        &format!("schedule {}", schedule.schedule_id),
-                    )
-                    .await;
-                // A skip is counted, not retried: next_fire advances
-                // either way so a busy agent cannot build a backlog.
-                let skipped = outcome.submitted().is_none();
-                if let Err(e) = schedules.advance(&schedule.schedule_id, skipped).await {
-                    eprintln!("[cron] advance {}: {e}", schedule.schedule_id);
-                }
+                fire(&schedules, &ctx, &schedule).await;
             }
         }
     });
@@ -327,7 +336,9 @@ pub fn tools(schedules: Schedules, ledger: Ledger) -> Vec<Tool> {
 
 // --- plugin ---
 
-use ciacola_core::plugin::{BoxFut, Migration, Plugin, PluginContext, Section, Surface};
+use ciacola_core::plugin::{
+    BoxFut, Migration, Plugin, PluginContext, Section, Submission, Surface,
+};
 
 /// Cron as a plugin. The only one so far that needs `start`: its loop
 /// is background work, and it is also the only plugin that submits
@@ -445,5 +456,204 @@ impl Plugin for SchedulePlugin {
                 "skips": all.iter().map(|s| s.skips).sum::<i64>(),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use ciacola_core::agent::AgentDef;
+    use ciacola_core::exec::TurnExecutor;
+    use ciacola_core::ledger::Ledger;
+    use ciacola_core::notify::Notifier;
+
+    use super::*;
+
+    /// Records what it was handed and does nothing else: no claim, no
+    /// run, no completion. A submitted turn therefore stays `queued`
+    /// forever, which is exactly what "the agent is busy" means to the
+    /// admission guard in `Ledger::enqueue_turn`. CI-safe stand-in for a
+    /// real executor; nothing here shells out to a provider.
+    #[derive(Default)]
+    struct RecordingExecutor {
+        submitted: Mutex<Vec<(String, i64)>>,
+    }
+
+    impl TurnExecutor for RecordingExecutor {
+        fn submit(&self, agent_id: String, seq: i64) {
+            self.submitted.lock().unwrap().push((agent_id, seq));
+        }
+        fn kill(&self, _agent_id: &str, _seq: i64) -> bool {
+            false
+        }
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+    }
+
+    async fn setup() -> (Schedules, PluginContext, Arc<RecordingExecutor>, Ledger) {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        let schedules = Schedules::setup(pool.clone()).await.expect("schedules");
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+        let exec = Arc::new(RecordingExecutor::default());
+        let ctx = PluginContext {
+            pool,
+            ledger: ledger.clone(),
+            exec: exec.clone() as Arc<dyn TurnExecutor>,
+            notify: Notifier(tx),
+            db_path: String::new(),
+            loopback_mcp_config: String::new(),
+            plugin_config: toml::Value::Table(toml::map::Map::new()),
+            limits: Default::default(),
+            runtime: Default::default(),
+        };
+        (schedules, ctx, exec, ledger)
+    }
+
+    async fn new_agent(ledger: &Ledger) -> String {
+        ledger
+            .create_agent(&AgentDef::new("a", "sys"), None)
+            .await
+            .expect("create agent")
+    }
+
+    /// Backdate a schedule's next fire without sleeping on the real
+    /// clock, per CONTRIBUTING: drive time by writing `next_fire_unix`
+    /// directly. `Schedules.pool` is private, but this module is a
+    /// descendant of the one that defines it.
+    async fn make_due(schedules: &Schedules, schedule_id: &str) {
+        sqlx::query("UPDATE schedules SET next_fire_unix = ?1 WHERE schedule_id = ?2")
+            .bind(now_unix() - 1)
+            .bind(schedule_id)
+            .execute(&schedules.pool)
+            .await
+            .expect("backdate");
+    }
+
+    async fn find(schedules: &Schedules, schedule_id: &str) -> ScheduleRow {
+        schedules
+            .list()
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|s| s.schedule_id == schedule_id)
+            .expect("schedule still exists")
+    }
+
+    #[tokio::test]
+    async fn due_schedule_with_idle_agent_fires_and_advances() {
+        let (schedules, ctx, exec, ledger) = setup().await;
+        let agent_id = new_agent(&ledger).await;
+        let s = schedules.create(&agent_id, "hi", 10).await.expect("create");
+        make_due(&schedules, &s.schedule_id).await;
+
+        let due = schedules.due(now_unix()).await.expect("due");
+        assert_eq!(due.len(), 1, "backdated schedule must be due");
+
+        let outcome = fire(&schedules, &ctx, &due[0]).await;
+        assert!(
+            matches!(outcome, Submission::Submitted { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            exec.submitted.lock().unwrap().as_slice(),
+            [(agent_id.clone(), 1)],
+            "an idle agent's fire must actually be dispatched"
+        );
+
+        let after = find(&schedules, &s.schedule_id).await;
+        assert_eq!(after.fires, 1);
+        assert_eq!(after.skips, 0);
+        assert!(
+            schedules.due(now_unix()).await.expect("due").is_empty(),
+            "next_fire_unix must advance past now, or the schedule stays due forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn due_schedule_with_busy_agent_skips_without_enqueuing() {
+        let (schedules, ctx, exec, ledger) = setup().await;
+        let agent_id = new_agent(&ledger).await;
+        // Busy: a turn is already queued, same admission rule `send` uses.
+        ledger
+            .enqueue_turn(&agent_id, "already running")
+            .await
+            .expect("enqueue");
+        let s = schedules.create(&agent_id, "hi", 10).await.expect("create");
+        make_due(&schedules, &s.schedule_id).await;
+
+        let due = schedules.due(now_unix()).await.expect("due");
+        let outcome = fire(&schedules, &ctx, &due[0]).await;
+        assert!(matches!(outcome, Submission::Busy { .. }), "{outcome:?}");
+        assert!(
+            exec.submitted.lock().unwrap().is_empty(),
+            "a skip must never reach the executor; that is the pileup this exists to prevent"
+        );
+
+        let (turn_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM turns WHERE agent_id = ?1")
+                .bind(&agent_id)
+                .fetch_one(&ctx.pool)
+                .await
+                .expect("count");
+        assert_eq!(turn_count, 1, "no second turn must have been enqueued");
+
+        let after = find(&schedules, &s.schedule_id).await;
+        assert_eq!(after.fires, 0);
+        assert_eq!(after.skips, 1);
+        assert!(
+            schedules.due(now_unix()).await.expect("due").is_empty(),
+            "a skip that fails to advance leaves the schedule permanently due"
+        );
+    }
+
+    #[tokio::test]
+    async fn due_schedule_for_a_retired_agent_produces_no_work() {
+        let (schedules, ctx, exec, ledger) = setup().await;
+        let agent_id = new_agent(&ledger).await;
+        let s = schedules.create(&agent_id, "hi", 10).await.expect("create");
+        assert!(ledger.retire_agent(&agent_id).await.expect("retire"));
+        make_due(&schedules, &s.schedule_id).await;
+
+        let due = schedules.due(now_unix()).await.expect("due");
+        let outcome = fire(&schedules, &ctx, &due[0]).await;
+        assert!(
+            outcome.submitted().is_none(),
+            "a retired agent must not produce a submitted turn: {outcome:?}"
+        );
+        assert!(exec.submitted.lock().unwrap().is_empty());
+
+        let after = find(&schedules, &s.schedule_id).await;
+        assert_eq!(after.fires, 0);
+        assert_eq!(after.skips, 1, "counted like any other skip, not queued");
+    }
+
+    #[tokio::test]
+    async fn round_trip_schedule_then_list_then_unschedule() {
+        let (schedules, _ctx, _exec, ledger) = setup().await;
+        let agent_id = new_agent(&ledger).await;
+
+        let s = schedules.create(&agent_id, "hi", 10).await.expect("create");
+        let listed = schedules.list().await.expect("list");
+        assert!(listed.iter().any(|r| r.schedule_id == s.schedule_id));
+
+        assert!(
+            schedules.delete(&s.schedule_id).await.expect("delete"),
+            "first unschedule removes it"
+        );
+        let listed = schedules.list().await.expect("list");
+        assert!(!listed.iter().any(|r| r.schedule_id == s.schedule_id));
+
+        assert!(
+            !schedules
+                .delete(&s.schedule_id)
+                .await
+                .expect("delete again"),
+            "a second unschedule of the same id is not an error"
+        );
     }
 }
