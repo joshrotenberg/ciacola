@@ -407,6 +407,15 @@ impl Plugin for RepoWorkerPlugin {
                     "Bash(git:*)".into(),
                     "Bash(cargo:*)".into(),
                     "Bash(just:*)".into(),
+                    // The implementer role below holds this too, for
+                    // repositories whose gate is a Makefile rather than a
+                    // justfile. A manager that cannot hold what it
+                    // dispatches cannot spawn the implementer shipped by
+                    // this same plugin: start_issue and spawn_role both
+                    // run every requested tool through the same authority
+                    // check, so a bundled parent missing one of its own
+                    // child's tools is refused before any work happens.
+                    "Bash(make:*)".into(),
                     "Bash(gh:*)".into(),
                     // The whole ciacola server, by server name: without
                     // this a *spawned* manager could see its operator
@@ -1553,5 +1562,175 @@ mod tests {
         );
         assert!(!root.exists(), "authority refusal must happen before clone");
         assert_eq!(ledger.list_agents().await.expect("list").len(), 1);
+    }
+
+    /// Issue #60: the first live manager-driven run could not use
+    /// `start_issue` or `spawn_role`, because the bundled `repo-manager`
+    /// role did not hold `Bash(make:*)`, which the bundled
+    /// `issue-implementer` role requests. The capability ceiling worked
+    /// as designed and refused the manager anyway.
+    ///
+    /// This builds the manager's authenticated agent from the *shipped*
+    /// `Role` (via `setup` and `to_def`, the same path a real boot
+    /// takes), not a hand-typed tool list, so a future edit that lets
+    /// the two roles drift apart again fails here rather than only in
+    /// prompt-derived documentation. An intentionally underprivileged
+    /// authenticated parent is still refused by
+    /// `start_issue_cannot_out_reach_its_authenticated_parent` above;
+    /// this test is its positive counterpart, and covers both creation
+    /// paths that share `grant_child_tools`.
+    #[tokio::test]
+    async fn bundled_manager_can_delegate_to_bundled_implementer() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+        let notify = ciacola_core::Notifier(tx);
+        let exec = ciacola_core::HandExecutor::start(ledger.clone(), notify.clone(), 1);
+
+        let root =
+            std::env::temp_dir().join(format!("ciacola-manager-delegation-{}", ulid::Ulid::new()));
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).expect("mkdir");
+        git(&origin, &["init", "-q", "-b", "main"]).await;
+        git(&origin, &["config", "user.email", "t@example.com"]).await;
+        git(&origin, &["config", "user.name", "t"]).await;
+        std::fs::write(origin.join("a"), "one").expect("write");
+        git(&origin, &["add", "."]).await;
+        git(&origin, &["commit", "-qm", "one"]).await;
+
+        let repos_root = root.join("repos");
+        std::fs::create_dir_all(&repos_root).expect("mkdir");
+        CloneCommand::new(format!("file://{}", origin.display()))
+            .bare()
+            .directory(repos_root.join("local__repo.git"))
+            .execute()
+            .await
+            .expect("bare clone");
+
+        let plugin_config: toml::Value = toml::from_str(&format!(
+            "[repo-worker]\nroot = {:?}\nrepos = [\"local/repo\"]",
+            repos_root.display().to_string()
+        ))
+        .expect("config");
+        let ctx = PluginContext {
+            pool,
+            ledger: ledger.clone(),
+            exec,
+            notify,
+            db_path: String::new(),
+            loopback_mcp_config: "agent.json".into(),
+            operator_mcp_config: "operator.json".into(),
+            plugin_config,
+            limits: Default::default(),
+            runtime: Default::default(),
+        };
+        let mut plugin = RepoWorkerPlugin::default();
+        plugin.setup(&ctx).await.expect("setup");
+
+        // The manager's authority comes from the shipped role, not a
+        // stand-in typed into this test.
+        let roles = plugin.roles.clone().expect("roles");
+        let manager_role = roles.get(MANAGER).cloned().expect("manager role bundled");
+        let manager_args =
+            std::collections::HashMap::from([("checkout".to_string(), root.display().to_string())]);
+        let manager_def = roles.to_def(&manager_role, &manager_args);
+        let manager_id = ledger
+            .create_agent(&manager_def, None)
+            .await
+            .expect("manager agent");
+
+        let start = plugin
+            .tools(Surface::Agent)
+            .into_iter()
+            .find(|tool| tool.definition().name == "start_issue")
+            .expect("start_issue");
+        let mut extensions = Extensions::new();
+        extensions.insert(ciacola_core::AgentIdentity(manager_id.clone()));
+        let request =
+            RequestContext::new(RequestId::Number(1)).with_extensions(Arc::new(extensions));
+        let out = start
+            .call_with_context(
+                request,
+                serde_json::json!({"repo": "local/repo", "issue": 60, "base": "main"}),
+            )
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+        assert!(
+            !rendered.contains("needs tools its parent does not hold"),
+            "the shipped manager must be able to start_issue the shipped implementer: {rendered}"
+        );
+        assert!(rendered.contains("\"agent_id\""), "got: {rendered}");
+
+        // spawn_role is the other creation path sharing grant_child_tools;
+        // the manager must be able to reach the implementer through it
+        // too, e.g. when start_issue's wiring is not what is wanted.
+        let spawn_roles = Roles::with_runtime(
+            roles.all().to_vec(),
+            ctx.loopback_mcp_config.clone(),
+            ctx.runtime.clone(),
+        );
+        let spawn_role_tool =
+            ciacola_core::roles::tools_with_depth(spawn_roles, ledger.clone(), 3, false)
+                .into_iter()
+                .find(|t| t.definition().name == "spawn_role")
+                .expect("spawn_role");
+        let mut extensions = Extensions::new();
+        extensions.insert(ciacola_core::AgentIdentity(manager_id.clone()));
+        let request =
+            RequestContext::new(RequestId::Number(2)).with_extensions(Arc::new(extensions));
+        let out = spawn_role_tool
+            .call_with_context(
+                request,
+                serde_json::json!({
+                    "role": ROLE,
+                    "arguments": {
+                        "repo": "local/repo",
+                        "issue": "60",
+                        "worktree": root.join("wt-manual").display().to_string(),
+                    }
+                }),
+            )
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+        assert!(
+            !rendered.contains("needs tools its parent does not hold"),
+            "the shipped manager must be able to spawn_role the shipped implementer: {rendered}"
+        );
+
+        // The ceiling still refuses a genuinely underprivileged parent
+        // through this second path, matching start_issue's refusal.
+        let underprivileged = ledger
+            .create_agent(
+                &ciacola_core::AgentDef::new("under", "s").allowed_tools(["Read"]),
+                None,
+            )
+            .await
+            .expect("underprivileged agent");
+        let mut extensions = Extensions::new();
+        extensions.insert(ciacola_core::AgentIdentity(underprivileged));
+        let request =
+            RequestContext::new(RequestId::Number(3)).with_extensions(Arc::new(extensions));
+        let out = spawn_role_tool
+            .call_with_context(
+                request,
+                serde_json::json!({
+                    "role": ROLE,
+                    "arguments": {
+                        "repo": "local/repo",
+                        "issue": "60",
+                        "worktree": root.join("wt-manual-2").display().to_string(),
+                    }
+                }),
+            )
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+        assert!(
+            rendered.contains("needs tools its parent does not hold"),
+            "an underprivileged authenticated parent must still be refused: {rendered}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
