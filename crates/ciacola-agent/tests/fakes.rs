@@ -187,7 +187,7 @@ fn intent() -> TurnIntent {
     let mut intent = TurnIntent::new("do the thing");
     intent.instructions = Some("you are a fake".into());
     intent.isolation = Isolation::Full;
-    intent.allowed_tools = vec!["Read".into()];
+    intent.allowed_tools = Some(vec!["Read".into()]);
     intent
 }
 

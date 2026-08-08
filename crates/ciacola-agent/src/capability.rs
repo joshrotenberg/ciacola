@@ -274,7 +274,7 @@ impl Capabilities {
                 );
             }
         }
-        if !intent.allowed_tools.is_empty() && !self.allowed_tools {
+        if intent.allowed_tools.is_some() && !self.allowed_tools {
             miss(
                 Constraint::AllowedTools,
                 format!(
@@ -363,6 +363,23 @@ mod tests {
     fn inheriting_ambient_config_is_not_an_unsupported_request() {
         let intent = TurnIntent::new("go");
         assert!(poor().validate(&intent).unsupported.is_empty());
+    }
+
+    /// Inheriting the provider's tool policy and explicitly granting no
+    /// tools are different requests. The latter is a security boundary
+    /// even though its inner list is empty.
+    #[test]
+    fn an_explicitly_toolless_turn_requires_tool_policy_support() {
+        let mut intent = TurnIntent::new("go");
+        intent.allowed_tools = Some(Vec::new());
+        let v = poor().validate(&intent);
+        assert_eq!(
+            v.blocking().map(|u| u.constraint),
+            Some(Constraint::AllowedTools)
+        );
+
+        let inherited = TurnIntent::new("go");
+        assert!(poor().validate(&inherited).unsupported.is_empty());
     }
 
     /// The concrete case this constraint exists for: a provider whose

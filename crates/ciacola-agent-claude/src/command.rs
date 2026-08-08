@@ -30,8 +30,21 @@ pub(crate) fn build(
     if let Some(effort) = intent.effort {
         command = command.effort(map_effort(effort));
     }
-    if !intent.allowed_tools.is_empty() {
-        command = command.allowed_tools(intent.allowed_tools.clone());
+    match &intent.allowed_tools {
+        // No policy requested: preserve the provider's defaults.
+        None => {}
+        // These are two different Claude controls. `--tools ""`
+        // removes every built-in tool from the model's available set;
+        // `--allowed-tools ""` makes the permission grant empty as
+        // well, including for dynamically loaded tools such as MCP.
+        // The wrapper omits either flag for an actually empty iterator,
+        // so a one-element empty string is intentional here.
+        Some(tools) if tools.is_empty() => {
+            command = command.tools([""]).allowed_tools([""]);
+        }
+        Some(tools) => {
+            command = command.allowed_tools(tools.clone());
+        }
     }
     if let Some(max_turns) = intent.max_provider_turns {
         command = command.max_turns(max_turns);
@@ -184,7 +197,7 @@ mod tests {
         let mut i = intent("go");
         i.model = Some("opus".into());
         i.effort = Some(ContractEffort::High);
-        i.allowed_tools = vec!["Read".into(), "Edit".into()];
+        i.allowed_tools = Some(vec!["Read".into(), "Edit".into()]);
         i.max_provider_turns = Some(12);
 
         let mut guard = None;
@@ -198,6 +211,36 @@ mod tests {
         assert_eq!(args[pos + 1], "Read,Edit");
         let pos = args.iter().position(|a| a == "--max-turns").unwrap();
         assert_eq!(args[pos + 1], "12");
+    }
+
+    /// The legacy path used an empty vector for both "inherit" and
+    /// "none", so a supposedly toolless agent received no CLI flags and
+    /// therefore inherited Claude's tools. The contract's outer Option
+    /// keeps the two states distinct and this adapter must render each
+    /// one differently.
+    #[test]
+    fn an_explicitly_toolless_turn_disables_availability_and_permission() {
+        let mut i = intent("reason only");
+        i.allowed_tools = Some(Vec::new());
+
+        let mut guard = None;
+        let args = build(&i, &mut guard).expect("builds").args();
+
+        let tools = args.iter().position(|a| a == "--tools").unwrap();
+        assert_eq!(args[tools + 1], "");
+        let allowed = args.iter().position(|a| a == "--allowed-tools").unwrap();
+        assert_eq!(args[allowed + 1], "");
+    }
+
+    #[test]
+    fn an_inherited_tool_policy_emits_no_tool_flags() {
+        let i = intent("use provider defaults");
+        assert!(i.allowed_tools.is_none());
+
+        let mut guard = None;
+        let args = build(&i, &mut guard).expect("builds").args();
+        assert!(!args.contains(&"--tools".to_string()));
+        assert!(!args.contains(&"--allowed-tools".to_string()));
     }
 
     #[test]

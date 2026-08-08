@@ -288,12 +288,16 @@ pub struct TurnIntent {
     /// Where the agent works. `None` means it does not touch a
     /// filesystem.
     pub working_dir: Option<PathBuf>,
-    /// Tools the agent may use. Empty means none beyond conversation.
+    /// Tools the agent may use. `None` inherits the provider's default;
+    /// `Some(vec![])` explicitly grants no tools beyond conversation.
     ///
     /// A grant, not a hint. A provider that cannot enforce it must fail
     /// rather than hand the agent everything: a toolless spoke does not
-    /// refuse, it fabricates, and the inverse is worse.
-    pub allowed_tools: Vec<String>,
+    /// refuse, it fabricates, and the inverse is worse. The outer
+    /// [`Option`] is load-bearing: using an empty vector for both
+    /// "inherit" and "none" is how the legacy Claude path told an agent
+    /// it had no tools while emitting no restriction flag at all.
+    pub allowed_tools: Option<Vec<String>>,
     /// Filesystem and network containment. [`Sandbox::Unconstrained`]
     /// asks for nothing, so it is honoured trivially by every provider;
     /// anything else is a security constraint checked the same way

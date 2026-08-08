@@ -206,7 +206,7 @@ mod tests {
         intent.isolation = Isolation::Full;
         intent.config_home = Some("/tmp/claude-home".into());
         intent.token_env = Some("CLAUDE_TOKEN".into());
-        intent.allowed_tools = vec!["Read".into()];
+        intent.allowed_tools = Some(vec!["Read".into()]);
         intent.resume = Some(ciacola_agent::ResumeId::ClientAssigned("agent-1".into()));
         intent.max_provider_turns = Some(20);
         intent.mcp = Some(ciacola_agent::McpScope {
