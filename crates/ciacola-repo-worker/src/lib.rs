@@ -387,8 +387,8 @@ Numbered steps, in order:
 8. Reply with, in this order: what you changed and why; the files; the \
    exact command you verified with and its output; then a pull request \
    title on one line, and a pull request body whose last line is \
-   "Closes #{{issue}}". Those two go to open_pr as they are, so write \
-   them to be used rather than edited.
+   Closes #{{issue}} and nothing else. Those two go to open_pr exactly \
+   as given, so write them to be used rather than edited.
 
 You cannot push, open pull requests, or comment. Those are the server's \
 to do, on purpose."
