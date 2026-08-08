@@ -648,3 +648,130 @@ fn item_routes(items: Items, ledger: Ledger) -> Router {
         .route("/board/item/{item_id}", get(item_page))
         .with_state((items, ledger))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn items() -> Items {
+        let pool = SqlitePool::connect("sqlite::memory:").await.expect("pool");
+        Items::setup(pool).await.expect("setup")
+    }
+
+    #[tokio::test]
+    async fn track_without_title_defaults_to_item_id() {
+        let items = items().await;
+        let item = items
+            .track("issue-1", None, "todo", None, None)
+            .await
+            .expect("track");
+        assert_eq!(item.title, "issue-1");
+    }
+
+    #[tokio::test]
+    async fn track_update_without_title_keeps_the_original() {
+        let items = items().await;
+        items
+            .track("issue-1", Some("Fix the thing"), "todo", None, None)
+            .await
+            .expect("create");
+        let item = items
+            .track("issue-1", None, "doing", None, None)
+            .await
+            .expect("move without a title");
+        assert_eq!(item.title, "Fix the thing");
+        assert_eq!(item.lane, "doing");
+    }
+
+    #[tokio::test]
+    async fn track_explicit_title_wins_on_update() {
+        let items = items().await;
+        items
+            .track("issue-1", Some("Fix the thing"), "todo", None, None)
+            .await
+            .expect("create");
+        let item = items
+            .track("issue-1", Some("Fix the other thing"), "doing", None, None)
+            .await
+            .expect("update with a title");
+        assert_eq!(item.title, "Fix the other thing");
+    }
+
+    #[tokio::test]
+    async fn event_sequence_counts_per_item() {
+        let items = items().await;
+        items
+            .track("issue-1", Some("a"), "todo", None, None)
+            .await
+            .expect("first track");
+        items
+            .track("issue-1", None, "doing", None, None)
+            .await
+            .expect("second track");
+        let events = items.events("issue-1").await.expect("events");
+        assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn event_sequence_restarts_for_a_different_item() {
+        let items = items().await;
+        items
+            .track("issue-1", Some("a"), "todo", None, None)
+            .await
+            .expect("track issue-1");
+        items
+            .track("issue-1", None, "doing", None, None)
+            .await
+            .expect("track issue-1 again");
+        items
+            .track("issue-2", Some("b"), "todo", None, None)
+            .await
+            .expect("track issue-2");
+
+        let first_item_events = items.events("issue-1").await.expect("events for issue-1");
+        assert_eq!(
+            first_item_events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let second_item_events = items.events("issue-2").await.expect("events for issue-2");
+        assert_eq!(
+            second_item_events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_lane() {
+        let items = items().await;
+        items
+            .track("issue-1", Some("a"), "todo", None, None)
+            .await
+            .expect("track a");
+        items
+            .track("issue-2", Some("b"), "doing", None, None)
+            .await
+            .expect("track b");
+        items
+            .track("issue-3", Some("c"), "todo", None, None)
+            .await
+            .expect("track c");
+
+        let todo = items.list(Some("todo")).await.expect("list todo");
+        assert_eq!(todo.len(), 2);
+        assert!(todo.iter().all(|i| i.lane == "todo"));
+
+        let all = items.list(None).await.expect("list all");
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn lane_rejects_a_value_outside_the_enum() {
+        let err = serde_json::from_value::<TrackArgs>(json!({
+            "item_id": "issue-1",
+            "lane": "blocked",
+        }))
+        .expect_err("\"blocked\" is not a lane");
+        assert!(err.to_string().contains("blocked"), "{err}");
+    }
+}
