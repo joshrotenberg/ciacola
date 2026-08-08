@@ -142,11 +142,22 @@ pub(crate) fn capped(
 /// ([`capped`]) do -- there is nothing more honest to report here than
 /// "this much time passed".
 ///
-/// No branch here calls `claude_wrapper::Error`'s own `Display`:
-/// `CommandFailed`, `Auth`, `MaxTurnsExceeded`, and `MaxBudgetExceeded`
-/// all render the full command line, and `--` plus the prompt is part
-/// of that command line. `AgentError`'s `detail` fields are meant for a
-/// board or a log line, and the prompt is not argv's to leak there.
+/// No branch that names a variant calls `claude_wrapper::Error`'s own
+/// `Display`: `CommandFailed`, `Auth`, `MaxTurnsExceeded`, and
+/// `MaxBudgetExceeded` all render the full command line, and `--` plus
+/// the prompt is part of that command line. `AgentError`'s `detail`
+/// fields are meant for a board or a log line, and the prompt is not
+/// argv's to leak there.
+///
+/// The catch-all arm is the one exception, and it is a deliberate
+/// trade rather than an oversight. `claude_wrapper::Error` is
+/// `#[non_exhaustive]`, so that arm exists only for variants added
+/// upstream after this was written. For those, an opaque message would
+/// leave an operator with nothing to debug from, so it keeps `Display`
+/// and accepts that a future variant might render argv. Every variant
+/// that exists at the pinned revision is named above and does not
+/// reach it. If upstream adds a variant that carries a command line,
+/// name it explicitly here rather than letting it fall through.
 pub(crate) fn classify_failure(
     error: claude_wrapper::Error,
     elapsed: Duration,
@@ -166,11 +177,17 @@ pub(crate) fn classify_failure(
             detail: "claude binary not found in PATH".to_string(),
         },
         claude_wrapper::Error::Io { message, .. } => {
-            // `exec.rs` only ever produces this variant from two sites:
-            // a failed spawn (pre-launch) and a failed wait on an
-            // already-running child (post-launch). The message text is
-            // this crate's own wording, read from the pinned checkout,
-            // not a guess.
+            // At the pinned revision `exec.rs` produces this variant
+            // from four message shapes: "failed to spawn claude" is the
+            // only pre-launch one, and "failed to write to claude
+            // stdin", "failed to flush claude stdin", and "failed to
+            // wait for claude process" all happen once the child is
+            // already running. Splitting on the spawn prefix therefore
+            // classifies every one of them correctly. The wording is
+            // read from the pinned checkout, not guessed, which is also
+            // why it is matched rather than parsed: a message that
+            // drifts upstream degrades to the post-launch branch, which
+            // over-reports telemetry rather than losing it.
             if message.starts_with("failed to spawn claude") {
                 AgentError::Launch {
                     provider,
