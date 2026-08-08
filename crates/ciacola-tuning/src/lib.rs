@@ -54,6 +54,9 @@ pub struct Stat {
 type BucketKey = (String, String, String, String);
 /// Costs, durations, failure count.
 type Bucket = (Vec<i64>, Vec<i64>, usize);
+/// One finished turn, flattened for grouping: provider, model, effort,
+/// role, cost, duration in seconds, and whether it failed.
+type Entry = (String, String, String, String, i64, i64, bool);
 
 fn median(mut values: Vec<i64>) -> i64 {
     if values.is_empty() {
@@ -63,40 +66,21 @@ fn median(mut values: Vec<i64>) -> i64 {
     values[values.len() / 2]
 }
 
-async fn collect(ledger: &Ledger) -> Result<Vec<Stat>, FlatError> {
-    // Retired agents are included on purpose: an ephemeral spoke is
-    // retired the moment its work is accepted, so excluding them would
-    // throw away exactly the population worth measuring.
-    let rows: Vec<(String, i64, i64, String)> = sqlx::query_as(
-        "SELECT a.def, t.cost_micro_usd, t.elapsed_ms, t.state
-         FROM turns t JOIN agents a ON a.agent_id = t.agent_id
-         WHERE t.state IN ('ok', 'failed', 'killed')",
-    )
-    .fetch_all(ledger.pool())
-    .await?;
-
+/// The aggregation itself, pulled out of `collect` so it can be tested
+/// without a database: feed it entries directly and it groups them the
+/// same way a real ledger read would.
+fn aggregate(entries: Vec<Entry>) -> Vec<Stat> {
     let mut buckets: BTreeMap<BucketKey, Bucket> = BTreeMap::new();
-    for (def_json, cost, elapsed_ms, state) in rows {
-        let Ok(def) = serde_json::from_str::<ciacola_core::agent::AgentDef>(&def_json) else {
-            continue;
-        };
-        let key = (
-            // Only one provider so far; the field exists so the shape
-            // survives a second one.
-            "claude".to_string(),
-            def.model.clone().unwrap_or_else(|| "(default)".into()),
-            def.effort.clone().unwrap_or_else(|| "(default)".into()),
-            def.name.clone(),
-        );
-        let entry = buckets.entry(key).or_default();
+    for (provider, model, effort, role, cost, secs, failed) in entries {
+        let entry = buckets.entry((provider, model, effort, role)).or_default();
         entry.0.push(cost);
-        entry.1.push(elapsed_ms / 1000);
-        if state != "ok" {
+        entry.1.push(secs);
+        if failed {
             entry.2 += 1;
         }
     }
 
-    Ok(buckets
+    buckets
         .into_iter()
         .map(
             |((provider, model, effort, role), (costs, secs, failures))| Stat {
@@ -111,7 +95,40 @@ async fn collect(ledger: &Ledger) -> Result<Vec<Stat>, FlatError> {
                 median_secs: median(secs),
             },
         )
-        .collect())
+        .collect()
+}
+
+async fn collect(ledger: &Ledger) -> Result<Vec<Stat>, FlatError> {
+    // Retired agents are included on purpose: an ephemeral spoke is
+    // retired the moment its work is accepted, so excluding them would
+    // throw away exactly the population worth measuring.
+    let rows: Vec<(String, i64, i64, String)> = sqlx::query_as(
+        "SELECT a.def, t.cost_micro_usd, t.elapsed_ms, t.state
+         FROM turns t JOIN agents a ON a.agent_id = t.agent_id
+         WHERE t.state IN ('ok', 'failed', 'killed')",
+    )
+    .fetch_all(ledger.pool())
+    .await?;
+
+    let entries = rows
+        .into_iter()
+        .filter_map(|(def_json, cost, elapsed_ms, state)| {
+            let def = serde_json::from_str::<ciacola_core::agent::AgentDef>(&def_json).ok()?;
+            Some((
+                // Only one provider so far; the field exists so the shape
+                // survives a second one.
+                "claude".to_string(),
+                def.model.clone().unwrap_or_else(|| "(default)".into()),
+                def.effort.clone().unwrap_or_else(|| "(default)".into()),
+                def.name.clone(),
+                cost,
+                elapsed_ms / 1000,
+                state != "ok",
+            ))
+        })
+        .collect();
+
+    Ok(aggregate(entries))
 }
 
 fn stat_json(s: &Stat) -> serde_json::Value {
@@ -275,5 +292,217 @@ impl Plugin for TuningPlugin {
                     .len(),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ciacola_core::agent::{AgentDef, Exchange};
+
+    async fn ledger() -> Ledger {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        Ledger::setup(pool).await.expect("ledger")
+    }
+
+    async fn run_ok_turn(l: &Ledger, agent_id: &str, cost_micro_usd: i64, elapsed_ms: i64) {
+        let seq = l.enqueue_turn(agent_id, "hi").await.expect("enqueue");
+        assert!(l.claim_turn(agent_id, seq).await.expect("claim"));
+        l.complete_turn(
+            agent_id,
+            seq,
+            &Exchange {
+                reply: "ok".into(),
+                session: "s".into(),
+                cost_micro_usd: cost_micro_usd as u64,
+                tokens_in: 1,
+                tokens_out: 1,
+                tokens_cached: 0,
+                num_turns: 1,
+                elapsed_ms: elapsed_ms as u64,
+                error: None,
+            },
+        )
+        .await
+        .expect("complete");
+    }
+
+    async fn run_failed_turn(
+        l: &Ledger,
+        agent_id: &str,
+        state: &str,
+        cost_micro_usd: i64,
+        elapsed_ms: i64,
+    ) {
+        let seq = l.enqueue_turn(agent_id, "hi").await.expect("enqueue");
+        assert!(l.claim_turn(agent_id, seq).await.expect("claim"));
+        l.fail_turn(
+            agent_id,
+            seq,
+            state,
+            "boom",
+            cost_micro_usd,
+            elapsed_ms,
+            None,
+        )
+        .await
+        .expect("fail");
+    }
+
+    /// The point of the whole module: two models must keep their own
+    /// totals rather than being summed into one row.
+    #[tokio::test]
+    async fn two_models_are_aggregated_separately() {
+        let l = ledger().await;
+        let sonnet = l
+            .create_agent(&AgentDef::new("alpha", "sys").model("sonnet"), None)
+            .await
+            .expect("create sonnet agent");
+        let haiku = l
+            .create_agent(&AgentDef::new("beta", "sys").model("haiku"), None)
+            .await
+            .expect("create haiku agent");
+
+        for cost in [100, 200, 300] {
+            run_ok_turn(&l, &sonnet, cost, 1000).await;
+        }
+        for cost in [10, 20] {
+            run_ok_turn(&l, &haiku, cost, 1000).await;
+        }
+
+        let stats = collect(&l).await.expect("collect");
+        assert_eq!(stats.len(), 2, "two models must not merge into one bucket");
+
+        let s = stats.iter().find(|s| s.model == "sonnet").expect("sonnet");
+        assert_eq!(s.runs, 3);
+        assert_eq!(s.total_cost_micro_usd, 600);
+
+        let h = stats.iter().find(|s| s.model == "haiku").expect("haiku");
+        assert_eq!(h.runs, 2);
+        assert_eq!(
+            h.total_cost_micro_usd, 30,
+            "haiku's spend must not include sonnet's"
+        );
+    }
+
+    /// Pins the decision the issue asked to pin: a failed turn still
+    /// counts as a run and its cost still counts as spend, since a
+    /// capped run can fail after money is already spent. It just also
+    /// counts as a failure.
+    #[tokio::test]
+    async fn failed_turns_count_toward_runs_and_spend() {
+        let l = ledger().await;
+        let a = l
+            .create_agent(&AgentDef::new("gamma", "sys").model("opus"), None)
+            .await
+            .expect("create");
+
+        run_ok_turn(&l, &a, 100, 1000).await;
+        run_ok_turn(&l, &a, 200, 1000).await;
+        run_failed_turn(&l, &a, "failed", 50, 500).await;
+
+        let stats = collect(&l).await.expect("collect");
+        assert_eq!(stats.len(), 1);
+        let s = &stats[0];
+        assert_eq!(s.runs, 3, "a failed turn still counts as a run");
+        assert_eq!(s.failures, 1);
+        assert_eq!(
+            s.total_cost_micro_usd, 350,
+            "a failure that cost money still counts toward spend"
+        );
+    }
+
+    /// No turns at all: an empty result, not a division by zero inside
+    /// `median` or a row of nulls.
+    #[tokio::test]
+    async fn empty_ledger_produces_no_stats() {
+        let l = ledger().await;
+        let stats = collect(&l).await.expect("collect");
+        assert!(stats.is_empty());
+    }
+
+    /// An agent that exists but has never finished a turn must not
+    /// appear either; queued and running turns are excluded on purpose.
+    #[tokio::test]
+    async fn an_agent_with_no_finished_turns_produces_no_stats() {
+        let l = ledger().await;
+        l.create_agent(&AgentDef::new("idle", "sys"), None)
+            .await
+            .expect("create");
+        let stats = collect(&l).await.expect("collect");
+        assert!(stats.is_empty());
+    }
+
+    /// Same "empty" guarantee for a model whose turns all failed: it
+    /// must still report a real bucket with a real median, not a zeroed
+    /// or null row standing in for "no data".
+    #[tokio::test]
+    async fn a_model_with_only_failures_still_reports_a_real_median() {
+        let l = ledger().await;
+        let a = l
+            .create_agent(&AgentDef::new("delta", "sys").model("sonnet"), None)
+            .await
+            .expect("create");
+
+        run_failed_turn(&l, &a, "failed", 100, 1000).await;
+        run_failed_turn(&l, &a, "killed", 300, 3000).await;
+
+        let stats = collect(&l).await.expect("collect");
+        assert_eq!(
+            stats.len(),
+            1,
+            "an all-failed model must still produce a bucket, not vanish"
+        );
+        let s = &stats[0];
+        assert_eq!(s.runs, 2);
+        assert_eq!(s.failures, 2, "both failed and killed count as failures");
+        assert_eq!(
+            s.median_cost_micro_usd, 300,
+            "median of the real costs, not a zeroed-out row"
+        );
+        assert_eq!(s.median_secs, 3);
+    }
+
+    /// The bucket key is `(provider, model, effort, role)` and only one
+    /// provider exists in production today, so this path has never run
+    /// through `collect`. `aggregate` is the pure grouping logic pulled
+    /// out for exactly this: feed it two rows that agree on model,
+    /// effort, and role but differ on provider, and confirm they land
+    /// in separate buckets rather than merging.
+    #[test]
+    fn aggregate_keys_on_provider() {
+        let entries = vec![
+            (
+                "claude".to_string(),
+                "sonnet".to_string(),
+                "high".to_string(),
+                "role".to_string(),
+                100,
+                10,
+                false,
+            ),
+            (
+                "codex".to_string(),
+                "sonnet".to_string(),
+                "high".to_string(),
+                "role".to_string(),
+                200,
+                20,
+                false,
+            ),
+        ];
+
+        let stats = aggregate(entries);
+        assert_eq!(
+            stats.len(),
+            2,
+            "identical model/effort/role but different providers must not merge"
+        );
+        let providers: std::collections::BTreeSet<_> =
+            stats.iter().map(|s| s.provider.clone()).collect();
+        assert!(providers.contains("claude"));
+        assert!(providers.contains("codex"));
     }
 }
