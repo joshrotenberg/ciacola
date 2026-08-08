@@ -393,6 +393,7 @@ impl TurnExecutor for HandExecutor {
 #[cfg(test)]
 mod config_injection_tests {
     use super::*;
+    use claude_wrapper::ClaudeCommand;
 
     /// The base names the surface and is shared; the token is secret
     /// and per agent; the provider must read a file carrying both.
@@ -449,5 +450,67 @@ mod config_injection_tests {
         let out = token_scoped_mcp_config("agent-1", "t", &base.display().to_string());
         std::fs::remove_file(&base).ok();
         assert!(out.is_err());
+    }
+
+    /// The complete regression from the dogfood run: a capped first
+    /// turn is failed in the ledger, then the next queued prompt must
+    /// render `--resume`, never a second `--session-id` for the id the
+    /// provider already created.
+    #[tokio::test]
+    async fn a_capped_first_turn_makes_the_second_query_resume() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool).await.expect("ledger");
+        let agent_id = ledger
+            .create_agent(&crate::agent::AgentDef::new("a", "sys"), None)
+            .await
+            .expect("agent");
+        let assigned = ledger
+            .get_agent(&agent_id)
+            .await
+            .expect("get")
+            .expect("agent row")
+            .session
+            .expect("preassigned session");
+
+        let first = ledger
+            .enqueue_turn(&agent_id, "first")
+            .await
+            .expect("first turn");
+        assert!(ledger.claim_turn(&agent_id, first).await.expect("claim"));
+        assert!(
+            ledger
+                .fail_turn(
+                    &agent_id,
+                    first,
+                    "failed",
+                    "hit max turns",
+                    1,
+                    1,
+                    Some(&assigned),
+                )
+                .await
+                .expect("record cap")
+        );
+
+        let second = ledger
+            .enqueue_turn(&agent_id, "continue")
+            .await
+            .expect("second turn");
+        let (def, session, started, prompt) =
+            load(&ledger, &agent_id, second).await.expect("load second");
+        let args =
+            crate::agent::query_for_session(&def, session.as_deref(), started, &prompt).args();
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--resume", assigned.as_str()]),
+            "second query did not resume: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--session-id"),
+            "second query tried to recreate the session: {args:?}"
+        );
     }
 }

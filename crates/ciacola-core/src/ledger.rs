@@ -690,12 +690,18 @@ impl Ledger {
         if recorded && (cost_micro_usd > 0 || session.is_some()) {
             sqlx::query(
                 "UPDATE agents SET session = COALESCE(?2, session),
-                     cost_micro_usd = cost_micro_usd + ?3
+                     cost_micro_usd = cost_micro_usd + ?3,
+                     session_started_seq = CASE
+                         WHEN ?2 IS NOT NULL
+                              AND (session IS NULL OR session <> ?2
+                                   OR session_started_seq = 0) THEN ?4
+                         ELSE session_started_seq END
                  WHERE agent_id = ?1",
             )
             .bind(agent_id)
             .bind(session)
             .bind(cost_micro_usd)
+            .bind(seq)
             .execute(&mut *tx)
             .await?;
         }
@@ -824,6 +830,48 @@ mod session_tests {
         );
     }
 
+    /// A provider-reported failure is still an exchange. In particular,
+    /// a max-turns result proves the preassigned session now exists at
+    /// the provider, so the next turn must resume it rather than trying
+    /// to create the same id again.
+    #[tokio::test]
+    async fn failed_first_exchange_records_where_the_session_started() {
+        let l = ledger().await;
+        let id = l
+            .create_agent(&AgentDef::new("a", "sys"), None)
+            .await
+            .expect("create");
+        let assigned = l
+            .get_agent(&id)
+            .await
+            .expect("get")
+            .expect("some")
+            .session
+            .expect("assigned");
+
+        l.enqueue_turn(&id, "hi").await.expect("enqueue");
+        assert!(l.claim_turn(&id, 1).await.expect("claim"));
+        l.fail_turn(
+            &id,
+            1,
+            "failed",
+            "hit max turns",
+            1_250_000,
+            323_000,
+            Some(&assigned),
+        )
+        .await
+        .expect("fail");
+
+        let a = l.get_agent(&id).await.expect("get").expect("some");
+        assert_eq!(a.session.as_deref(), Some(assigned.as_str()));
+        assert_eq!(
+            a.session_started_seq, 1,
+            "the next turn must use --resume, not reuse --session-id"
+        );
+        assert_eq!(a.cost_micro_usd, 1_250_000);
+    }
+
     /// The arithmetic that depends on the above. `in_session` is
     /// `seq - session_started_seq`, so a session_started_seq left at 0
     /// makes turn 2 look like 2 turns in and fires rotation early.
@@ -912,6 +960,10 @@ mod session_tests {
             a.session.as_deref(),
             Some(assigned.as_str()),
             "the session must survive an orphaned turn"
+        );
+        assert_eq!(
+            a.session_started_seq, 0,
+            "a pre-provider failure is not proof that the assigned session opened"
         );
     }
 
