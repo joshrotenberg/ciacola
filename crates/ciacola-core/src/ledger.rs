@@ -253,7 +253,48 @@ impl Ledger {
         self.runtime = runtime;
         Ok(self)
     }
+}
 
+/// A session id we choose, rather than one we learn.
+///
+/// `--session-id` wants a UUID and ciacola already depends on `ulid`,
+/// which is also 128 bits, so the bytes are reshaped rather than adding
+/// a crate for it. Version and variant nibbles are set so the result is
+/// a well-formed v4 and nothing downstream has to be lenient.
+pub fn new_session_id() -> String {
+    let mut b = ulid::Ulid::new().to_bytes();
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h = |r: &[u8]| r.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        h(&b[0..4]),
+        h(&b[4..6]),
+        h(&b[6..8]),
+        h(&b[8..10]),
+        h(&b[10..16])
+    )
+}
+
+impl Ledger {
+    /// Point an agent at a session it has not used yet.
+    ///
+    /// `session_started_seq` goes back to 0, which is what marks the id
+    /// as assigned-but-unopened. Called at creation and again on
+    /// rotation, and in both cases the write lands *before* the provider
+    /// runs, which is the whole point: a turn that dies mid-flight
+    /// leaves an id behind that recovery can actually resume.
+    pub async fn assign_session(&self, agent_id: &str, session: &str) -> Result<(), FlatError> {
+        sqlx::query("UPDATE agents SET session = ?2, session_started_seq = 0 WHERE agent_id = ?1")
+            .bind(agent_id)
+            .bind(session)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+impl Ledger {
     pub async fn create_agent(
         &self,
         def: &AgentDef,
@@ -276,13 +317,17 @@ impl Ledger {
         if def.token_env.is_none() {
             def.token_env = self.runtime.token_env.clone();
         }
-        sqlx::query("INSERT INTO agents (agent_id, name, def, spawned_by) VALUES (?1, ?2, ?3, ?4)")
-            .bind(&agent_id)
-            .bind(&def.name)
-            .bind(serde_json::to_string(&def)?)
-            .bind(spawned_by)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT INTO agents (agent_id, name, def, spawned_by, session) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(&agent_id)
+        .bind(&def.name)
+        .bind(serde_json::to_string(&def)?)
+        .bind(spawned_by)
+        .bind(new_session_id())
+        .execute(&self.pool)
+        .await?;
         Ok(agent_id)
     }
 
@@ -493,13 +538,19 @@ impl Ledger {
         .await?;
         let recorded = done.rows_affected() == 1;
         if recorded {
-            // session_started_seq maintains itself: a session id that
-            // differs from the stored one means this turn opened a new
-            // session, so rotation needs no flag threaded through.
+            // session_started_seq marks where the current session
+            // began, and rotation measures from it. Two ways in: the id
+            // changed (a session we did not assign), or the id was
+            // assigned and this is the turn that opened it, which is
+            // what `session_started_seq = 0` means. Without the second
+            // clause an assigned id never records its start, because it
+            // never differs, and rotation then counts from 0 and fires
+            // one turn early on every agent for the rest of its life.
             sqlx::query(
                 "UPDATE agents SET session = ?2, cost_micro_usd = cost_micro_usd + ?3,
                      session_started_seq = CASE
-                         WHEN session IS NULL OR session <> ?2 THEN ?4
+                         WHEN session IS NULL OR session <> ?2
+                              OR session_started_seq = 0 THEN ?4
                          ELSE session_started_seq END
                  WHERE agent_id = ?1",
             )
@@ -587,5 +638,185 @@ impl Ledger {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(turn_row).collect())
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::agent::{AgentDef, Exchange};
+
+    async fn ledger() -> Ledger {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        Ledger::setup(pool).await.expect("ledger")
+    }
+
+    fn exchange(session: &str) -> Exchange {
+        Exchange {
+            reply: "ok".into(),
+            session: session.into(),
+            cost_micro_usd: 1,
+            tokens_in: 1,
+            tokens_out: 1,
+            tokens_cached: 0,
+            num_turns: 1,
+            elapsed_ms: 1,
+            error: None,
+        }
+    }
+
+    /// The point of the whole change: an agent has a resumable id
+    /// before it has ever run, so a crash mid-turn cannot lose it.
+    #[tokio::test]
+    async fn an_agent_has_a_session_before_its_first_turn() {
+        let l = ledger().await;
+        let id = l
+            .create_agent(&AgentDef::new("a", "sys"), None)
+            .await
+            .expect("create");
+        let a = l.get_agent(&id).await.expect("get").expect("some");
+        assert!(a.session.is_some(), "no session assigned at creation");
+        assert_eq!(
+            a.session_started_seq, 0,
+            "assigned but unopened must read as 0"
+        );
+    }
+
+    #[test]
+    fn assigned_ids_are_well_formed_uuids_and_distinct() {
+        let (a, b) = (new_session_id(), new_session_id());
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 36);
+        let parts: Vec<_> = a.split('-').map(str::len).collect();
+        assert_eq!(parts, vec![8, 4, 4, 4, 12]);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        assert_eq!(&a[14..15], "4", "version nibble");
+        assert!(matches!(&a[19..20], "8" | "9" | "a" | "b"), "variant");
+    }
+
+    /// The regression this change could most easily have introduced.
+    /// `session_started_seq` used to be set only when the id *changed*,
+    /// which never happens once we assign it, so it would have stayed 0
+    /// and rotation would measure from 0 forever.
+    #[tokio::test]
+    async fn first_turn_records_where_the_session_started() {
+        let l = ledger().await;
+        let id = l
+            .create_agent(&AgentDef::new("a", "sys"), None)
+            .await
+            .expect("create");
+        let assigned = l
+            .get_agent(&id)
+            .await
+            .expect("get")
+            .expect("some")
+            .session
+            .expect("assigned");
+
+        l.enqueue_turn(&id, "hi").await.expect("enqueue");
+        assert!(l.claim_turn(&id, 1).await.expect("claim"));
+        l.complete_turn(&id, 1, &exchange(&assigned))
+            .await
+            .expect("complete");
+
+        let a = l.get_agent(&id).await.expect("get").expect("some");
+        assert_eq!(a.session.as_deref(), Some(assigned.as_str()));
+        assert_eq!(
+            a.session_started_seq, 1,
+            "an assigned session must record its start, or rotation counts from zero"
+        );
+    }
+
+    /// The arithmetic that depends on the above. `in_session` is
+    /// `seq - session_started_seq`, so a session_started_seq left at 0
+    /// makes turn 2 look like 2 turns in and fires rotation early.
+    #[tokio::test]
+    async fn turns_in_session_counts_from_the_opening_turn() {
+        let l = ledger().await;
+        let id = l
+            .create_agent(&AgentDef::new("a", "sys"), None)
+            .await
+            .expect("create");
+        let assigned = l
+            .get_agent(&id)
+            .await
+            .expect("get")
+            .expect("some")
+            .session
+            .expect("assigned");
+        l.enqueue_turn(&id, "one").await.expect("enqueue");
+        l.claim_turn(&id, 1).await.expect("claim");
+        l.complete_turn(&id, 1, &exchange(&assigned))
+            .await
+            .expect("complete");
+
+        let a = l.get_agent(&id).await.expect("get").expect("some");
+        assert_eq!(2 - a.session_started_seq, 1, "turn 2 is one turn in");
+    }
+
+    /// Rotation assigns the next id up front for the same reason
+    /// creation does, and resets the marker so the new session records
+    /// its own start.
+    #[tokio::test]
+    async fn assign_session_replaces_the_id_and_reopens_it() {
+        let l = ledger().await;
+        let id = l
+            .create_agent(&AgentDef::new("a", "sys"), None)
+            .await
+            .expect("create");
+        let first = l
+            .get_agent(&id)
+            .await
+            .expect("get")
+            .expect("some")
+            .session
+            .expect("assigned");
+        l.enqueue_turn(&id, "one").await.expect("enqueue");
+        l.claim_turn(&id, 1).await.expect("claim");
+        l.complete_turn(&id, 1, &exchange(&first))
+            .await
+            .expect("complete");
+
+        let next = new_session_id();
+        l.assign_session(&id, &next).await.expect("assign");
+
+        let a = l.get_agent(&id).await.expect("get").expect("some");
+        assert_eq!(a.session.as_deref(), Some(next.as_str()));
+        assert_ne!(a.session.as_deref(), Some(first.as_str()));
+        assert_eq!(a.session_started_seq, 0, "a rotated session is unopened");
+    }
+
+    /// The failure this issue was filed for: a turn that dies leaves
+    /// the agent resumable rather than blank.
+    #[tokio::test]
+    async fn an_orphaned_turn_leaves_the_session_behind() {
+        let l = ledger().await;
+        let id = l
+            .create_agent(&AgentDef::new("a", "sys"), None)
+            .await
+            .expect("create");
+        let assigned = l
+            .get_agent(&id)
+            .await
+            .expect("get")
+            .expect("some")
+            .session
+            .expect("assigned");
+
+        // Claimed and then abandoned, exactly as a killed server does.
+        l.enqueue_turn(&id, "hi").await.expect("enqueue");
+        l.claim_turn(&id, 1).await.expect("claim");
+        l.fail_turn(&id, 1, "failed", "orphaned by server crash", 0, None)
+            .await
+            .expect("fail");
+
+        let a = l.get_agent(&id).await.expect("get").expect("some");
+        assert_eq!(
+            a.session.as_deref(),
+            Some(assigned.as_str()),
+            "the session must survive an orphaned turn"
+        );
     }
 }

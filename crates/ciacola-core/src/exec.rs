@@ -83,12 +83,12 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
         notify.turn(LogLevel::Error, agent_id, seq, state, &error);
     };
 
-    let (def, session, prompt) = match load(ledger, agent_id, seq).await {
+    let (def, session, started, prompt) = match load(ledger, agent_id, seq).await {
         Ok(loaded) => loaded,
         Err(e) => return fail("failed", e.to_string(), 0, None).await,
     };
 
-    match run_exchange(&def, session.as_deref(), &prompt).await {
+    match run_exchange(&def, session.as_deref(), started, &prompt).await {
         Ok(exchange) => {
             if let Some(error) = &exchange.error {
                 // The provider ran and failed. The spend and any session
@@ -148,7 +148,7 @@ async fn load(
     ledger: &Ledger,
     agent_id: &str,
     seq: i64,
-) -> Result<(crate::agent::AgentDef, Option<String>, String), crate::agent::FlatError> {
+) -> Result<(crate::agent::AgentDef, Option<String>, bool, String), crate::agent::FlatError> {
     let agent = ledger
         .get_agent(agent_id)
         .await?
@@ -161,18 +161,32 @@ async fn load(
     // Rotate when this turn would exceed the policy for the current
     // session. Dropping the session is the whole mechanism; the
     // provider keeps the old transcript, we simply stop resuming it.
+    // An id is assigned at birth, so `session.is_some()` no longer
+    // means "has run". `session_started_seq` does: 0 until the turn
+    // that opens the session records itself.
+    let started = agent.session_started_seq > 0;
     let in_session = seq - agent.session_started_seq;
     let rotating = agent
         .def
         .rotate_after_turns
-        .is_some_and(|limit| agent.session.is_some() && in_session > limit as i64);
+        .is_some_and(|limit| started && in_session > limit as i64);
 
     if rotating {
         eprintln!("[exec] rotating {agent_id} after {in_session} turns in session");
+        // Persisted before the provider runs, for the same reason the
+        // first one is: a rotation turn that dies mid-flight would
+        // otherwise lose the id it was about to open.
+        let next = crate::ledger::new_session_id();
+        ledger.assign_session(agent_id, &next).await?;
         let preamble = rotation_preamble(&agent.def.name, in_session);
-        return Ok((agent.def, None, format!("{preamble}{}", turn.prompt)));
+        return Ok((
+            agent.def,
+            Some(next),
+            false,
+            format!("{preamble}{}", turn.prompt),
+        ));
     }
-    Ok((agent.def, agent.session, turn.prompt))
+    Ok((agent.def, agent.session, started, turn.prompt))
 }
 
 type Kills = Arc<Mutex<HashMap<(String, i64), CancellationToken>>>;
