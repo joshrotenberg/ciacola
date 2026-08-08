@@ -236,13 +236,18 @@ impl Repos {
     async fn remove_worktree(&self, repo: &str, slug: &str) -> Result<(), FlatError> {
         let bare = self.bare(repo);
         let path = self.root.join(format!("wt-{slug}"));
-        let mut remove = WorktreeCommand::remove(&path);
-        remove.force();
-        bare_repo(&bare)
-            .worktree(remove)
-            .execute()
-            .await
-            .map_err(|e| -> FlatError { format!("worktree remove: {e}").into() })?;
+        // Cleanup is retried after partial failures, so an already
+        // absent worktree is success. The branch deletion below is
+        // deliberately idempotent as well.
+        if path.exists() {
+            let mut remove = WorktreeCommand::remove(&path);
+            remove.force();
+            bare_repo(&bare)
+                .worktree(remove)
+                .execute()
+                .await
+                .map_err(|e| -> FlatError { format!("worktree remove: {e}").into() })?;
+        }
         let _ = bare_repo(&bare)
             .branch()
             .delete(format!("agent/{slug}"))
@@ -709,6 +714,19 @@ to do, on purpose."
                     .handler(move |args: OpenPrArgs| {
                         let ctx = ctx_pr.clone();
                         async move {
+                            // The title gate is the preflight: keep it
+                            // ahead of assignment lookup, gh, git, and
+                            // especially push so every rejection is
+                            // side-effect free.
+                            if !conventional_title(&args.title) {
+                                return Ok(CallToolResult::error(format!(
+                                    "title '{}' is not conventional-commit form. \
+                                     Use type(scope): subject, e.g. 'fix: ...' or \
+                                     'feat(board): ...'; types are build, chore, ci, \
+                                     docs, feat, fix, perf, refactor, revert, style, test.",
+                                    args.title
+                                )));
+                            }
                             let store =
                                 ciacola_core::store::Store::new(ctx.pool.clone(), "repo-worker");
                             let key = format!("agent/{}", args.agent_id);
@@ -768,15 +786,6 @@ to do, on purpose."
                             if let Err(e) = pushed {
                                 return Ok(CallToolResult::error(format!("push: {e}")));
                             }
-                            if !conventional_title(&args.title) {
-                                return Ok(CallToolResult::error(format!(
-                                    "title '{}' is not conventional-commit form. \
-                                     Use type(scope): subject, e.g. 'fix: ...' or \
-                                     'feat(board): ...'; types are build, chore, ci, \
-                                     docs, feat, fix, perf, refactor, revert, style, test.",
-                                    args.title
-                                )));
-                            }
                             let draft = args.draft.unwrap_or(true);
                             let mut cmd = vec![
                                 "pr",
@@ -830,16 +839,58 @@ to do, on purpose."
                             let Ok(Some(a)) = store.get::<Assignment>(&key).await else {
                                 return Ok(CallToolResult::error("no assignment".to_string()));
                             };
-                            let removed = if args.keep.unwrap_or(false) {
+                            // Retire before touching the worktree, and
+                            // `retire_agent` is the proof: it flips the
+                            // row atomically with the check that no turn
+                            // is `queued` or `running`, so `true` here
+                            // means idle, not merely "we asked". Removing
+                            // the directory first, as this used to, could
+                            // delete a mid-turn agent's working tree out
+                            // from under it and only afterwards discover
+                            // retirement had refused.
+                            // A prior cleanup attempt may have retired
+                            // successfully and then failed in git or the
+                            // store. Treat that as proof too, so the
+                            // retained assignment is actually retryable.
+                            let retired = match ctx.ledger.get_agent(&args.agent_id).await {
+                                Ok(Some(agent)) if agent.retired => true,
+                                Ok(Some(_)) => ctx
+                                    .ledger
+                                    .retire_agent(&args.agent_id)
+                                    .await
+                                    .unwrap_or(false),
+                                _ => false,
+                            };
+                            if !retired {
+                                return Ok(CallToolResult::error(
+                                    "agent still has a queued or running turn; \
+                                     finish once it goes idle"
+                                        .to_string(),
+                                ));
+                            }
+                            let keep = args.keep.unwrap_or(false);
+                            let removed = if keep {
                                 false
                             } else {
-                                repos.remove_worktree(&a.repo, &a.slug).await.is_ok()
+                                if let Err(e) = repos.remove_worktree(&a.repo, &a.slug).await {
+                                    return Ok(CallToolResult::error(format!(
+                                        "agent retired, but cleanup failed; assignment kept for retry: {e}"
+                                    )));
+                                }
+                                true
                             };
-                            let retired = ctx
-                                .ledger
-                                .retire_agent(&args.agent_id)
-                                .await
-                                .unwrap_or(false);
+                            // A retired agent is done, not "in progress":
+                            // drop the assignment so it stops appearing
+                            // in the board's "issues in progress" section
+                            // and in `health`'s count. Nothing else in
+                            // this plugin reads a finished assignment, so
+                            // there is no history to preserve by keeping
+                            // it.
+                            if let Err(e) = store.delete(&key).await {
+                                return Ok(CallToolResult::error(format!(
+                                    "agent retired and worktree cleanup completed, but assignment cleanup failed: {e}"
+                                )));
+                            }
                             Ok(CallToolResult::json(json!({
                                 "worktree_removed": removed,
                                 "agent_retired": retired,
@@ -927,6 +978,264 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    fn context(pool: sqlx::SqlitePool, ledger: Ledger) -> PluginContext {
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+        let notify = ciacola_core::Notifier(tx);
+        let exec = ciacola_core::HandExecutor::start(ledger.clone(), notify.clone(), 1);
+        PluginContext {
+            pool,
+            ledger,
+            exec,
+            notify,
+            db_path: String::new(),
+            loopback_mcp_config: "agent.json".into(),
+            operator_mcp_config: "operator.json".into(),
+            plugin_config: toml::Value::Table(Default::default()),
+            limits: Default::default(),
+            runtime: Default::default(),
+        }
+    }
+
+    fn plugin(ctx: PluginContext, repos: Repos) -> RepoWorkerPlugin {
+        RepoWorkerPlugin {
+            repos: Some(repos),
+            ctx: Some(ctx),
+            roles: Some(Roles::new(Vec::new(), "agent.json")),
+        }
+    }
+
+    fn operator_tool(plugin: &RepoWorkerPlugin, name: &str) -> Tool {
+        plugin
+            .tools(Surface::Operator)
+            .into_iter()
+            .find(|tool| tool.definition().name == name)
+            .unwrap_or_else(|| panic!("operator tool {name}"))
+    }
+
+    async fn local_repos(label: &str) -> (PathBuf, Repos) {
+        let tmp = std::env::temp_dir().join(format!("ciacola-{label}-{}", ulid::Ulid::new()));
+        let origin = tmp.join("origin");
+        std::fs::create_dir_all(&origin).expect("mkdir");
+        git(&origin, &["init", "-q", "-b", "main"]).await;
+        git(&origin, &["config", "user.email", "t@example.com"]).await;
+        git(&origin, &["config", "user.name", "t"]).await;
+        std::fs::write(origin.join("a"), "one").expect("write");
+        git(&origin, &["add", "."]).await;
+        git(&origin, &["commit", "-qm", "one"]).await;
+
+        let repos = Repos {
+            root: tmp.join("root"),
+            allowed: Arc::new(vec!["local/repo".into()]),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        std::fs::create_dir_all(&repos.root).expect("mkdir root");
+        CloneCommand::new(format!("file://{}", origin.display()))
+            .bare()
+            .directory(repos.bare("local/repo"))
+            .execute()
+            .await
+            .expect("clone");
+        (tmp, repos)
+    }
+
+    async fn memory_plugin(repos: Repos) -> (RepoWorkerPlugin, Ledger) {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        // The real plugin host applies core's shared Store migration.
+        // These focused plugin tests build the context directly, so the
+        // fixture must supply the same table explicitly.
+        sqlx::query(
+            "CREATE TABLE plugin_kv (
+                 plugin TEXT NOT NULL,
+                 key TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 updated_unix INTEGER NOT NULL,
+                 PRIMARY KEY (plugin, key))",
+        )
+        .execute(&pool)
+        .await
+        .expect("plugin store");
+        (plugin(context(pool, ledger.clone()), repos), ledger)
+    }
+
+    #[tokio::test]
+    async fn invalid_pr_title_is_refused_before_assignment_or_git_work() {
+        let root = std::env::temp_dir().join(format!("ciacola-title-{}", ulid::Ulid::new()));
+        let repos = Repos {
+            root: root.clone(),
+            allowed: Arc::new(Vec::new()),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let (plugin, _ledger) = memory_plugin(repos).await;
+
+        let out = operator_tool(&plugin, "open_pr")
+            .call(json!({
+                "agent_id": "missing",
+                "title": "not conventional",
+                "body": "unused"
+            }))
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+
+        assert!(rendered.contains("not conventional-commit form"));
+        assert!(!rendered.contains("no assignment"));
+        assert!(!root.exists(), "preflight must not create repository state");
+    }
+
+    #[tokio::test]
+    async fn finish_refuses_a_running_agent_before_removing_its_worktree() {
+        let (tmp, repos) = local_repos("finish-running").await;
+        let slug = "local-repo-42";
+        let (worktree, branch) = repos
+            .add_worktree("local/repo", slug, "main")
+            .await
+            .expect("worktree");
+        let (plugin, ledger) = memory_plugin(repos).await;
+        let agent_id = ledger
+            .create_agent(&ciacola_core::AgentDef::new("worker", "s"), None)
+            .await
+            .expect("agent");
+        let seq = ledger.enqueue_turn(&agent_id, "work").await.expect("turn");
+        assert!(ledger.claim_turn(&agent_id, seq).await.expect("claim"));
+        let store = plugin.store().expect("store");
+        store
+            .put(
+                &format!("agent/{agent_id}"),
+                &Assignment {
+                    repo: "local/repo".into(),
+                    issue: 42,
+                    slug: slug.into(),
+                    branch,
+                    worktree: worktree.display().to_string(),
+                    pr: None,
+                },
+            )
+            .await
+            .expect("assignment");
+
+        let out = operator_tool(&plugin, "finish_issue")
+            .call(json!({"agent_id": agent_id}))
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+
+        assert!(rendered.contains("queued or running"), "got: {rendered}");
+        assert!(worktree.exists(), "finish removed a live worktree");
+        assert!(
+            store
+                .get::<Assignment>(&format!("agent/{agent_id}"))
+                .await
+                .expect("read assignment")
+                .is_some(),
+            "finish lost the live assignment"
+        );
+        assert!(!ledger.get_agent(&agent_id).await.unwrap().unwrap().retired);
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn finished_assignment_leaves_the_in_progress_view() {
+        let root = std::env::temp_dir().join(format!("ciacola-finish-keep-{}", ulid::Ulid::new()));
+        let worktree = root.join("wt-local-repo-42");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        let repos = Repos {
+            root: root.clone(),
+            allowed: Arc::new(Vec::new()),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let (plugin, ledger) = memory_plugin(repos).await;
+        let agent_id = ledger
+            .create_agent(&ciacola_core::AgentDef::new("worker", "s"), None)
+            .await
+            .expect("agent");
+        plugin
+            .store()
+            .unwrap()
+            .put(
+                &format!("agent/{agent_id}"),
+                &Assignment {
+                    repo: "local/repo".into(),
+                    issue: 42,
+                    slug: "local-repo-42".into(),
+                    branch: "agent/local-repo-42".into(),
+                    worktree: worktree.display().to_string(),
+                    pr: Some(44),
+                },
+            )
+            .await
+            .expect("assignment");
+
+        let out = operator_tool(&plugin, "finish_issue")
+            .call(json!({"agent_id": agent_id, "keep": true}))
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+
+        assert!(rendered.contains("agent_retired"), "got: {rendered}");
+        assert!(ledger.get_agent(&agent_id).await.unwrap().unwrap().retired);
+        assert!(plugin.assignments().await.is_empty());
+        assert!(worktree.exists(), "keep=true must retain the worktree");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_keeps_a_retryable_assignment() {
+        let root = std::env::temp_dir().join(format!("ciacola-finish-retry-{}", ulid::Ulid::new()));
+        let worktree = root.join("wt-local-repo-42");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        let repos = Repos {
+            root: root.clone(),
+            allowed: Arc::new(Vec::new()),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let (plugin, ledger) = memory_plugin(repos).await;
+        let agent_id = ledger
+            .create_agent(&ciacola_core::AgentDef::new("worker", "s"), None)
+            .await
+            .expect("agent");
+        let store = plugin.store().unwrap();
+        store
+            .put(
+                &format!("agent/{agent_id}"),
+                &Assignment {
+                    repo: "local/repo".into(),
+                    issue: 42,
+                    slug: "local-repo-42".into(),
+                    branch: "agent/local-repo-42".into(),
+                    worktree: worktree.display().to_string(),
+                    pr: None,
+                },
+            )
+            .await
+            .expect("assignment");
+
+        let finish = operator_tool(&plugin, "finish_issue");
+        let failed = finish.call(json!({"agent_id": agent_id})).await;
+        let failed = serde_json::to_string(&failed).expect("render");
+        assert!(
+            failed.contains("assignment kept for retry"),
+            "got: {failed}"
+        );
+        assert!(ledger.get_agent(&agent_id).await.unwrap().unwrap().retired);
+        assert!(
+            store
+                .get::<Assignment>(&format!("agent/{agent_id}"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // A later cleanup recognizes the already-retired agent instead
+        // of getting stuck forever at the retirement gate.
+        let retried = finish
+            .call(json!({"agent_id": agent_id, "keep": true}))
+            .await;
+        let retried = serde_json::to_string(&retried).expect("render");
+        assert!(retried.contains("agent_retired"), "got: {retried}");
+        assert!(plugin.assignments().await.is_empty());
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// A bare clone made by `git clone --bare` has no

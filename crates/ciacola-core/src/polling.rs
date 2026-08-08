@@ -44,6 +44,30 @@ use crate::plugin::BoxFut;
 
 type Kills = Arc<Mutex<HashMap<(String, i64), CancellationToken>>>;
 
+/// A dispatch is in flight from the moment it owns a permit, not only
+/// after its task has been spawned and claimed the ledger row. Keeping
+/// that accounting in a drop guard closes the startup gap and makes
+/// every early return, cancellation, and panic release the count.
+struct InflightGuard(Arc<AtomicUsize>);
+
+impl InflightGuard {
+    fn after_permit(stopping: &AtomicBool, inflight: Arc<AtomicUsize>) -> Option<InflightGuard> {
+        // Reserve before consulting `stopping`. If drain wins just
+        // before this increment it may observe zero and return, but the
+        // check below then observes stopping and refuses to dispatch. If
+        // this increment wins, drain observes one and waits for us.
+        let guard = InflightGuard(inflight);
+        guard.0.fetch_add(1, Ordering::SeqCst);
+        (!stopping.load(Ordering::SeqCst)).then_some(guard)
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub struct PollingExecutor {
     /// Woken by `submit` so a fresh turn does not wait for the tick.
     /// Losing a nudge costs latency, never correctness.
@@ -96,11 +120,21 @@ impl PollingExecutor {
                     let Ok(permit) = limit.clone().acquire_owned().await else {
                         return;
                     };
+                    // This both accounts for the dispatch-startup gap
+                    // and re-checks shutdown after a potentially long
+                    // permit wait. On refusal, both guards drop and the
+                    // ledger row stays queued for the next boot.
+                    let Some(inflight_guard) =
+                        InflightGuard::after_permit(&stopping, inflight.clone())
+                    else {
+                        break;
+                    };
                     let (ledger, notify) = (ledger.clone(), notify.clone());
-                    let (kills, inflight) = (kills.clone(), inflight.clone());
+                    let kills = kills.clone();
                     let (agent_id, seq) = (turn.agent_id.clone(), turn.seq);
                     tokio::spawn(async move {
                         let _permit = permit;
+                        let _inflight = inflight_guard;
                         match ledger.claim_turn(&agent_id, seq).await {
                             Ok(true) => {}
                             Ok(false) => return,
@@ -114,12 +148,10 @@ impl PollingExecutor {
                         if let Ok(mut map) = kills.lock() {
                             map.insert(key.clone(), token.clone());
                         }
-                        inflight.fetch_add(1, Ordering::SeqCst);
                         tokio::select! {
                             () = run_claimed_turn(&ledger, &notify, &agent_id, seq) => {}
                             () = token.cancelled() => {}
                         }
-                        inflight.fetch_sub(1, Ordering::SeqCst);
                         if let Ok(mut map) = kills.lock() {
                             map.remove(&key);
                         }
@@ -168,5 +200,44 @@ impl TurnExecutor for PollingExecutor {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn executor(stopping: Arc<AtomicBool>, inflight: Arc<AtomicUsize>) -> PollingExecutor {
+        PollingExecutor {
+            nudge: Arc::new(Notify::new()),
+            kills: Arc::new(Mutex::new(HashMap::new())),
+            stopping,
+            inflight,
+        }
+    }
+
+    #[test]
+    fn shutdown_after_a_permit_refuses_the_dispatch() {
+        let stopping = AtomicBool::new(true);
+        let inflight = Arc::new(AtomicUsize::new(0));
+
+        let reservation = InflightGuard::after_permit(&stopping, inflight.clone());
+
+        assert!(reservation.is_none());
+        assert_eq!(inflight.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_sees_a_dispatch_before_its_task_starts() {
+        let stopping = Arc::new(AtomicBool::new(false));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let reservation = InflightGuard::after_permit(&stopping, inflight.clone())
+            .expect("dispatch reserved before task spawn");
+        let executor = executor(stopping, inflight.clone());
+
+        assert_eq!(executor.drain(Duration::ZERO).await, 1);
+
+        drop(reservation);
+        assert_eq!(inflight.load(Ordering::SeqCst), 0);
     }
 }
