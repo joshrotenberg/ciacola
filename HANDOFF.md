@@ -103,6 +103,15 @@ three are now enforced where paths converge: `plugin::submit` for
 submission, `Ledger::create_agent` for creation. **When you add a
 policy, find the convergence point first.**
 
+**A correct fix can arm a latent bug.** `ensure_clone` passed
+`--prune` for its whole life and it did nothing, because a bare clone
+configures no refspec for prune to work against. Supplying the missing
+refspec was right, and it armed the prune, which then deleted the
+worktree branches this system creates and turned agents' commits into
+orphans. The next fix exposed a third failure in the same line. When
+you fix something that was silently doing nothing, look at what was
+relying on it doing nothing.
+
 **Isolation has to be paired with putting back what it removes.**
 Hermetic agents inherit no ambient config, which is the point, and
 which silently removed the operator's own standing rules: the first
@@ -111,19 +120,20 @@ forbid. House rules are now an explicit layer of the system prompt.
 
 ## Known broken, in the order it will annoy you
 
-1. **`config::apply` reaches into a plugin's table.** Agent config
-   declares `[agents.schedule]`, so the binary's config pass needs a
-   `Schedules` handle. The right fix is a plugin config hook: let a
-   plugin claim part of an agent's declaration.
-2. **`spawned_by` is honour-system.** The loopback has no caller
-   identity, so an agent reports its own parentage and could lie. Fix
-   is per-agent tokens or per-agent mount paths.
-3. **No capability ceiling.** A spawned helper's tools are not required
+1. **`spawned_by` is honour-system.** The loopback has no caller
+   identity, so an agent reports its own parentage and could lie.
+   Designed in ciacola#7: a per-agent token minted in `create_agent`,
+   carried in that agent's MCP config, resolved to an id by a layer.
+   Blocked on tower-mcp#1242, which asks for a way to get anything a
+   layer knows into a tool handler.
+2. **No capability ceiling.** A spawned helper's tools are not required
    to be a subset of its parent's. Depth is capped; breadth is not.
-4. **`CLAUDE_CONFIG_DIR` isolates the login.** A fresh `claude_home`
+   Falls out of the item above: once the caller is known rather than
+   claimed, `spawn` can intersect the child's tools with the parent's.
+3. **`CLAUDE_CONFIG_DIR` isolates the login.** A fresh `claude_home`
    authenticates as nobody. `claude setup-token` plus `token_env` is
    the route through, and the server warns at boot.
-5. **`wait` is shadowed in mcp-repl.** `wait` is one of the six verbs
+4. **`wait` is shadowed in mcp-repl.** `wait` is one of the six verbs
    and also an mcp-repl built-in (wait for a background task), and the
    built-in wins: typing `wait` gets "no tasks in this session to wait
    for". `find wait` lists both, so the client knows about the clash
@@ -132,7 +142,7 @@ forbid. House rules are now an explicit layer of the system prompt.
    one client is the wrong direction, so this is filed upstream as
    [mcp-repl#87](https://github.com/joshrotenberg/mcp-repl/issues/87)
    and nothing here changes.
-6. **Cost is Claude-only.** codex reports tokens and no price at all
+5. **Cost is Claude-only.** codex reports tokens and no price at all
    and deliberately refuses to synthesize one, which is why tokens are
    in the ledger beside cost. A second provider will find `cost_usd`
    optional in practice but not in shape.
