@@ -364,15 +364,11 @@ impl Ledger {
 }
 
 impl Ledger {
-    pub async fn create_agent(
-        &self,
-        def: &AgentDef,
-        spawned_by: Option<&str>,
-    ) -> Result<String, FlatError> {
-        let agent_id = ulid::Ulid::new().to_string();
-        // A definition that does not say otherwise inherits the
-        // server's isolation and rules. Explicit values win, so a role
-        // can still opt out.
+    /// Stamp server-wide defaults onto a definition at the storage
+    /// boundary. Both creation and replacement pass here: config upsert
+    /// and `spawn_role` replace a definition after the id is known, and a
+    /// create-only guard let those writes erase isolation and credentials.
+    fn normalized_def(&self, def: &AgentDef) -> AgentDef {
         let mut def = def.clone();
         if def.hermetic.is_none() {
             def.hermetic = self.runtime.hermetic.clone();
@@ -386,6 +382,19 @@ impl Ledger {
         if def.token_env.is_none() {
             def.token_env = self.runtime.token_env.clone();
         }
+        def
+    }
+
+    pub async fn create_agent(
+        &self,
+        def: &AgentDef,
+        spawned_by: Option<&str>,
+    ) -> Result<String, FlatError> {
+        let agent_id = ulid::Ulid::new().to_string();
+        // A definition that does not say otherwise inherits the
+        // server's isolation and rules. Explicit values win, so a role
+        // can still opt out.
+        let def = self.normalized_def(def);
         sqlx::query(
             "INSERT INTO agents (agent_id, name, def, spawned_by, session, token) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -405,10 +414,11 @@ impl Ledger {
     /// and history. This is what makes config-born agents updatable:
     /// the def follows the config file; the conversation persists.
     pub async fn update_agent_def(&self, agent_id: &str, def: &AgentDef) -> Result<(), FlatError> {
+        let def = self.normalized_def(def);
         sqlx::query("UPDATE agents SET name = ?2, def = ?3 WHERE agent_id = ?1")
             .bind(agent_id)
             .bind(&def.name)
-            .bind(serde_json::to_string(def)?)
+            .bind(serde_json::to_string(&def)?)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -954,5 +964,40 @@ mod session_tests {
             l2.token_of(&a).await.expect("q").is_some(),
             "boot must mint the missing token"
         );
+    }
+
+    /// Config upsert and `spawn_role` replace a definition after creation.
+    /// That replacement used to erase the defaults create_agent had just
+    /// stamped, reopening ambient config and dropping isolated-home auth.
+    #[tokio::test]
+    async fn replacing_a_definition_keeps_runtime_defaults() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let runtime = crate::roles::Runtime {
+            hermetic: Some("full".into()),
+            claude_home: Some("/tmp/ciacola-test-home".into()),
+            house_rules: Some("keep the rule".into()),
+            house_rules_file: None,
+            token_env: Some("CIACOLA_TEST_TOKEN".into()),
+        };
+        let l = Ledger::setup(pool)
+            .await
+            .expect("ledger")
+            .with_runtime(runtime)
+            .expect("runtime");
+        let id = l
+            .create_agent(&AgentDef::new("before", "s"), None)
+            .await
+            .expect("create");
+
+        l.update_agent_def(&id, &AgentDef::new("after", "changed"))
+            .await
+            .expect("replace");
+        let def = l.get_agent(&id).await.expect("get").expect("row").def;
+        assert_eq!(def.hermetic.as_deref(), Some("full"));
+        assert_eq!(def.claude_home.as_deref(), Some("/tmp/ciacola-test-home"));
+        assert_eq!(def.house_rules.as_deref(), Some("keep the rule"));
+        assert_eq!(def.token_env.as_deref(), Some("CIACOLA_TEST_TOKEN"));
     }
 }

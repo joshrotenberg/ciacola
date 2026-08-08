@@ -586,6 +586,25 @@ to do, on purpose."
                                 args.repo
                             )));
                         }
+                        let Some(role) = roles.get(ROLE).cloned() else {
+                            return Ok(CallToolResult::error("role missing".to_string()));
+                        };
+                        let grant = match ciacola_core::grant_child_tools(
+                            &ctx.ledger,
+                            caller.as_deref(),
+                            role.allowed_tools.clone(),
+                        )
+                        .await
+                        {
+                            Ok(grant) => grant,
+                            Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                        };
+                        if !grant.denied.is_empty() {
+                            return Ok(CallToolResult::error(format!(
+                                "issue-implementer needs tools its parent does not hold: {}",
+                                grant.denied.join(", ")
+                            )));
+                        }
                         let slug = format!("{}-{}", args.repo.replace('/', "-"), args.issue);
                         let base = match &args.base {
                             Some(base) => base.clone(),
@@ -609,16 +628,12 @@ to do, on purpose."
                                 Ok(pair) => pair,
                                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
                             };
-
-                        let Some(role) = roles.get(ROLE) else {
-                            return Ok(CallToolResult::error("role missing".to_string()));
-                        };
                         let args_map = std::collections::HashMap::from([
                             ("repo".to_string(), args.repo.clone()),
                             ("issue".to_string(), args.issue.to_string()),
                             ("worktree".to_string(), worktree.display().to_string()),
                         ]);
-                        let mut def = roles.to_def(role, &args_map);
+                        let mut def = roles.to_def(&role, &args_map);
                         def.name = format!("impl-{slug}");
 
                         match ctx.ledger.create_agent(&def, spawned_by.as_deref()).await {
@@ -897,6 +912,8 @@ to do, on purpose."
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_mcp::context::{Extensions, RequestContext};
+    use tower_mcp::protocol::RequestId;
 
     async fn git(dir: &Path, args: &[&str]) {
         let out = tokio::process::Command::new("git")
@@ -1112,5 +1129,69 @@ mod tests {
         ] {
             assert!(!conventional_title(bad), "should fail: {bad}");
         }
+    }
+
+    /// `start_issue` creates an agent through plugin wiring, so it must
+    /// meet the same ceiling as raw spawn and spawn_role. The refusal is
+    /// deliberately checked before gh or git runs.
+    #[tokio::test]
+    async fn start_issue_cannot_out_reach_its_authenticated_parent() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        let parent = ledger
+            .create_agent(
+                &ciacola_core::AgentDef::new("parent", "s").allowed_tools(["Read"]),
+                None,
+            )
+            .await
+            .expect("parent");
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+        let notify = ciacola_core::Notifier(tx);
+        let exec = ciacola_core::HandExecutor::start(ledger.clone(), notify.clone(), 1);
+        let root = std::env::temp_dir().join(format!("ciacola-authority-{}", ulid::Ulid::new()));
+        let plugin_config: toml::Value = toml::from_str(&format!(
+            "[repo-worker]\nroot = {:?}\nrepos = [\"local/repo\"]",
+            root.display().to_string()
+        ))
+        .expect("config");
+        let ctx = PluginContext {
+            pool,
+            ledger: ledger.clone(),
+            exec,
+            notify,
+            db_path: String::new(),
+            loopback_mcp_config: "agent.json".into(),
+            operator_mcp_config: "operator.json".into(),
+            plugin_config,
+            limits: Default::default(),
+            runtime: Default::default(),
+        };
+        let mut plugin = RepoWorkerPlugin::default();
+        plugin.setup(&ctx).await.expect("setup");
+        let start = plugin
+            .tools(Surface::Agent)
+            .into_iter()
+            .find(|tool| tool.definition().name == "start_issue")
+            .expect("start_issue");
+        let mut extensions = Extensions::new();
+        extensions.insert(ciacola_core::AgentIdentity(parent));
+        let request =
+            RequestContext::new(RequestId::Number(1)).with_extensions(Arc::new(extensions));
+
+        let out = start
+            .call_with_context(
+                request,
+                serde_json::json!({"repo": "local/repo", "issue": 1}),
+            )
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+        assert!(
+            rendered.contains("needs tools its parent does not hold"),
+            "must refuse: {rendered}"
+        );
+        assert!(!root.exists(), "authority refusal must happen before clone");
+        assert_eq!(ledger.list_agents().await.expect("list").len(), 1);
     }
 }
