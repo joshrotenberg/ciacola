@@ -62,15 +62,23 @@ needs something core owns.
 
 ## Running it
 
+For a durable server, copy the annotated config and give the ledger a
+persistent path:
+
 ```sh
-cargo run -p ciacola
-mcp-repl -- cargo run -p ciacola     # the pleasant way
+cp ciacola.example.toml ciacola.toml
+mkdir -p "$HOME/.local/share/ciacola"
+CIACOLA_DB="$HOME/.local/share/ciacola/ciacola.db" cargo run -p ciacola
 ```
 
 Then open the board at `http://127.0.0.1:4823/board`.
 
-See `ciacola.example.toml` for what is configurable, and `HANDOFF.md`
-for the design, the known-broken list, and what to do next.
+`ciacola.toml` is optional; when absent the server starts empty. The
+database also defaults to a temporary file, which is convenient for a
+smoke test and wrong for real work. Before adding schedules, set the
+`daily_warn_usd` and `daily_stop_usd` circuit breakers in the copied
+config. See `ciacola.example.toml` for the annotated settings and
+`HANDOFF.md` for the design, the known-broken list, and what to do next.
 
 ## License
 

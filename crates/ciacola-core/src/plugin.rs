@@ -293,10 +293,12 @@ pub async fn submit(
     // total says. Stopping mid-supervision would leave a half-finished
     // branch and an agent that never learns how it ended, which is
     // worse than the overspend.
-    if let Some(limit) = limits.stop_micro_usd() {
+    let warn = limits.warn_micro_usd();
+    let stop = limits.stop_micro_usd();
+    if warn.is_some() || stop.is_some() {
         let since = crate::time::now_unix() - 86_400;
         let spent = ledger.spend_since(since).await.unwrap_or_default();
-        if spent >= limit {
+        if let Some(limit) = stop.filter(|limit| spent >= *limit) {
             let (spent_usd, limit_usd) = (spent as f64 / 1e6, limit as f64 / 1e6);
             notify.turn(
                 LogLevel::Error,
@@ -313,21 +315,21 @@ pub async fn submit(
                 limit_usd,
             };
         }
-        if let Some(warn) = limits.warn_micro_usd() {
-            if spent >= warn {
-                notify.turn(
-                    LogLevel::Warning,
-                    agent_id,
-                    0,
-                    "budget_warning",
-                    &format!(
-                        "{source}: ${:.2} spent in 24h, warning at ${:.2}, stop at ${:.2}",
-                        spent as f64 / 1e6,
-                        warn as f64 / 1e6,
-                        limit as f64 / 1e6
-                    ),
-                );
-            }
+        if let Some(warn) = warn.filter(|warn| spent >= *warn) {
+            let stop_detail = stop
+                .map(|limit| format!(", stop at ${:.2}", limit as f64 / 1e6))
+                .unwrap_or_default();
+            notify.turn(
+                LogLevel::Warning,
+                agent_id,
+                0,
+                "budget_warning",
+                &format!(
+                    "{source}: ${:.2} spent in 24h, warning at ${:.2}{stop_detail}",
+                    spent as f64 / 1e6,
+                    warn as f64 / 1e6,
+                ),
+            );
         }
     }
 
@@ -662,6 +664,27 @@ impl PluginHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingExecutor(Mutex<Vec<(String, i64)>>);
+
+    impl TurnExecutor for RecordingExecutor {
+        fn submit(&self, agent_id: String, seq: i64) {
+            self.0
+                .lock()
+                .expect("recording executor")
+                .push((agent_id, seq));
+        }
+
+        fn kill(&self, _agent_id: &str, _seq: i64) -> bool {
+            false
+        }
+
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+    }
 
     struct Fake(&'static str, &'static [&'static str]);
 
@@ -820,5 +843,59 @@ mod tests {
             .await
             .expect_err("a typo must not pass silently");
         assert!(format!("{err}").contains("shcedule"), "names the offender");
+    }
+
+    #[tokio::test]
+    async fn warn_only_spend_limit_emits_a_warning_and_allows_the_turn() {
+        use crate::agent::AgentDef;
+        use crate::limits::Limits;
+        use tower_mcp::ServerNotification;
+
+        let pool = SqlitePool::connect("sqlite::memory:").await.expect("pool");
+        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        let agent_id = ledger
+            .create_agent(&AgentDef::new("target", "system"), None)
+            .await
+            .expect("agent");
+        sqlx::query(
+            "INSERT INTO turns
+                 (agent_id, seq, prompt, state, cost_micro_usd, at_unix)
+             VALUES ('previous', 1, 'spent', 'ok', 2000000, ?1)",
+        )
+        .bind(crate::time::now_unix())
+        .execute(&pool)
+        .await
+        .expect("record spend");
+        let (tx, mut rx) = tower_mcp::context::notification_channel(8);
+        let notify = Notifier(tx);
+        let exec = RecordingExecutor::default();
+        let limits = Limits {
+            daily_warn_usd: Some(1.0),
+            daily_stop_usd: None,
+            ..Default::default()
+        };
+
+        let outcome = submit(
+            &ledger, &exec, &notify, &limits, &agent_id, "continue", "test",
+        )
+        .await;
+        assert!(
+            matches!(outcome, Submission::Submitted { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(exec.0.lock().expect("recorded").len(), 1);
+
+        let notification = rx.recv().await.expect("budget warning");
+        let ServerNotification::LogMessage(message) = notification else {
+            panic!("expected a log notification");
+        };
+        assert_eq!(message.data["state"], "budget_warning");
+        assert!(
+            message.data["detail"]
+                .as_str()
+                .is_some_and(|detail| !detail.contains("stop at")),
+            "warn-only detail must not invent a stop threshold: {}",
+            message.data
+        );
     }
 }

@@ -27,14 +27,22 @@ survives as the alternative implementation that keeps the
 ## Running it
 
 ```sh
-cargo run -p ciacola                      # stdio MCP on stdout, board on 4823
-mcp-repl -- cargo run -p ciacola          # the pleasant way to drive it
+cp ciacola.example.toml ciacola.toml
+mkdir -p "$HOME/.local/share/ciacola"
+CIACOLA_DB="$HOME/.local/share/ciacola/ciacola.db" cargo run -p ciacola
 ```
+
+The temporary database default is for a smoke test only. A real server
+must set `CIACOLA_DB`, or its durable conversations will be left in a
+different temp ledger after an OS cleanup or path change. Before adding
+a scheduled agent, uncomment and choose both spend circuit breakers in
+`ciacola.toml`; unattended work with `no spend limit` in the startup
+banner is an explicit unsafe mode.
 
 | variable | meaning |
 |---|---|
 | `CIACOLA_DB` | ledger path, default a temp file |
-| `CIACOLA_CONFIG` | config file, default `ciacola.toml` |
+| `CIACOLA_CONFIG` | config file; default `ciacola.toml` when present, otherwise empty |
 | `CIACOLA_HTTP` | port for the board and the agents' MCP endpoint |
 | `CIACOLA_CONCURRENCY` | turns in flight, default 4 |
 | `CIACOLA_NO_RECOVER` | skip startup recovery |
