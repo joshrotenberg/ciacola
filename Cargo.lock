@@ -375,6 +375,7 @@ dependencies = [
 [[package]]
 name = "claude-wrapper"
 version = "0.13.5"
+source = "git+https://github.com/joshrotenberg/claude-wrapper?rev=22484531ecbec0789c16ee10f8abaa95d5501596#22484531ecbec0789c16ee10f8abaa95d5501596"
 dependencies = [
  "libc",
  "serde",
@@ -682,6 +683,7 @@ dependencies = [
 [[package]]
 name = "git-spawn"
 version = "0.3.0"
+source = "git+https://github.com/joshrotenberg/git-spawn?rev=ea2826b9da416cc9396ce79f2af7f9770cd50ac1#ea2826b9da416cc9396ce79f2af7f9770cd50ac1"
 dependencies = [
  "async-trait",
  "libc",
@@ -1789,7 +1791,8 @@ checksum = "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e"
 
 [[package]]
 name = "tower-mcp"
-version = "0.20.1"
+version = "0.21.0"
+source = "git+https://github.com/joshrotenberg/tower-mcp?rev=a63cb73c5c2b912894f5af6f8158d4c499763aba#a63cb73c5c2b912894f5af6f8158d4c499763aba"
 dependencies = [
  "async-trait",
  "axum",
@@ -1817,7 +1820,8 @@ dependencies = [
 
 [[package]]
 name = "tower-mcp-types"
-version = "0.20.1"
+version = "0.21.0"
+source = "git+https://github.com/joshrotenberg/tower-mcp?rev=a63cb73c5c2b912894f5af6f8158d4c499763aba#a63cb73c5c2b912894f5af6f8158d4c499763aba"
 dependencies = [
  "base64 0.23.1",
  "indexmap",

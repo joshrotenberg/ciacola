@@ -1,0 +1,22 @@
+# Local development against the sibling checkouts.
+#
+# Cargo.toml pins git revs so that CI, and the agents' own clones, build
+# with no siblings present. This file puts the working copies back in
+# front for anyone who has them, and is gitignored so it never reaches
+# either.
+#
+# `[patch]` rather than `paths`: a path override cannot alter a crate's
+# dependency list, and tower-mcp's does differ between the workspace
+# checkout and the published crate, which cargo warns about today and
+# will reject outright later.
+#
+# Copy this from .cargo/config.toml.example and adjust the paths.
+
+[patch."https://github.com/joshrotenberg/tower-mcp"]
+tower-mcp = { path = "../tower-mcp/crates/tower-mcp" }
+
+[patch."https://github.com/joshrotenberg/claude-wrapper"]
+claude-wrapper = { path = "../claude-wrapper" }
+
+[patch."https://github.com/joshrotenberg/git-spawn"]
+git-spawn = { path = "../git-spawn" }
