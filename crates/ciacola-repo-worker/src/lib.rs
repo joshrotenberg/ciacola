@@ -135,6 +135,10 @@ async fn gh(dir: Option<&Path>, args: &[&str]) -> Result<String, FlatError> {
 struct Repos {
     root: PathBuf,
     allowed: Arc<Vec<String>>,
+    /// Where clones come from: `{remote_base}/{owner}/{name}.git`.
+    /// GitHub in production; tests point it at a `file://` directory,
+    /// which is what lets the first-clone path be tested at all.
+    remote_base: String,
     /// Held across the clone, never merely around the check. Stage 7
     /// shipped the released-too-early version of this lock and a second
     /// run raced ahead to a bare repository that did not exist yet.
@@ -196,12 +200,26 @@ impl Repos {
         }
         std::fs::create_dir_all(&self.root)?;
         eprintln!("[repo-worker] cloning {repo} (once)");
-        CloneCommand::new(format!("https://github.com/{repo}.git"))
+        CloneCommand::new(format!("{}/{repo}.git", self.remote_base))
             .bare()
             .directory(&bare)
             .execute()
             .await
             .map_err(|e| -> FlatError { format!("clone {repo}: {e}").into() })?;
+        // A fresh bare clone has refs/heads/* and no refs/remotes/*,
+        // and worktrees are cut from `origin/<base>`. Without this the
+        // first start_issue for a repository failed exactly once, on
+        // exactly that ref, and the retry worked because by then the
+        // refresh path above had run. Found by the first supervised
+        // manager run, which hit it, retried, and reported it.
+        let mut fetch = bare_repo(&bare).fetch();
+        fetch
+            .remote("origin")
+            .refspec("+refs/heads/*:refs/remotes/origin/*");
+        fetch
+            .execute()
+            .await
+            .map_err(|e| -> FlatError { format!("post-clone fetch {repo}: {e}").into() })?;
         Ok(bare)
     }
 
@@ -358,6 +376,7 @@ impl Plugin for RepoWorkerPlugin {
                     .unwrap_or("~/.local/share/flat/repos"),
             );
             self.repos = Some(Repos {
+                remote_base: "https://github.com".into(),
                 root,
                 allowed: Arc::new(config.repos),
                 cloning: Arc::new(tokio::sync::Mutex::new(())),
@@ -924,6 +943,7 @@ mod tests {
         let repos = Repos {
             root: tmp.join("root"),
             allowed: Arc::new(vec!["local/repo".into()]),
+            remote_base: format!("file://{}", tmp.display()),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
         };
         std::fs::create_dir_all(&repos.root).expect("mkdir root");
@@ -994,6 +1014,7 @@ mod tests {
         let repos = Repos {
             root: tmp.join("root"),
             allowed: Arc::new(vec!["local/repo".into()]),
+            remote_base: format!("file://{}", tmp.display()),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
         };
         std::fs::create_dir_all(&repos.root).expect("mkdir root");
@@ -1052,6 +1073,7 @@ mod tests {
         let repos = Repos {
             root: tmp.join("root"),
             allowed: Arc::new(vec!["local/repo".into()]),
+            remote_base: format!("file://{}", tmp.display()),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
         };
         std::fs::create_dir_all(&repos.root).expect("mkdir root");
@@ -1101,5 +1123,44 @@ mod tests {
         ] {
             assert!(!conventional_title(bad), "should fail: {bad}");
         }
+    }
+
+    /// The very first start_issue for a repository must work.
+    ///
+    /// The refresh path writes remote-tracking refs; the first-clone
+    /// path did not, and worktrees are cut from `origin/<base>`, so the
+    /// first attempt for any new repository failed exactly once and the
+    /// retry succeeded. Found by the first supervised manager run,
+    /// which hit it on a fresh clone of a second repository, retried,
+    /// and reported it. Unlike the other tests here, nothing
+    /// pre-creates the clone: `add_worktree` does the whole job.
+    #[tokio::test]
+    async fn the_first_clone_supports_a_worktree_immediately() {
+        let tmp = std::env::temp_dir().join(format!("ciacola-first-{}", ulid::Ulid::new()));
+        let origin_dir = tmp.join("local");
+        let origin = origin_dir.join("repo.git");
+        std::fs::create_dir_all(&origin).expect("mkdir");
+        git(&origin, &["init", "-q", "-b", "main"]).await;
+        git(&origin, &["config", "user.email", "t@example.com"]).await;
+        git(&origin, &["config", "user.name", "t"]).await;
+        std::fs::write(origin.join("a"), "one").expect("write");
+        git(&origin, &["add", "."]).await;
+        git(&origin, &["commit", "-qm", "one"]).await;
+
+        let repos = Repos {
+            root: tmp.join("root"),
+            allowed: Arc::new(vec!["local/repo".into()]),
+            remote_base: format!("file://{}", tmp.display()),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        std::fs::create_dir_all(&repos.root).expect("mkdir root");
+
+        let made = repos
+            .add_worktree("local/repo", "local-repo-1", "main")
+            .await;
+        std::fs::remove_dir_all(&tmp).ok();
+        let (path, branch) = made.expect("first add_worktree must not need a retry");
+        assert!(path.ends_with("wt-local-repo-1"));
+        assert_eq!(branch, "agent/local-repo-1");
     }
 }
