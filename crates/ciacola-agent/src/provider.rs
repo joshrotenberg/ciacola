@@ -100,10 +100,18 @@ pub trait Provider: Send + Sync {
     /// **A run that ended badly is `Ok`.** A ceiling we set, or a
     /// result the provider itself called an error, comes back as a
     /// [`TurnOutcome`] carrying its spend, its usage, its conversation
-    /// id, and a [`TurnFailure`](crate::TurnFailure). `Err` means the
-    /// turn did not happen at all: nothing was spent and no
-    /// conversation was opened. Getting this backwards is how a five
-    /// minute run once landed in the ledger as free and unresumable.
+    /// id, and a [`TurnFailure`](crate::TurnFailure). Getting this
+    /// backwards is how a five minute run once landed in the ledger as
+    /// free and unresumable.
+    ///
+    /// `Err` means the turn produced no usable result. For most
+    /// [`AgentError`] variants that also means nothing was spent and no
+    /// conversation was opened, but not for all of them: a cancelled,
+    /// timed-out, or unparseable run may have done real paid work
+    /// first. An adapter returning one of those three puts whatever it
+    /// still knows on
+    /// [`PartialTelemetry`](crate::PartialTelemetry) rather than
+    /// discarding it.
     ///
     /// `events` is told about a conversation id the moment the backend
     /// reveals one, which may be long before this future resolves.
@@ -132,6 +140,31 @@ pub trait Provider: Send + Sync {
     fn owns_process(&self, ps_line: &str) -> bool;
 }
 
+/// Two adapters tried to register under the same key.
+///
+/// A boot-time misconfiguration, not a turn outcome, which is why this
+/// is not an [`AgentError`] variant: that type's whole contract is
+/// about turns, and nothing here has run one. Checked before any turn
+/// can be sent, so there is no partial telemetry question either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateProvider {
+    /// The key both adapters claimed.
+    pub key: String,
+}
+
+impl fmt::Display for DuplicateProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "an adapter is already registered as '{}'; registration refuses to \
+             replace it rather than silently prefer whichever registered last",
+            self.key
+        )
+    }
+}
+
+impl std::error::Error for DuplicateProvider {}
+
 /// Adapters by name, resolved at runtime.
 ///
 /// A `BTreeMap` rather than a `HashMap` so [`ProviderRegistry::keys`]
@@ -149,21 +182,41 @@ impl ProviderRegistry {
         Self::default()
     }
 
-    /// Register an adapter under its own key, replacing any adapter
-    /// already there.
+    /// Register an adapter under its own key.
     ///
-    /// Replacement rather than refusal so a test, or an operator
-    /// shimming a backend, can override without a second mechanism.
-    pub fn register(&mut self, provider: Arc<dyn Provider>) -> &mut Self {
-        self.providers
-            .insert(provider.key().as_str().to_string(), provider);
-        self
+    /// Refuses a key that is already taken rather than replacing it.
+    /// Two adapters claiming `claude` at boot is a misconfiguration --
+    /// a build that links both a real adapter and a test shim under the
+    /// same name, say -- and silently keeping whichever registered last
+    /// means every turn after that runs on an adapter nobody chose on
+    /// purpose. There is no legitimate reason to overwrite a live
+    /// registration; a caller that wants a different adapter for the
+    /// same key builds a fresh [`ProviderRegistry`] instead.
+    pub fn register(
+        &mut self,
+        provider: Arc<dyn Provider>,
+    ) -> Result<&mut Self, DuplicateProvider> {
+        let key = provider.key().as_str().to_string();
+        if self.providers.contains_key(&key) {
+            return Err(DuplicateProvider { key });
+        }
+        self.providers.insert(key, provider);
+        Ok(self)
     }
 
     /// Builder-shaped [`register`](Self::register), for `main`.
+    ///
+    /// Panics on a duplicate key rather than returning a `Result`,
+    /// because this is boot-time wiring: a binary that links two
+    /// adapters under the same key has a bug in the list it builds, not
+    /// a recoverable runtime condition, and failing closed here means
+    /// the process never starts serving turns on the wrong adapter.
+    /// Code that wants to handle the collision (tests, an operator
+    /// shim) calls [`register`](Self::register) directly instead.
     #[must_use]
     pub fn with(mut self, provider: Arc<dyn Provider>) -> Self {
-        self.register(provider);
+        self.register(provider)
+            .expect("duplicate provider key registered at boot");
         self
     }
 
@@ -203,6 +256,61 @@ impl fmt::Debug for ProviderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The minimum viable adapter, for exercising the registry without
+    /// dragging in a full fake with a run script.
+    struct Stub(&'static str);
+
+    impl Provider for Stub {
+        fn key(&self) -> ProviderKey {
+            ProviderKey::new(self.0)
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::none(self.key())
+        }
+        fn run<'a>(
+            &'a self,
+            _intent: &'a TurnIntent,
+            _events: &'a dyn TurnEvents,
+        ) -> BoxFut<'a, Result<TurnOutcome, AgentError>> {
+            Box::pin(async { Ok(TurnOutcome::ok("stub")) })
+        }
+        fn owns_process(&self, _ps_line: &str) -> bool {
+            false
+        }
+    }
+
+    /// The concrete misconfiguration this refusal exists for: two
+    /// adapters claiming the same key at boot must not silently resolve
+    /// to whichever registered last.
+    #[test]
+    fn registering_a_duplicate_key_is_refused_rather_than_replacing() {
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(Arc::new(Stub("claude")))
+            .expect("first registration succeeds");
+
+        let err = registry
+            .register(Arc::new(Stub("claude")))
+            .expect_err("a second adapter under the same key must be refused");
+        assert_eq!(err.key, "claude");
+        assert!(err.to_string().contains("claude"), "{err}");
+
+        // The original registration is untouched by the refused attempt.
+        assert_eq!(registry.keys(), vec!["claude".to_string()]);
+    }
+
+    /// `with` is the boot-time builder; a collision there is a bug in
+    /// the list the binary assembles, not a runtime condition to route
+    /// around, so it fails closed by panicking rather than starting a
+    /// server with an ambiguous adapter.
+    #[test]
+    #[should_panic(expected = "duplicate provider key")]
+    fn with_panics_on_a_duplicate_key_at_boot() {
+        let _ = ProviderRegistry::new()
+            .with(Arc::new(Stub("claude")))
+            .with(Arc::new(Stub("claude")));
+    }
 
     /// The compatibility property the live ledger depends on: a
     /// definition written before the field existed deserializes as

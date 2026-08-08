@@ -15,9 +15,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ciacola_agent::{
-    AgentError, BoxFut, Capabilities, Constraint, Cost, Isolation, NoEvents, Provider, ProviderKey,
-    ProviderRegistry, ResumeId, Severity, TokenUsage, TurnEvents, TurnFailure, TurnIntent,
-    TurnOutcome,
+    AgentError, BoxFut, Capabilities, Constraint, Cost, Isolation, NoEvents, PartialTelemetry,
+    Provider, ProviderKey, ProviderRegistry, ResumeId, Severity, TokenUsage, TurnEvents,
+    TurnFailure, TurnIntent, TurnOutcome, Usage,
 };
 
 /// What the fake should do this time. One adapter with a script beats
@@ -71,6 +71,16 @@ impl Fake {
             Cost::NotPriced
         }
     }
+
+    /// The same agreement for tokens. A backend that declares it does
+    /// not count them must not then report counts, and vice versa.
+    fn usage(&self, tokens: TokenUsage) -> Usage {
+        if self.caps.reports_token_usage {
+            Usage::Reported(tokens)
+        } else {
+            Usage::NotTracked
+        }
+    }
 }
 
 impl Provider for Fake {
@@ -89,17 +99,32 @@ impl Provider for Fake {
     ) -> BoxFut<'a, Result<TurnOutcome, AgentError>> {
         Box::pin(async move {
             match self.script {
+                // A cancelled run is not a free one: this backend was
+                // twenty minutes in, had opened its conversation, and
+                // had spent real money before we stopped it. All of
+                // that survives on the partial rather than being
+                // thrown away with the turn.
                 Script::Cancel => Err(AgentError::Cancelled {
                     provider: self.key.clone(),
+                    partial: PartialTelemetry {
+                        resume: Some(ResumeId::ProviderAssigned("sess-mid-run".into())),
+                        cost: Some(self.cost()),
+                        usage: Some(TokenUsage {
+                            input: 4_000,
+                            output: 300,
+                            cached_input: 0,
+                        }),
+                    }
+                    .into(),
                 }),
                 Script::Succeed => Ok(TurnOutcome {
                     resume: intent.resume.clone(),
                     cost: self.cost(),
-                    usage: TokenUsage {
+                    usage: self.usage(TokenUsage {
                         input: 120,
                         output: 40,
                         cached_input: 100,
-                    },
+                    }),
                     provider_turns: Some(3),
                     elapsed: Duration::from_millis(1_500),
                     ..TurnOutcome::ok("done")
@@ -107,11 +132,11 @@ impl Provider for Fake {
                 Script::FailWithUsage => Ok(TurnOutcome {
                     resume: intent.resume.clone(),
                     cost: self.cost(),
-                    usage: TokenUsage {
+                    usage: self.usage(TokenUsage {
                         input: 900,
                         output: 12,
                         cached_input: 0,
-                    },
+                    }),
                     provider_turns: Some(60),
                     elapsed: Duration::from_millis(323_000),
                     failure: Some(TurnFailure::limit("reached maximum number of turns (60)")),
@@ -205,8 +230,12 @@ async fn a_successful_turn_reports_usage_without_inventing_a_price() {
 
     assert!(outcome.succeeded());
     assert_eq!(outcome.reply, "done");
-    assert_eq!(outcome.usage.input, 120);
-    assert_eq!(outcome.usage.cached_input, 100);
+    let tokens = outcome
+        .usage
+        .tokens()
+        .expect("this backend counts tokens even though it prices nothing");
+    assert_eq!(tokens.input, 120);
+    assert_eq!(tokens.cached_input, 100);
     assert_eq!(outcome.provider_turns, Some(3));
     assert_eq!(
         outcome.cost,
@@ -268,7 +297,8 @@ async fn a_failed_turn_still_carries_its_usage_and_its_conversation() {
         Some("reached maximum number of turns (60)")
     );
     assert_eq!(
-        outcome.usage.input, 900,
+        outcome.usage.tokens().map(|t| t.input),
+        Some(900),
         "usage that was really spent must survive the failure"
     );
     assert_eq!(
@@ -319,6 +349,34 @@ async fn a_cancelled_turn_is_a_typed_error_rather_than_a_string() {
     assert!(err.is_cancelled());
     assert_eq!(err.provider().map(ProviderKey::as_str), Some("fake"));
     assert!(matches!(err, AgentError::Cancelled { .. }));
+
+    // Normal does not mean free. The run was mid-conversation and had
+    // already spent money, and reporting it as `Err` must not discard
+    // either fact.
+    let partial = err
+        .partial()
+        .expect("a cancelled run is one of the variants that can carry spend");
+    assert!(!partial.is_empty());
+    assert_eq!(
+        partial.resume.as_ref().map(ResumeId::value),
+        Some("sess-mid-run"),
+        "a cancelled turn must still leave the agent resumable"
+    );
+    assert_eq!(partial.cost, Some(Cost::Reported { micro_usd: 4_200 }));
+}
+
+/// The other half of the same rule: a failure that happened before the
+/// provider ever started has nothing to report, and must say so rather
+/// than carry an empty-but-present telemetry value that reads as "we
+/// looked and there was nothing".
+#[test]
+fn a_pre_launch_failure_carries_no_partial_telemetry() {
+    let err = AgentError::NotFound {
+        provider: ProviderKey::new("fake"),
+        detail: "no such binary on PATH".into(),
+    };
+    assert!(err.partial().is_none());
+    assert!(!err.is_cancelled());
 }
 
 /// The dangerous case, and the one the whole capability mechanism is

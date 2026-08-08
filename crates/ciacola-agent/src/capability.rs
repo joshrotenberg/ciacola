@@ -15,12 +15,15 @@
 //!
 //! **Fail** ([`Severity::Fail`]) when dropping the constraint would
 //! widen what the agent can reach or see: isolation from ambient
-//! configuration, credential isolation, the scoped MCP endpoint list,
-//! and the allowed-tool grant. Each of those is the whole of some
-//! boundary. An agent handed the operator MCP mount because `strict`
-//! was ignored is one guessable path away from `kill` and `open_pr`; an
-//! agent that inherited the operator's ambient rules because isolation
-//! was ignored behaves in ways nobody configured.
+//! configuration, credential isolation, the filesystem/network sandbox,
+//! the scoped MCP endpoint list, and the allowed-tool grant. Each of
+//! those is the whole of some boundary. An agent handed the operator
+//! MCP mount because `strict` was ignored is one guessable path away
+//! from `kill` and `open_pr`; an agent that inherited the operator's
+//! ambient rules because isolation was ignored behaves in ways nobody
+//! configured; an agent that wrote outside its working directory
+//! because a claimed sandbox was actually a permission prompt has done
+//! the thing the sandbox existed to prevent.
 //!
 //! **Warn** ([`Severity::Warn`]) when dropping the constraint costs
 //! accuracy or money but not authority: an effort level the backend
@@ -44,6 +47,9 @@ pub enum Constraint {
     /// Keeping the provider's configuration and login in a directory of
     /// our choosing, rather than the operator's own.
     CredentialIsolation,
+    /// Confining filesystem writes and network reach the way
+    /// [`Sandbox`](crate::intent::Sandbox) asks.
+    Sandbox,
     /// Restricting the turn to a named set of MCP endpoints.
     ScopedMcp,
     /// Restricting the turn to that set and no other.
@@ -70,6 +76,7 @@ impl Constraint {
         match self {
             Constraint::Isolation
             | Constraint::CredentialIsolation
+            | Constraint::Sandbox
             | Constraint::ScopedMcp
             | Constraint::StrictMcp
             | Constraint::AllowedTools => true,
@@ -156,6 +163,11 @@ pub struct Capabilities {
     pub isolation: bool,
     /// Keeps its configuration and login where we tell it to.
     pub credential_isolation: bool,
+    /// Can confine filesystem writes and network reach the way
+    /// [`Sandbox`](crate::intent::Sandbox) asks. `false` for any
+    /// adapter whose containment is a permission prompt rather than an
+    /// OS-level boundary -- Claude's `claude` CLI included.
+    pub sandbox: bool,
     /// Takes a set of MCP endpoints.
     pub scoped_mcp: bool,
     /// Takes that set as exclusive.
@@ -187,6 +199,7 @@ impl Capabilities {
             client_assigned_resume: false,
             isolation: false,
             credential_isolation: false,
+            sandbox: false,
             scoped_mcp: false,
             strict_mcp: false,
             allowed_tools: false,
@@ -233,6 +246,15 @@ impl Capabilities {
                     "provider '{who}' cannot keep its configuration and login in a \
                      directory of our choosing, so this agent would authenticate as \
                      the operator"
+                ),
+            );
+        }
+        if intent.sandbox.is_constrained() && !self.sandbox {
+            miss(
+                Constraint::Sandbox,
+                format!(
+                    "provider '{who}' cannot confine filesystem writes or network reach, \
+                     and this agent asked to be sandboxed"
                 ),
             );
         }
@@ -294,7 +316,7 @@ impl Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent::{Effort, Isolation, McpScope, ResumeId};
+    use crate::intent::{Effort, Isolation, McpEndpoint, McpScope, ResumeId, Sandbox};
 
     fn poor() -> Capabilities {
         Capabilities::none(ProviderKey::new("poor"))
@@ -307,6 +329,7 @@ mod tests {
         for c in [
             Constraint::Isolation,
             Constraint::CredentialIsolation,
+            Constraint::Sandbox,
             Constraint::ScopedMcp,
             Constraint::StrictMcp,
             Constraint::AllowedTools,
@@ -342,6 +365,32 @@ mod tests {
         assert!(poor().validate(&intent).unsupported.is_empty());
     }
 
+    /// The concrete case this constraint exists for: a provider whose
+    /// containment is a permission prompt, not an OS-level sandbox --
+    /// which today describes every adapter this crate ships with --
+    /// must refuse a turn that asked to be sandboxed rather than run it
+    /// wide open under the name of a security feature it does not have.
+    #[test]
+    fn an_unsupported_sandbox_request_blocks_the_turn() {
+        let mut intent = TurnIntent::new("go");
+        intent.sandbox = Sandbox::WorkspaceWriteNoNetwork;
+        let v = poor().validate(&intent);
+        let blocking = v.blocking().expect("sandbox must block");
+        assert_eq!(blocking.constraint, Constraint::Sandbox);
+    }
+
+    /// An unconstrained turn asks nothing of the provider's sandboxing,
+    /// so the absence of that capability is not a reason to refuse it.
+    #[test]
+    fn an_unconstrained_turn_does_not_require_sandbox_support() {
+        let intent = TurnIntent::new("go");
+        assert!(poor().validate(&intent).unsupported.is_empty());
+
+        let mut caps = poor();
+        caps.sandbox = true;
+        assert!(caps.validate(&intent).unsupported.is_empty());
+    }
+
     /// An endpoint list that is not exclusive is not the endpoint list
     /// that was granted.
     #[test]
@@ -350,7 +399,11 @@ mod tests {
         caps.scoped_mcp = true;
         let mut intent = TurnIntent::new("go");
         intent.mcp = Some(McpScope {
-            config_path: "/tmp/agent.json".into(),
+            endpoints: vec![McpEndpoint {
+                name: "ciacola".into(),
+                url: "http://127.0.0.1:4823/mcp".into(),
+                headers: Default::default(),
+            }],
             strict: true,
         });
         let v = caps.validate(&intent);

@@ -6,8 +6,10 @@
 //! and stopped at a ceiling we set spent real money and may have opened
 //! the conversation, so it comes back here as an [`TurnOutcome`] with a
 //! [`TurnFailure`] on it. `Err(`[`AgentError`](crate::AgentError)`)` is
-//! reserved for turns that did not happen: no process, no spend, no
-//! session.
+//! reserved for turns that did not run to a usable result -- which for
+//! most of that type's variants also means no process, no spend, no
+//! session, though not for all of them: see the exception carved out on
+//! [`AgentError`](crate::AgentError)'s own docs.
 //!
 //! That was learned the expensive way. The wrapper keeps cost and
 //! session id off the terminal result event for a capped run, and
@@ -28,8 +30,13 @@ use crate::intent::ResumeId;
 /// beside cost rather than under it.
 ///
 /// `cached_input` is a subset of `input`, reported when the provider
-/// distinguishes it. Zero means "not reported", which is the honest
-/// reading: nothing here is ever invented to fill a gap.
+/// distinguishes it.
+///
+/// This struct only ever appears inside [`Usage::Reported`]. It carries
+/// no "not reported" state of its own on purpose: a struct that means
+/// both "these are the counts" and "nothing was counted" is the same
+/// conflation [`Cost`] exists to avoid, just moved one level down. See
+/// [`Usage`] for where that distinction actually lives.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     /// Tokens sent to the model.
@@ -40,16 +47,46 @@ pub struct TokenUsage {
     pub cached_input: u64,
 }
 
-impl TokenUsage {
-    /// Usage with nothing reported. Distinct in meaning from a run that
-    /// genuinely used nothing, but not distinguishable here: no
-    /// provider reports the difference, so pretending otherwise would
-    /// be a field that is always the same value.
-    pub const NONE: TokenUsage = TokenUsage {
-        input: 0,
-        output: 0,
-        cached_input: 0,
-    };
+/// What a turn used, in the same three states as [`Cost`] and for the
+/// same reason.
+///
+/// The first cut of this crate gave [`TokenUsage`] a `NONE` constant
+/// meaning "not reported" and documented the conflation with a run that
+/// genuinely used zero tokens rather than fixing it -- exactly the bug
+/// this crate exists to fix for cost, reintroduced one field over. A
+/// provider that never counts tokens says [`Usage::NotTracked`] once,
+/// mirroring [`Cost::NotPriced`]; one that counts but came back without
+/// them this time says [`Usage::Unreported`], mirroring
+/// [`Cost::Unreported`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Usage {
+    /// The provider reported token counts for this turn.
+    Reported(TokenUsage),
+    /// This provider counts tokens, but this run came back without
+    /// them. A gap, and worth saying so out loud.
+    Unreported,
+    /// This provider never reports token counts. Not a gap; there is
+    /// nothing to report and nothing to warn about.
+    NotTracked,
+}
+
+impl Usage {
+    /// The counts when there are any. `None` covers both
+    /// [`Usage::Unreported`] and [`Usage::NotTracked`], and callers
+    /// that care about the difference must match rather than call this.
+    pub fn tokens(&self) -> Option<TokenUsage> {
+        match self {
+            Usage::Reported(usage) => Some(*usage),
+            Usage::Unreported | Usage::NotTracked => None,
+        }
+    }
+
+    /// True when the provider could have reported usage for this run
+    /// and did not. [`Usage::NotTracked`] is not missing data, so it is
+    /// not this.
+    pub fn is_missing(&self) -> bool {
+        matches!(self, Usage::Unreported)
+    }
 }
 
 /// What a turn cost, in three states rather than two.
@@ -172,8 +209,9 @@ pub struct TurnOutcome {
     pub resume: Option<ResumeId>,
     /// What it cost, in the three states [`Cost`] distinguishes.
     pub cost: Cost,
-    /// Tokens in, out, and cached.
-    pub usage: TokenUsage,
+    /// Tokens in, out, and cached, in the three states [`Usage`]
+    /// distinguishes.
+    pub usage: Usage,
     /// Provider-internal turns spent producing the reply, where the
     /// provider counts them. `None` means it does not, which is not the
     /// same as zero.
@@ -199,7 +237,7 @@ impl TurnOutcome {
             reply: reply.into(),
             resume: None,
             cost: Cost::Unreported,
-            usage: TokenUsage::NONE,
+            usage: Usage::Unreported,
             provider_turns: None,
             elapsed: Duration::ZERO,
             metadata: BTreeMap::new(),
@@ -247,6 +285,45 @@ mod tests {
         assert_eq!(Cost::Reported { micro_usd: 12 }.micro_usd_or_zero(), 12);
         assert_eq!(Cost::NotPriced.micro_usd_or_zero(), 0);
         assert_eq!(Cost::Unreported.micro_usd_or_zero(), 0);
+    }
+
+    /// The same rule as `Cost`, one field over: "this provider never
+    /// counts tokens" and "this run came back without them" must not
+    /// collapse into the same zeroed struct.
+    #[test]
+    fn untracked_and_unreported_usage_are_different_facts() {
+        assert_eq!(Usage::NotTracked.tokens(), None);
+        assert_eq!(Usage::Unreported.tokens(), None);
+        assert_ne!(Usage::NotTracked, Usage::Unreported);
+        assert!(
+            Usage::Unreported.is_missing(),
+            "a provider that counts and did not is a gap"
+        );
+        assert!(
+            !Usage::NotTracked.is_missing(),
+            "a provider that never counts has nothing missing"
+        );
+    }
+
+    /// A run that genuinely used a handful of tokens must read
+    /// differently from one where nothing was ever reported, which a
+    /// zeroed `TokenUsage` standing in for "unreported" could not do.
+    #[test]
+    fn reported_usage_survives_distinctly_from_the_absent_states() {
+        let reported = Usage::Reported(TokenUsage {
+            input: 12,
+            output: 3,
+            cached_input: 0,
+        });
+        assert_eq!(
+            reported.tokens(),
+            Some(TokenUsage {
+                input: 12,
+                output: 3,
+                cached_input: 0
+            })
+        );
+        assert!(!reported.is_missing());
     }
 
     /// A cap is data. It keeps its spend and its session, and it still

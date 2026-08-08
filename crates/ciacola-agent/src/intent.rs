@@ -8,6 +8,8 @@
 //! of this line is what lets a second backend arrive without another
 //! round of conditionals in the core.
 
+use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 
 /// Which conversation to continue, and who chose its name.
@@ -136,6 +138,104 @@ impl Isolation {
     }
 }
 
+/// Filesystem and network containment for a turn, independent of
+/// [`Isolation`] (which governs what *configuration* a turn inherits,
+/// not what it can read, write, or reach once it is running).
+///
+/// This is the constraint the Codex follow-up to issue 53 names
+/// explicitly: an unattended turn should not be able to write outside
+/// its working directory or reach the network unless that was asked
+/// for. It is modelled here, rather than left implicit, precisely so it
+/// can be checked the same way every other security constraint in this
+/// crate is: through
+/// [`Capabilities::sandbox`](crate::Capabilities::sandbox) and
+/// [`Constraint::Sandbox`](crate::Constraint::Sandbox). The `claude` CLI
+/// has permission *prompts* for tool use -- a confirmation gate, not an
+/// OS-level sandbox -- so an adapter over it must declare `sandbox:
+/// false` and let a turn that asks for containment fail rather than
+/// claim to provide something it cannot enforce.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Sandbox {
+    /// No containment asked for beyond whatever the provider does on
+    /// its own. The default, and the wrong default for unattended work
+    /// nobody reviewed first.
+    #[default]
+    Unconstrained,
+    /// Filesystem writes confined to [`TurnIntent::working_dir`]; the
+    /// network stays reachable.
+    WorkspaceWrite,
+    /// Filesystem writes confined to [`TurnIntent::working_dir`]; the
+    /// network is denied entirely.
+    WorkspaceWriteNoNetwork,
+}
+
+impl Sandbox {
+    /// Parse a configured policy. `None` for anything unrecognised.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "unconstrained" | "none" | "false" => Some(Sandbox::Unconstrained),
+            "workspace-write" | "workspace_write" => Some(Sandbox::WorkspaceWrite),
+            "workspace-write-no-network" | "workspace_write_no_network" => {
+                Some(Sandbox::WorkspaceWriteNoNetwork)
+            }
+            _ => None,
+        }
+    }
+
+    /// True when the turn is asking to be contained at all.
+    /// [`Sandbox::Unconstrained`] asks for nothing, so it can never be
+    /// the constraint a provider without sandboxing silently drops.
+    pub fn is_constrained(&self) -> bool {
+        !matches!(self, Sandbox::Unconstrained)
+    }
+}
+
+/// One MCP server a turn may reach.
+///
+/// Every field is transcribed from what ciacola already writes today,
+/// not from what a backend might want later: `crates/ciacola/src/main.rs`
+/// emits `{"mcpServers": {"<name>": {"type": "http", "url": "..."}}}`,
+/// and `ciacola-core`'s executor injects a per-agent bearer into that
+/// JSON's `headers` before handing it over. Transport is not a field
+/// because only loopback HTTP has ever been emitted; add one when a
+/// backend needs it rather than in advance.
+#[derive(Clone, PartialEq, Eq)]
+pub struct McpEndpoint {
+    /// The server's name, as the agent sees it.
+    pub name: String,
+    /// Where it lives. Loopback HTTP today.
+    pub url: String,
+    /// Headers sent with every request, including the per-agent secret
+    /// that proves which agent is calling.
+    ///
+    /// **Secret-bearing.** These values are the one place in this crate
+    /// where a credential is held rather than named, because the
+    /// provider genuinely has to send them. [`Debug`] is implemented by
+    /// hand to redact the values, so an intent that gets logged or
+    /// panics does not print the token.
+    pub headers: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for McpEndpoint {
+    /// Redacts header values. Nothing else in this crate holds a
+    /// credential, and the derived impl would put this one in every log
+    /// line and panic message that touches a [`TurnIntent`].
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("McpEndpoint")
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .keys()
+                    .map(|k| (k.as_str(), "<redacted>"))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+            .finish()
+    }
+}
+
 /// The MCP endpoints a turn may reach.
 ///
 /// This is the recursion mechanism: point it at a server (this one,
@@ -143,11 +243,17 @@ impl Isolation {
 /// uses. `strict` means *only* these, which is what makes the endpoint
 /// an authority boundary rather than a suggestion: an agent handed the
 /// agent mount must not be able to add the operator one.
+///
+/// Endpoints rather than a path to a config file, because a path is one
+/// backend's ingestion mechanism rather than the intent. Claude's CLI
+/// takes `--mcp-config <file>`; codex has no flag that consumes such a
+/// file at all (joshrotenberg/codex-wrapper#111, citing its #105). An
+/// adapter materialises whatever its own CLI wants from this list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpScope {
-    /// Path to a config file describing the servers.
-    pub config_path: String,
-    /// Refuse anything not in that file. Dropping this quietly would
+    /// The servers, in the order they should be written.
+    pub endpoints: Vec<McpEndpoint>,
+    /// Refuse anything not in that list. Dropping this quietly would
     /// widen an agent's reach, so it is a security constraint.
     pub strict: bool,
 }
@@ -183,6 +289,12 @@ pub struct TurnIntent {
     /// rather than hand the agent everything: a toolless spoke does not
     /// refuse, it fabricates, and the inverse is worse.
     pub allowed_tools: Vec<String>,
+    /// Filesystem and network containment. [`Sandbox::Unconstrained`]
+    /// asks for nothing, so it is honoured trivially by every provider;
+    /// anything else is a security constraint checked the same way
+    /// [`Isolation`] is. See [`Sandbox`] for why this is not folded
+    /// into `isolation`.
+    pub sandbox: Sandbox,
     /// Ceiling on provider-internal turns (tool calls and the like) for
     /// this one reply. `None` is the provider's default.
     pub max_provider_turns: Option<u32>,
@@ -263,5 +375,54 @@ mod tests {
     fn effort_is_case_insensitive_and_rejects_typos() {
         assert_eq!(Effort::parse("XHIGH"), Some(Effort::Xhigh));
         assert_eq!(Effort::parse("hihg"), None);
+    }
+
+    /// The sandbox switch parses the same shape of spellings as
+    /// isolation, and an unconstrained turn is not asking for anything.
+    #[test]
+    fn sandbox_parses_and_unconstrained_is_not_a_constraint() {
+        assert_eq!(
+            Sandbox::parse("workspace-write"),
+            Some(Sandbox::WorkspaceWrite)
+        );
+        assert_eq!(
+            Sandbox::parse("workspace-write-no-network"),
+            Some(Sandbox::WorkspaceWriteNoNetwork)
+        );
+        assert_eq!(Sandbox::parse("none"), Some(Sandbox::Unconstrained));
+        assert_eq!(Sandbox::parse("bogus"), None);
+
+        assert!(!Sandbox::Unconstrained.is_constrained());
+        assert!(Sandbox::WorkspaceWrite.is_constrained());
+        assert!(Sandbox::WorkspaceWriteNoNetwork.is_constrained());
+    }
+
+    /// The one credential this crate holds by value has to survive being
+    /// printed. `TurnIntent` derives `Debug`, so anything that logs an
+    /// intent or panics while holding one would otherwise put the
+    /// per-agent token in the output.
+    #[test]
+    fn an_endpoints_header_values_do_not_survive_debug_printing() {
+        let endpoint = McpEndpoint {
+            name: "ciacola".into(),
+            url: "http://127.0.0.1:4823/mcp".into(),
+            headers: BTreeMap::from([("x-ciacola-agent".to_string(), "super-secret".to_string())]),
+        };
+        let mut intent = TurnIntent::new("go");
+        intent.mcp = Some(McpScope {
+            endpoints: vec![endpoint],
+            strict: true,
+        });
+
+        let printed = format!("{intent:?}");
+        assert!(
+            !printed.contains("super-secret"),
+            "the token must never reach a log line: {printed}"
+        );
+        assert!(
+            printed.contains("x-ciacola-agent"),
+            "the header name is not a secret and is worth keeping: {printed}"
+        );
+        assert!(printed.contains("127.0.0.1:4823"), "{printed}");
     }
 }

@@ -10,16 +10,18 @@
 //!
 //! - [`TurnIntent`] says what a turn is *for*: instructions, a prompt,
 //!   a model, an effort level, a working directory, the tools it may
-//!   use, a ceiling on provider-internal turns, the MCP endpoints it may
-//!   reach, how sealed it is from ambient configuration, and which
-//!   conversation to continue. All intent, no flags.
+//!   use, a filesystem/network sandbox, a ceiling on provider-internal
+//!   turns, the MCP endpoints it may reach, how sealed it is from
+//!   ambient configuration, and which conversation to continue. All
+//!   intent, no flags.
 //! - [`Provider`] runs one, [`ProviderRegistry`] finds one by name, and
 //!   [`Capabilities`] says up front what it cannot do.
 //! - [`TurnOutcome`] is what a turn that *ended* looks like, including
 //!   the ones that ended badly.
-//! - [`AgentError`] is what a turn that never happened looks like.
+//! - [`AgentError`] is what a turn that never ran to a usable result
+//!   looks like.
 //!
-//! # Three decisions worth the words
+//! # Four decisions worth the words
 //!
 //! **A run that hit a ceiling comes back as data, not as `Err`.** The
 //! provider ran, at length, and stopped at a cap we set. That cost real
@@ -27,24 +29,39 @@
 //! an error throws both away, and a five minute run then lands in the
 //! ledger as costing nothing: invisible to the spend limit and to
 //! anything reading the board. So a cap is an [`TurnOutcome`] carrying
-//! usage, a resume id, and a [`TurnFailure`]; `Err` is reserved for
-//! "the turn did not happen". See [`FailureKind`].
+//! usage, a resume id, and a [`TurnFailure`]. `Err` covers the rest --
+//! except that a handful of its variants can *also* follow real spend;
+//! see the next point and [`error`]'s own docs.
 //!
-//! **Cost is not a shared `Option<u64>`.** Claude reports money; codex
-//! reports tokens and deliberately refuses to synthesize a price. A
-//! field that is permanently `None` on one side reads as "not this
-//! time" when it means "never here", and that exact confusion is how
-//! two upstream issues came to be scoped wrong
-//! (joshrotenberg/codex-wrapper#111). [`Cost`] therefore has three
-//! states, and [`TokenUsage`] is the portable measure that both sides
-//! actually report.
+//! **Not every `Err` is free, either.** [`AgentError::Protocol`],
+//! [`AgentError::Timeout`], and [`AgentError::Cancelled`] can all be
+//! raised after the provider process launched and did paid work: a
+//! cancelled twenty-minute run has spent real money and may already
+//! hold a session id. Whatever an adapter still knows in that case goes
+//! on [`error::PartialTelemetry`] rather than being thrown away for the
+//! sake of a blanket "Err means nothing happened" claim that does not
+//! hold for these three.
 //!
-//! **An unsupported constraint is never silently dropped.** A provider
-//! that cannot seal itself off from ambient configuration, or cannot
-//! keep its credentials in a directory of our choosing, must say so and
-//! fail. A provider that cannot count its own internal turns may warn
-//! and carry on. The difference is [`Severity`], and the line is drawn
-//! at security: see [`Constraint::security`].
+//! **Cost and token usage are not shared `Option` fields.** Claude
+//! reports money; codex reports tokens and deliberately refuses to
+//! synthesize a price. A field that is permanently `None` on one side
+//! reads as "not this time" when it means "never here", and that exact
+//! confusion is how two upstream issues came to be scoped wrong
+//! (joshrotenberg/codex-wrapper#111). [`Cost`] and [`Usage`] therefore
+//! each have three states, the same shape for the same reason: a
+//! provider that never reports says so once and for good
+//! ([`Cost::NotPriced`], [`Usage::NotTracked`]); one that usually
+//! reports and did not this time says so per-outcome
+//! ([`Cost::Unreported`], [`Usage::Unreported`]).
+//!
+//! **An unsupported security constraint is never silently dropped.** A
+//! provider that cannot seal itself off from ambient configuration,
+//! cannot keep its credentials in a directory of our choosing, or
+//! cannot confine filesystem writes and network reach the way a
+//! [`Sandbox`] asks, must say so and fail. A provider that cannot count
+//! its own internal turns may warn and carry on. The difference is
+//! [`Severity`], and the line is drawn at security: see
+//! [`Constraint::security`].
 //!
 //! # Why the futures are boxed
 //!
@@ -68,11 +85,11 @@ pub mod outcome;
 pub mod provider;
 
 pub use capability::{Capabilities, Constraint, Severity, Unsupported, Validation};
-pub use error::AgentError;
+pub use error::{AgentError, PartialTelemetry};
 pub use events::{NoEvents, TurnEvents};
-pub use intent::{Effort, Isolation, McpScope, ResumeId, TurnIntent};
-pub use outcome::{Cost, FailureKind, TokenUsage, TurnFailure, TurnOutcome};
-pub use provider::{Provider, ProviderKey, ProviderRegistry};
+pub use intent::{Effort, Isolation, McpEndpoint, McpScope, ResumeId, Sandbox, TurnIntent};
+pub use outcome::{Cost, FailureKind, TokenUsage, TurnFailure, TurnOutcome, Usage};
+pub use provider::{DuplicateProvider, Provider, ProviderKey, ProviderRegistry};
 
 /// Boxed future, so [`Provider`] stays object-safe without an
 /// `async-trait` dependency. Adapters write `Box::pin(async move { .. })`.
