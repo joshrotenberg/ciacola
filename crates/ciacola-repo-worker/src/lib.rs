@@ -82,6 +82,37 @@ fn bare_repo(path: &Path) -> Repository {
     Repository::new_unchecked(path)
 }
 
+/// Is this a conventional-commit title: `type(scope)!: subject`?
+///
+/// Enforced mechanically in `open_pr` rather than only asked for in the
+/// prompt, because the title is the one piece of an agent's writing
+/// that lands on GitHub verbatim, and a guard that is only a request
+/// is not a guard. Scope and `!` are optional; the type is the closed
+/// set below; the subject must be non-empty.
+fn conventional_title(title: &str) -> bool {
+    const TYPES: &[&str] = &[
+        "build", "chore", "ci", "docs", "feat", "fix", "perf", "refactor", "revert", "style",
+        "test",
+    ];
+    let Some((prefix, subject)) = title.split_once(':') else {
+        return false;
+    };
+    if subject.trim().is_empty() {
+        return false;
+    }
+    let prefix = prefix.strip_suffix('!').unwrap_or(prefix);
+    let ty = match prefix.split_once('(') {
+        Some((ty, scope)) => {
+            if !scope.ends_with(')') || scope.len() < 2 {
+                return false;
+            }
+            ty
+        }
+        None => prefix,
+    };
+    TYPES.contains(&ty)
+}
+
 async fn gh(dir: Option<&Path>, args: &[&str]) -> Result<String, FlatError> {
     let mut command = tokio::process::Command::new("gh");
     command.args(args).kill_on_drop(true);
@@ -372,10 +403,20 @@ impl Plugin for RepoWorkerPlugin {
                     "Bash(cargo:*)".into(),
                     "Bash(just:*)".into(),
                     "Bash(gh:*)".into(),
+                    // The whole ciacola server, by server name: without
+                    // this a *spawned* manager could see its operator
+                    // surface and not call it. An interactive session
+                    // playing the role is unaffected.
+                    "mcp__ciacola".into(),
                 ],
                 max_turns: None,
                 rotate_after_turns: None,
                 loopback: true,
+                // The supervising half of the pair, and the only role
+                // here that may act on the world. An implementer without
+                // `open_pr` only means something if someone looks at the
+                // work before it lands; this is that someone.
+                surface: Some("operator".into()),
                 arguments: vec!["checkout".into()],
                 system_prompt: "\
 You dispatch issues to implementers and you own the prompt they run on.
@@ -454,6 +495,7 @@ effect:
                 max_turns: Some(60),
                 rotate_after_turns: None,
                 loopback: true,
+                surface: None,
                 arguments: vec!["repo".into(), "issue".into(), "worktree".into()],
                 system_prompt: "\
 You are implementing issue #{{issue}} of {{repo}}, working in {{worktree}}, \
@@ -492,7 +534,8 @@ Numbered steps, in order:
    handles that.
 8. Reply with, in this order: what you changed and why; the files; the \
    exact command you verified with and its output; then a pull request \
-   title on one line, and a pull request body whose last line is \
+   title on one line, in conventional-commit form like the commit \
+   (open_pr refuses any other shape), and a pull request body whose last line is \
    Closes #{{issue}} and nothing else. Those two go to open_pr exactly \
    as given, so write them to be used rather than edited.
 
@@ -698,6 +741,15 @@ to do, on purpose."
                             };
                             if let Err(e) = pushed {
                                 return Ok(CallToolResult::error(format!("push: {e}")));
+                            }
+                            if !conventional_title(&args.title) {
+                                return Ok(CallToolResult::error(format!(
+                                    "title '{}' is not conventional-commit form. \
+                                     Use type(scope): subject, e.g. 'fix: ...' or \
+                                     'feat(board): ...'; types are build, chore, ci, \
+                                     docs, feat, fix, perf, refactor, revert, style, test.",
+                                    args.title
+                                )));
                             }
                             let draft = args.draft.unwrap_or(true);
                             let mut cmd = vec![
@@ -1022,5 +1074,32 @@ mod tests {
         let refreshed = repos.ensure_clone("local/repo").await;
         std::fs::remove_dir_all(&tmp).ok();
         refreshed.expect("refresh must not be blocked by a live worktree");
+    }
+
+    /// The title gate is a pure function; the closed set and both
+    /// optional parts are worth pinning.
+    #[test]
+    fn conventional_titles_pass_and_the_rest_do_not() {
+        for good in [
+            "fix: accept bare repositories",
+            "feat(board): live updates",
+            "feat!: drop the queue",
+            "refactor(core)!: rename the ledger",
+            "test: cover the skip path",
+        ] {
+            assert!(conventional_title(good), "should pass: {good}");
+        }
+        for bad in [
+            "Fix: capitalized type",
+            "fixed the bug",
+            "fix:",
+            "fix: ",
+            "wip: not a type",
+            "feat(: broken scope",
+            "feat(scope: unclosed",
+            ": no type at all",
+        ] {
+            assert!(!conventional_title(bad), "should fail: {bad}");
+        }
     }
 }

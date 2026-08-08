@@ -118,6 +118,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "{{\"mcpServers\": {{\"ciacola\": {{\"type\": \"http\", \"url\": \"http://127.0.0.1:{port}/mcp\"}}}}}}"
         ),
     )?;
+    // The same server at its other mount, for roles that supervise.
+    // Capability by endpoint: an agent is handed one of these two paths
+    // in a config applied strictly, so the URL it has is the authority
+    // it has. That holds while no role can make arbitrary HTTP requests,
+    // which is a property of each role's tool list rather than of this
+    // file, and is why `Bash(curl:*)` should not appear in one.
+    let operator_mcp_config_path = std::env::temp_dir().join("ciacola-mcp-operator.json");
+    std::fs::write(
+        &operator_mcp_config_path,
+        format!(
+            "{{\"mcpServers\": {{\"ciacola\": {{\"type\": \"http\", \"url\": \"http://127.0.0.1:{port}/mcp-operator\"}}}}}}"
+        ),
+    )?;
 
     let declared = declared_early;
     let ctx = PluginContext {
@@ -127,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         notify: notify.clone(),
         db_path: path.clone(),
         loopback_mcp_config: mcp_config_path.display().to_string(),
+        operator_mcp_config: operator_mcp_config_path.display().to_string(),
         plugin_config: declared.plugins.clone(),
         limits: declared.limits.clone(),
         runtime: declared.runtime.clone(),
@@ -201,7 +215,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         merged_roles_for_completion.clone(),
         mcp_config_path.display().to_string(),
         declared.runtime.clone(),
-    );
+    )
+    .with_operator_mcp_config(operator_mcp_config_path.display().to_string());
 
     let mut stdio_router = server::router_with_limits(
         ledger.clone(),
@@ -223,16 +238,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         stdio_router = stdio_router.resource(resource);
     }
 
-    let mut agent_router =
-        server::router_with_limits(ledger.clone(), exec, notify, false, declared.limits.clone())
-            .resource(agents_resource(ledger.clone()));
+    let mut agent_router = server::router_with_limits(
+        ledger.clone(),
+        exec.clone(),
+        notify.clone(),
+        false,
+        declared.limits.clone(),
+    )
+    .resource(agents_resource(ledger.clone()));
     agent_router = host.install(agent_router, Surface::Agent);
-    agent_router = ciacola_core::complete::attach(agent_router, ledger.clone(), completing);
+    agent_router = ciacola_core::complete::attach(agent_router, ledger.clone(), completing.clone());
     for tool in health_tools(health.clone()) {
         agent_router = agent_router.tool(tool);
     }
-    for resource in health_resources(health) {
+    for resource in health_resources(health.clone()) {
         agent_router = agent_router.resource(resource);
+    }
+
+    // The operator surface again, this time over HTTP, for roles that
+    // supervise. Same construction as the stdio router because it is
+    // the same surface; a transport consumes its router, so the stdio
+    // one cannot be reused here.
+    let mut operator_router =
+        server::router_with_limits(ledger.clone(), exec, notify, true, declared.limits.clone())
+            .resource(agents_resource(ledger.clone()));
+    operator_router = host.install(operator_router, Surface::Operator);
+    operator_router = ciacola_core::complete::attach(operator_router, ledger.clone(), completing);
+    for tool in health_tools(health.clone()) {
+        operator_router = operator_router.tool(tool);
+    }
+    for tool in health_operator_tools(health.clone()) {
+        operator_router = operator_router.tool(tool);
+    }
+    for resource in health_resources(health) {
+        operator_router = operator_router.resource(resource);
     }
 
     // Shared with the drain below, so the HTTP side and the turn
@@ -244,6 +283,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let http = HttpTransport::new(agent_router)
         .into_router_at("/mcp")
+        // Capability by endpoint: which of the two mounts an agent is
+        // pointed at is the whole of what it may do, because its MCP
+        // config is applied strictly and its tool list cannot make
+        // arbitrary HTTP requests. Anything local can reach this mount,
+        // but that has always been true of `/mcp` too; the listener is
+        // loopback-only and the threat model is a laptop.
+        .merge(HttpTransport::new(operator_router).into_router_at("/mcp-operator"))
         // The board is optional by construction: nothing in core knows
         // about it, so leaving it out is leaving out a merge.
         .merge(ciacola_board::router_with_limits(
@@ -262,7 +308,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             eprintln!("[ciacola] http: {e}");
         }
     });
-    eprintln!("[ciacola] board at http://127.0.0.1:{port}/board, agents' tools at /mcp");
+    eprintln!(
+        "[ciacola] board at http://127.0.0.1:{port}/board, agents' tools at /mcp, \
+         supervisors' at /mcp-operator"
+    );
 
     // Ctrl-C drains rather than kills. Without this, a signal ends a
     // twenty minute agent run mid-flight: recovery tidies up on the
