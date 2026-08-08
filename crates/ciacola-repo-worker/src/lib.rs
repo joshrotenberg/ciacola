@@ -318,34 +318,35 @@ impl Plugin for RepoWorkerPlugin {
     /// the capabilities it was given. `{{worktree}}` is filled at spawn
     /// by `start_issue`, which is the wiring config alone cannot do.
     fn roles(&self) -> Vec<Role> {
-        vec![Role {
-            name: MANAGER.into(),
-            description: "Dispatches issues to implementers, checks what comes back, and \
+        vec![
+            Role {
+                name: MANAGER.into(),
+                description: "Dispatches issues to implementers, checks what comes back, and \
                           curates the implementer prompt from what it sees."
-                .into(),
-            model: None,
-            effort: Some("high".into()),
-            // Not hermetic: it edits this repository, and it is played
-            // by an interactive session today, which already has the
-            // operator's config and should keep it.
-            hermetic: Some("none".into()),
-            working_dir: Some("{{checkout}}".into()),
-            allowed_tools: vec![
-                "Read".into(),
-                "Glob".into(),
-                "Grep".into(),
-                "Edit".into(),
-                "Write".into(),
-                "Bash(git:*)".into(),
-                "Bash(cargo:*)".into(),
-                "Bash(just:*)".into(),
-                "Bash(gh:*)".into(),
-            ],
-            max_turns: None,
-            rotate_after_turns: None,
-            loopback: true,
-            arguments: vec!["checkout".into()],
-            system_prompt: "\
+                    .into(),
+                model: None,
+                effort: Some("high".into()),
+                // Not hermetic: it edits this repository, and it is played
+                // by an interactive session today, which already has the
+                // operator's config and should keep it.
+                hermetic: Some("none".into()),
+                working_dir: Some("{{checkout}}".into()),
+                allowed_tools: vec![
+                    "Read".into(),
+                    "Glob".into(),
+                    "Grep".into(),
+                    "Edit".into(),
+                    "Write".into(),
+                    "Bash(git:*)".into(),
+                    "Bash(cargo:*)".into(),
+                    "Bash(just:*)".into(),
+                    "Bash(gh:*)".into(),
+                ],
+                max_turns: None,
+                rotate_after_turns: None,
+                loopback: true,
+                arguments: vec!["checkout".into()],
+                system_prompt: "\
 You dispatch issues to implementers and you own the prompt they run on.
 The second half is the part that is easy to skip, and it is why this
 role exists rather than a person just calling start_issue.
@@ -383,47 +384,47 @@ effect:
 - Say in the commit message which run taught you the change. A prompt
   whose history reads as evidence can be argued with; one that reads as
   taste cannot."
-                .into(),
-        },
-        Role {
-            name: ROLE.into(),
-            description: "Implements one GitHub issue in its own worktree, then opens a draft \
+                    .into(),
+            },
+            Role {
+                name: ROLE.into(),
+                description: "Implements one GitHub issue in its own worktree, then opens a draft \
                           pull request for review."
-                .into(),
-            model: Some("sonnet".into()),
-            effort: Some("high".into()),
-            hermetic: Some("full".into()),
-            working_dir: Some("{{worktree}}".into()),
-            allowed_tools: vec![
-                "Read".into(),
-                "Glob".into(),
-                "Grep".into(),
-                "Edit".into(),
-                "Write".into(),
-                "Bash(git add:*)".into(),
-                "Bash(git commit:*)".into(),
-                "Bash(git status:*)".into(),
-                "Bash(git diff:*)".into(),
-                "Bash(cargo build:*)".into(),
-                "Bash(cargo test:*)".into(),
-                "Bash(cargo fmt:*)".into(),
-                "Bash(cargo clippy:*)".into(),
-                "Bash(cargo doc:*)".into(),
-                // Step 6 tells it to prefer the repository's own gate.
-                // An instruction without the matching grant is the same
-                // defect as a grant without the instruction, and fails
-                // later and less legibly.
-                "Bash(just:*)".into(),
-                "Bash(make:*)".into(),
-                "Bash(gh issue view:*)".into(),
-                "mcp__ciacola__track".into(),
-                "mcp__ciacola__items".into(),
-            ],
-            max_turns: Some(60),
-            rotate_after_turns: None,
-            loopback: true,
-            arguments: vec!["repo".into(), "issue".into(), "worktree".into()],
-            system_prompt: "\
+                    .into(),
+                model: Some("sonnet".into()),
+                effort: Some("high".into()),
+                hermetic: Some("full".into()),
+                working_dir: Some("{{worktree}}".into()),
+                allowed_tools: vec![
+                    "Read".into(),
+                    "Glob".into(),
+                    "Grep".into(),
+                    "Edit".into(),
+                    "Write".into(),
+                    "Bash(git add:*)".into(),
+                    "Bash(git commit:*)".into(),
+                    "Bash(git status:*)".into(),
+                    "Bash(git diff:*)".into(),
+                    "Bash(cargo build:*)".into(),
+                    "Bash(cargo test:*)".into(),
+                    "Bash(cargo fmt:*)".into(),
+                    "Bash(cargo clippy:*)".into(),
+                    "Bash(cargo doc:*)".into(),
+                    // Step 6 tells it to prefer the repository's own gate.
+                    // An instruction without the matching grant is the same
+                    // defect as a grant without the instruction, and fails
+                    // later and less legibly.
+                    "Bash(just:*)".into(),
+                    "Bash(make:*)".into(),
+                    "Bash(gh issue view:*)".into(),
+                    "mcp__ciacola__track".into(),
+                    "mcp__ciacola__items".into(),
+                ],
+                max_turns: Some(60),
+                rotate_after_turns: None,
+                loopback: true,
+                arguments: vec!["repo".into(), "issue".into(), "worktree".into()],
+                system_prompt: "\
 You are implementing issue #{{issue}} of {{repo}}, working in {{worktree}}, \
 which is a git worktree created for you on its own branch. Nobody else is \
 in it.
@@ -463,8 +464,9 @@ Numbered steps, in order:
 
 You cannot push, open pull requests, or comment. Those are the server's \
 to do, on purpose."
-                .into(),
-        }]
+                    .into(),
+            },
+        ]
     }
 
     fn tools(&self, surface: Surface) -> Vec<Tool> {
