@@ -375,6 +375,7 @@ dependencies = [
 name = "ciacola-tuning"
 version = "0.0.1"
 dependencies = [
+ "ciacola-agent",
  "ciacola-core",
  "schemars",
  "serde",

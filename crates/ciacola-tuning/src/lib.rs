@@ -317,12 +317,16 @@ mod tests {
             seq,
             &Exchange {
                 reply: "ok".into(),
-                session: "s".into(),
-                cost_micro_usd: cost_micro_usd as u64,
-                tokens_in: 1,
-                tokens_out: 1,
-                tokens_cached: 0,
-                num_turns: 1,
+                session: Some("s".into()),
+                cost: ciacola_agent::Cost::Reported {
+                    micro_usd: cost_micro_usd as u64,
+                },
+                usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage {
+                    input: 1,
+                    output: 1,
+                    cached_input: 0,
+                }),
+                provider_turns: Some(1),
                 elapsed_ms: elapsed_ms as u64,
                 error: None,
             },

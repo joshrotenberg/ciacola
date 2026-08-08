@@ -18,3 +18,5 @@ tokio = { workspace = true }
 tower-mcp = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+ciacola-agent = { workspace = true }

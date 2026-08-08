@@ -76,19 +76,29 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
                 error: String,
                 cost: i64,
                 elapsed_ms: u64,
-                session: Option<String>| async move {
-        if let Err(e) = ledger
-            .fail_turn(
-                agent_id,
-                seq,
-                state,
-                &error,
-                cost,
-                elapsed_ms as i64,
-                session.as_deref(),
-            )
-            .await
-        {
+                session: Option<String>,
+                exchange: Option<crate::agent::Exchange>| async move {
+        let recorded = match exchange.as_ref() {
+            Some(exchange) => {
+                ledger
+                    .fail_exchange(agent_id, seq, state, &error, exchange)
+                    .await
+            }
+            None => {
+                ledger
+                    .fail_turn(
+                        agent_id,
+                        seq,
+                        state,
+                        &error,
+                        cost,
+                        elapsed_ms as i64,
+                        session.as_deref(),
+                    )
+                    .await
+            }
+        };
+        if let Err(e) = recorded {
             eprintln!("[exec] record failure {agent_id}/{seq}: {e}");
         }
         tracing::warn!(agent = %agent_id, seq, state, %error, "turn settled badly");
@@ -97,13 +107,14 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
 
     let (def, mcp, session, started, prompt) = match load(ledger, agent_id, seq).await {
         Ok(loaded) => loaded,
-        Err(e) => return fail("failed", e.to_string(), 0, 0, None).await,
+        Err(e) => return fail("failed", e.to_string(), 0, 0, None, None).await,
     };
 
     let wall = std::time::Instant::now();
     let events = SessionSink {
         ledger: ledger.clone(),
         agent_id: agent_id.to_string(),
+        seq,
     };
     match run_exchange(
         ledger.providers(),
@@ -120,13 +131,13 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
             if let Some(error) = &exchange.error {
                 // The provider ran and failed. The spend and any session
                 // it learned are real; record both.
-                let session = (!exchange.session.is_empty()).then(|| exchange.session.clone());
                 return fail(
                     "failed",
                     error.clone(),
-                    exchange.cost_micro_usd as i64,
+                    exchange.cost_micro_usd() as i64,
                     exchange.elapsed_ms,
-                    session,
+                    exchange.session.clone(),
+                    Some(exchange),
                 )
                 .await;
             }
@@ -146,9 +157,10 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
                     fail(
                         "failed",
                         format!("exchange succeeded but recording failed: {e}"),
-                        exchange.cost_micro_usd as i64,
+                        exchange.cost_micro_usd() as i64,
                         exchange.elapsed_ms,
-                        Some(exchange.session.clone()),
+                        exchange.session.clone(),
+                        Some(exchange),
                     )
                     .await;
                 }
@@ -160,6 +172,7 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
                 e.to_string(),
                 0,
                 wall.elapsed().as_millis() as u64,
+                None,
                 None,
             )
             .await
@@ -181,12 +194,17 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
 struct SessionSink {
     ledger: Ledger,
     agent_id: String,
+    seq: i64,
 }
 
 impl ciacola_agent::TurnEvents for SessionSink {
     fn resume_id<'a>(&'a self, id: &'a ciacola_agent::ResumeId) -> ciacola_agent::BoxFut<'a, ()> {
         Box::pin(async move {
-            if let Err(e) = self.ledger.assign_session(&self.agent_id, id.value()).await {
+            if let Err(e) = self
+                .ledger
+                .record_provider_session(&self.agent_id, self.seq, id.value())
+                .await
+            {
                 eprintln!("[exec] persist session {}: {e}", self.agent_id);
             }
         })
@@ -218,10 +236,12 @@ fn rotation_preamble(name: &str, turns: i64) -> String {
 /// That is the fix for a real weakness, not a refactor. Core used to
 /// write the merged config itself, to the predictable path
 /// `$TMPDIR/ciacola-agent-<id>.json`, with `std::fs::write` and
-/// therefore mode 0644. The agent's bearer token sat in that file, world
-/// readable, at a path anyone could guess from an agent id visible on
-/// the board. The Claude adapter writes it through `tempfile` instead:
-/// randomized name, mode 0600, removed when the turn ends.
+/// therefore mode 0644. On systems with a shared temporary directory
+/// that exposed the bearer to other local users; macOS's per-user temp
+/// directory reduced the exposure but did not make the file mode or
+/// predictable lifetime appropriate. The Claude adapter writes it
+/// through `tempfile` instead: randomized name, mode 0600, removed when
+/// the turn ends.
 ///
 /// Failing loudly is deliberate and unchanged: a base config that cannot
 /// be parsed is an operator error, and a turn that ran anonymously
@@ -248,18 +268,30 @@ fn token_scoped_mcp_scope(
         // contract carries only that. A stdio or otherwise-shaped entry
         // is refused rather than silently dropped: dropping it would
         // hand the agent a config missing a server it was granted.
+        if let Some(kind) = server.get("type") {
+            if kind.as_str() != Some("http") {
+                return Err(format!(
+                    "mcp config {base_path}: '{name}' has unsupported type {kind}; \
+                     only http servers are supported"
+                )
+                .into());
+            }
+        }
         let url = server.get("url").and_then(|u| u.as_str()).ok_or_else(|| {
             format!("mcp config {base_path}: '{name}' has no url; only http servers are supported")
         })?;
-        let mut headers: std::collections::BTreeMap<String, String> = server
-            .get("headers")
-            .and_then(|h| h.as_object())
-            .map(|h| {
-                h.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut headers = std::collections::BTreeMap::new();
+        if let Some(raw_headers) = server.get("headers") {
+            let raw_headers = raw_headers.as_object().ok_or_else(|| {
+                format!("mcp config {base_path}: '{name}' headers is not an object")
+            })?;
+            for (key, value) in raw_headers {
+                let value = value.as_str().ok_or_else(|| {
+                    format!("mcp config {base_path}: '{name}' header '{key}' is not a string")
+                })?;
+                headers.insert(key.clone(), value.to_string());
+            }
+        }
         if name == "ciacola" {
             headers.insert(crate::identity::TOKEN_HEADER.into(), token.into());
         }
@@ -533,8 +565,8 @@ mod config_injection_tests {
 
     /// Core hands the backend intent and never writes the secret itself.
     /// The old path wrote it to `$TMPDIR/ciacola-agent-<id>.json` at mode
-    /// 0644, world readable at a guessable path; the adapter now writes
-    /// a randomized 0600 file instead. This pins the half core owns:
+    /// 0644; the adapter now writes a randomized 0600 file instead. This
+    /// pins the half core owns:
     /// the value is carried, and it does not survive a debug print.
     #[test]
     fn the_secret_is_carried_as_intent_and_never_printed() {
@@ -581,6 +613,19 @@ mod config_injection_tests {
         assert!(
             out.is_err(),
             "a server the contract cannot express must be refused, not dropped"
+        );
+
+        let bad_header = dir.join(format!("ciacola-test-header-{}.json", std::process::id()));
+        std::fs::write(
+            &bad_header,
+            r#"{"mcpServers": {"remote": {"type": "http", "url": "http://x/", "headers": {"x": 7}}}}"#,
+        )
+        .expect("write");
+        let out = token_scoped_mcp_scope("t", &bad_header.display().to_string());
+        std::fs::remove_file(&bad_header).ok();
+        assert!(
+            out.is_err(),
+            "a non-string header must not be dropped silently"
         );
     }
 
@@ -682,5 +727,81 @@ mod config_injection_tests {
             intent.instructions.is_some(),
             "the turn that opens a conversation carries the system prompt"
         );
+    }
+
+    /// A resume event means the provider has opened the conversation.
+    /// Re-confirming the same id on later turns must not reset the
+    /// session origin, or rotation will count from zero forever.
+    #[tokio::test]
+    async fn provider_session_events_open_once_and_preserve_rotation_origin() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool).await.expect("ledger");
+        let agent_id = ledger
+            .create_agent(&crate::agent::AgentDef::new("a", "sys"), None)
+            .await
+            .expect("agent");
+        let assigned = ledger
+            .get_agent(&agent_id)
+            .await
+            .expect("get")
+            .expect("row")
+            .session
+            .expect("assigned id");
+
+        let first = SessionSink {
+            ledger: ledger.clone(),
+            agent_id: agent_id.clone(),
+            seq: 1,
+        };
+        ciacola_agent::TurnEvents::resume_id(
+            &first,
+            &ciacola_agent::ResumeId::ProviderAssigned(assigned.clone()),
+        )
+        .await;
+        assert_eq!(
+            ledger
+                .get_agent(&agent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .session_started_seq,
+            1
+        );
+
+        let later = SessionSink {
+            ledger: ledger.clone(),
+            agent_id: agent_id.clone(),
+            seq: 2,
+        };
+        ciacola_agent::TurnEvents::resume_id(
+            &later,
+            &ciacola_agent::ResumeId::ProviderAssigned(assigned),
+        )
+        .await;
+        assert_eq!(
+            ledger
+                .get_agent(&agent_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .session_started_seq,
+            1,
+            "re-confirming an open id must not reset rotation bookkeeping"
+        );
+
+        ciacola_agent::TurnEvents::resume_id(
+            &SessionSink {
+                ledger: ledger.clone(),
+                agent_id: agent_id.clone(),
+                seq: 3,
+            },
+            &ciacola_agent::ResumeId::ProviderAssigned("provider-new".into()),
+        )
+        .await;
+        let row = ledger.get_agent(&agent_id).await.unwrap().unwrap();
+        assert_eq!(row.session.as_deref(), Some("provider-new"));
+        assert_eq!(row.session_started_seq, 3);
     }
 }

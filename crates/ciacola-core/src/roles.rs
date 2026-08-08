@@ -45,6 +45,9 @@ pub struct Role {
     /// What this role is for. Shown in prompts/list, so write it for
     /// whoever is choosing: "read-only analyst for one GitHub issue".
     pub description: String,
+    /// Backend key. Omit for Claude, preserving every existing role.
+    #[serde(default)]
+    pub provider: Option<String>,
     pub model: Option<String>,
     /// low, medium, high, xhigh, max.
     pub effort: Option<String>,
@@ -237,6 +240,9 @@ impl Roles {
     /// A role plus arguments becomes a definition ready to create.
     pub fn to_def(&self, role: &Role, args: &HashMap<String, String>) -> AgentDef {
         let mut def = AgentDef::new(&role.name, self.render(role, args));
+        if let Some(provider) = &role.provider {
+            def = def.provider(provider.as_str());
+        }
         if let Some(model) = &role.model {
             def = def.model(model);
         }
@@ -292,6 +298,7 @@ fn role_json(role: &Role) -> serde_json::Value {
     json!({
         "name": role.name,
         "description": role.description,
+        "provider": role.provider.as_deref().unwrap_or(ciacola_agent::ProviderKey::CLAUDE),
         "model": role.model,
         "effort": role.effort,
         "allowed_tools": role.allowed_tools,
@@ -584,6 +591,7 @@ mod surface_tests {
         Role {
             name: "r".into(),
             description: "d".into(),
+            provider: None,
             model: None,
             effort: None,
             hermetic: None,
@@ -614,6 +622,19 @@ mod surface_tests {
             Roles::new(vec![role(None)], "agent.json").with_operator_mcp_config("operator.json");
         let def = roles.to_def(roles.get("r").unwrap(), &HashMap::new());
         assert_eq!(def.mcp_config.as_deref(), Some("agent.json"));
+    }
+
+    #[test]
+    fn a_role_selects_its_provider_without_changing_the_default() {
+        let mut selected = role(None);
+        selected.provider = Some("codex".into());
+        let roles = Roles::new(vec![selected], "agent.json");
+        let def = roles.to_def(roles.get("r").unwrap(), &HashMap::new());
+        assert_eq!(def.provider.as_str(), "codex");
+
+        let defaults = Roles::new(vec![role(None)], "agent.json");
+        let def = defaults.to_def(defaults.get("r").unwrap(), &HashMap::new());
+        assert_eq!(def.provider, ciacola_agent::ProviderKey::claude());
     }
 
     /// Before the binary supplies the operator path, asking for it gets

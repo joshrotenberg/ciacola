@@ -17,13 +17,13 @@
 use std::path::PathBuf;
 
 use ciacola_agent::{
-    AgentError, Effort, Isolation, McpScope, ProviderKey, ProviderRegistry, ResumeId, TurnEvents,
-    TurnIntent, TurnOutcome,
+    AgentError, Capabilities, Cost, Effort, Isolation, McpScope, ProviderKey, ProviderRegistry,
+    ResumeId, TokenUsage, TurnEvents, TurnIntent, TurnOutcome, Usage,
 };
 use serde::{Deserialize, Serialize};
 
-/// Errors are boxed strings for now; this is a spike, and nothing
-/// downstream branches on the variant yet.
+/// Errors are boxed strings for now; nothing downstream branches on
+/// the variant yet.
 pub type FlatError = Box<dyn std::error::Error + Send + Sync>;
 
 /// What an agent *is*, before it has said anything. The knowledge lives
@@ -212,9 +212,10 @@ impl AgentDef {
 pub struct Agent {
     pub id: String,
     pub def: AgentDef,
-    /// Provider session id, set by the first completed turn. This is the
-    /// recovery mechanism: anyone holding it can continue the
-    /// conversation, from any process, at any later time.
+    /// Provider session id, assigned before the first turn and confirmed
+    /// when the provider opens it. This is the recovery mechanism:
+    /// anyone holding it can continue the conversation, from any process,
+    /// at any later time.
     pub session: Option<String>,
     pub turns: Vec<Turn>,
     pub cost_micro_usd: u64,
@@ -253,17 +254,17 @@ pub struct Turn {
 #[derive(Debug, Clone)]
 pub struct Exchange {
     pub reply: String,
-    pub session: String,
-    pub cost_micro_usd: u64,
+    /// A conversation id learned from the provider. `None` must not
+    /// erase an id already in the ledger.
+    pub session: Option<String>,
+    pub cost: Cost,
     /// Tokens, kept separately from cost because they are the portable
     /// measure: codex reports usage but no price, so a ledger that
     /// records only dollars goes blank the moment a second provider
     /// lands. Cached input is a subset of input, reported when the
     /// provider distinguishes it.
-    pub tokens_in: u64,
-    pub tokens_out: u64,
-    pub tokens_cached: u64,
-    pub num_turns: u32,
+    pub usage: Usage,
+    pub provider_turns: Option<u32>,
     pub elapsed_ms: u64,
     /// The provider reported the run as an error. The exchange still
     /// happened: it cost money and may have advanced the session, so it
@@ -271,6 +272,18 @@ pub struct Exchange {
     /// away. `Err` from [`run_exchange`] means the process could not be
     /// run at all.
     pub error: Option<String>,
+}
+
+impl Exchange {
+    /// Reported money, flattened only for legacy aggregate columns.
+    pub fn cost_micro_usd(&self) -> u64 {
+        self.cost.micro_usd_or_zero()
+    }
+
+    /// Reported token buckets for callers that need the numeric view.
+    pub fn tokens(&self) -> TokenUsage {
+        self.usage.tokens().unwrap_or_default()
+    }
 }
 
 /// What is true of every agent here and of no interactive session.
@@ -386,7 +399,8 @@ pub async fn run_exchange(
     // reach or see; say the rest out loud and carry on. Where that line
     // falls is the contract's decision, not ours: see
     // `ciacola_agent::Constraint::security`.
-    let validation = provider.capabilities().validate(&intent);
+    let capabilities = provider.capabilities();
+    let validation = capabilities.validate(&intent);
     if let Some(blocking) = validation.blocking() {
         return Err(AgentError::Unsupported {
             provider: def.provider.clone(),
@@ -412,7 +426,7 @@ pub async fn run_exchange(
         // spend and a session id. `Err` is reserved for a turn that
         // genuinely did not happen, because that is the only one with
         // nothing to bank.
-        Err(e) => match partial_exchange(&e) {
+        Err(e) => match partial_exchange(&e, &capabilities) {
             Some(exchange) => Ok(exchange),
             None => Err(e.into()),
         },
@@ -483,27 +497,22 @@ pub(crate) fn intent_for(
     intent
 }
 
-/// Record a completed turn in the shape the ledger stores.
-///
-/// The ledger's columns are plain integers that predate [`Cost`] and
-/// [`Usage`], so the three-state distinction is lost here. It is lost
-/// *once*, in one place, and never quietly: a provider that prices its
-/// work and reported nothing says so on the way past, while one that
-/// never prices says nothing because it has nothing to report.
+/// Record a completed turn in the provider-neutral shape the ledger
+/// stores. Money and usage keep their reported/unreported/not-tracked
+/// state until persistence; only legacy aggregates flatten them.
 fn exchange_from(def: &AgentDef, outcome: TurnOutcome) -> Exchange {
     if outcome.cost.is_missing() {
         tracing::warn!(
             agent = %def.name,
             provider = %def.provider,
-            "provider prices its work but reported no cost for this turn; \
-             recording zero, which the spend limit cannot tell from free"
+            "provider prices its work but reported no cost for this turn"
         );
     }
     if outcome.usage.is_missing() {
         tracing::warn!(
             agent = %def.name,
             provider = %def.provider,
-            "provider counts tokens but reported none for this turn; recording zero"
+            "provider counts tokens but reported none for this turn"
         );
     }
     let cost_micro_usd = outcome.cost.micro_usd_or_zero();
@@ -531,16 +540,10 @@ fn exchange_from(def: &AgentDef, outcome: TurnOutcome) -> Exchange {
     Exchange {
         error: outcome.failure_message().map(str::to_string),
         reply: outcome.reply,
-        session: outcome
-            .resume
-            .as_ref()
-            .map(|r| r.value().to_string())
-            .unwrap_or_default(),
-        cost_micro_usd,
-        tokens_in: tokens.input,
-        tokens_out: tokens.output,
-        tokens_cached: tokens.cached_input,
-        num_turns: outcome.provider_turns.unwrap_or_default(),
+        session: outcome.resume.as_ref().map(|r| r.value().to_string()),
+        cost: outcome.cost,
+        usage: outcome.usage,
+        provider_turns: outcome.provider_turns,
         elapsed_ms,
     }
 }
@@ -554,30 +557,31 @@ fn exchange_from(def: &AgentDef, outcome: TurnOutcome) -> Exchange {
 /// the ledger as free and unresumable. `None` means the turn really did
 /// not happen: no process, no spend, nothing to record but the failure
 /// itself.
-fn partial_exchange(error: &AgentError) -> Option<Exchange> {
+fn partial_exchange(error: &AgentError, capabilities: &Capabilities) -> Option<Exchange> {
     let partial = error.partial()?;
     if partial.is_empty() {
         return None;
     }
-    let tokens = partial.usage.unwrap_or_default();
     Some(Exchange {
         error: Some(error.to_string()),
         reply: String::new(),
-        session: partial
-            .resume
-            .as_ref()
-            .map(|r| r.value().to_string())
-            .unwrap_or_default(),
-        cost_micro_usd: partial
-            .cost
-            .map(|c| c.micro_usd_or_zero())
-            .unwrap_or_default(),
-        tokens_in: tokens.input,
-        tokens_out: tokens.output,
-        tokens_cached: tokens.cached_input,
+        session: partial.resume.as_ref().map(|r| r.value().to_string()),
+        cost: partial.cost.unwrap_or(if capabilities.reports_cost {
+            Cost::Unreported
+        } else {
+            Cost::NotPriced
+        }),
+        usage: partial
+            .usage
+            .map(Usage::Reported)
+            .unwrap_or(if capabilities.reports_token_usage {
+                Usage::Unreported
+            } else {
+                Usage::NotTracked
+            }),
         // The contract carries no provider-turn count on a partial, and
         // inventing one would be worse than admitting the gap.
-        num_turns: 0,
+        provider_turns: None,
         elapsed_ms: partial
             .elapsed
             .map(|d| d.as_millis() as u64)
@@ -612,17 +616,21 @@ pub async fn prompt<'a>(
     if let Some(error) = exchange.error {
         return Err(error.into());
     }
-    agent.session = Some(exchange.session);
-    agent.cost_micro_usd += exchange.cost_micro_usd;
+    if let Some(session) = exchange.session.clone() {
+        agent.session = Some(session);
+    }
+    agent.cost_micro_usd += exchange.cost_micro_usd();
+    let tokens = exchange.tokens();
+    let cost_micro_usd = exchange.cost_micro_usd();
     let seq = agent.turns.len() as u32 + 1;
     agent.turns.push(Turn {
         seq,
         prompt: text.to_string(),
         reply: exchange.reply,
-        cost_micro_usd: exchange.cost_micro_usd,
-        tokens_in: exchange.tokens_in,
-        tokens_out: exchange.tokens_out,
-        num_turns: exchange.num_turns,
+        cost_micro_usd,
+        tokens_in: tokens.input,
+        tokens_out: tokens.output,
+        num_turns: exchange.provider_turns.unwrap_or_default(),
         elapsed_ms: exchange.elapsed_ms,
     });
     Ok(agent.turns.last().expect("just pushed"))
@@ -729,11 +737,15 @@ mod migration_tests {
             ..TurnOutcome::ok("")
         };
         let x = exchange_from(&def(), outcome);
-        assert_eq!(x.cost_micro_usd, 1_250_000, "spend must survive");
-        assert_eq!(x.session, "sess-1", "session must survive, so it resumes");
+        assert_eq!(x.cost_micro_usd(), 1_250_000, "spend must survive");
+        assert_eq!(
+            x.session.as_deref(),
+            Some("sess-1"),
+            "session must survive, so it resumes"
+        );
         assert_eq!(x.elapsed_ms, 323_000);
-        assert_eq!(x.num_turns, 60);
-        assert_eq!(x.tokens_in, 900);
+        assert_eq!(x.provider_turns, Some(60));
+        assert_eq!(x.tokens().input, 900);
         assert!(
             x.error.is_some(),
             "it still failed, and must read as failed"
@@ -755,9 +767,12 @@ mod migration_tests {
             }
             .into(),
         };
-        let x = partial_exchange(&e).expect("a run that spent money is an exchange");
-        assert_eq!(x.cost_micro_usd, 900_000);
-        assert_eq!(x.session, "sess-mid");
+        let mut capabilities = Capabilities::none(ProviderKey::claude());
+        capabilities.reports_cost = true;
+        capabilities.reports_token_usage = true;
+        let x = partial_exchange(&e, &capabilities).expect("a run that spent money is an exchange");
+        assert_eq!(x.cost_micro_usd(), 900_000);
+        assert_eq!(x.session.as_deref(), Some("sess-mid"));
         assert_eq!(x.elapsed_ms, 1_200_000);
         assert!(x.error.is_some());
     }
@@ -771,13 +786,19 @@ mod migration_tests {
             provider: ProviderKey::claude(),
             detail: "no binary".into(),
         };
-        assert!(partial_exchange(&e).is_none());
+        assert!(partial_exchange(&e, &Capabilities::none(ProviderKey::claude())).is_none());
 
         // Present but empty is also nothing to bank.
         let empty = AgentError::Cancelled {
             provider: ProviderKey::claude(),
             partial: PartialTelemetry::none().into(),
         };
-        assert!(partial_exchange(&empty).is_none());
+        assert!(partial_exchange(&empty, &Capabilities::none(ProviderKey::claude())).is_none());
+    }
+
+    #[test]
+    fn an_absent_resume_id_does_not_become_an_empty_session() {
+        let exchange = exchange_from(&def(), TurnOutcome::ok("done"));
+        assert_eq!(exchange.session, None);
     }
 }
