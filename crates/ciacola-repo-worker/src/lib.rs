@@ -45,6 +45,10 @@ use ciacola_core::plugin::{BoxFut, Plugin, PluginContext, Section, Surface};
 use ciacola_core::roles::{Role, Roles};
 
 const ROLE: &str = "issue-implementer";
+/// The other half of the loop: whoever dispatches work is also who
+/// notices what the implementer prompt got wrong, and that only turns
+/// into a better prompt if it is somebody's stated job.
+const MANAGER: &str = "repo-manager";
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -314,63 +318,155 @@ impl Plugin for RepoWorkerPlugin {
     /// the capabilities it was given. `{{worktree}}` is filled at spawn
     /// by `start_issue`, which is the wiring config alone cannot do.
     fn roles(&self) -> Vec<Role> {
-        vec![Role {
-            name: ROLE.into(),
-            description: "Implements one GitHub issue in its own worktree, then opens a draft \
+        vec![
+            Role {
+                name: MANAGER.into(),
+                description: "Dispatches issues to implementers, checks what comes back, and \
+                          curates the implementer prompt from what it sees."
+                    .into(),
+                model: None,
+                effort: Some("high".into()),
+                // Not hermetic: it edits this repository, and it is played
+                // by an interactive session today, which already has the
+                // operator's config and should keep it.
+                hermetic: Some("none".into()),
+                working_dir: Some("{{checkout}}".into()),
+                allowed_tools: vec![
+                    "Read".into(),
+                    "Glob".into(),
+                    "Grep".into(),
+                    "Edit".into(),
+                    "Write".into(),
+                    "Bash(git:*)".into(),
+                    "Bash(cargo:*)".into(),
+                    "Bash(just:*)".into(),
+                    "Bash(gh:*)".into(),
+                ],
+                max_turns: None,
+                rotate_after_turns: None,
+                loopback: true,
+                arguments: vec!["checkout".into()],
+                system_prompt: "\
+You dispatch issues to implementers and you own the prompt they run on.
+The second half is the part that is easy to skip, and it is why this
+role exists rather than a person just calling start_issue.
+
+Working in {{checkout}}, which is ciacola's own repository.
+
+Dispatching:
+- start_issue, then send, then wait. Pass timeout_secs; the default is
+  120 and real work runs longer, and a turn cut short loses its session.
+- Read the diff yourself before open_pr. The reply is the worker's
+  account of what it did, which is not the same thing.
+- Verify its verification. It reports running the gate; run the gate.
+  The gap between what a role grants and what its agents actually use
+  is only visible if someone looks.
+
+Curating the implementer prompt, which lives in
+crates/ciacola-repo-worker/src/lib.rs and needs a rebuild to take
+effect:
+
+- Change it only from a run you watched. Not from imagining how an
+  agent might go wrong: that produces long prompts full of rules
+  nobody needed, and every added rule dilutes the ones that matter.
+- When a worker did something right that the prompt never asked for,
+  make it required. Good behaviour that depends on the model's mood is
+  not a feature.
+- When you had to fix its reply by hand before you could use it, the
+  prompt should have produced the usable form. Hand-editing twice is a
+  prompt bug.
+- When you add an instruction, grant the tool it needs in the same
+  commit. An instruction the allowlist does not permit fails later and
+  less legibly than one that is simply absent.
+- When a worker used the wrong command for a repository, the fix is
+  usually to tell it to read that repository's own rules, not to
+  hardcode the right command here.
+- Say in the commit message which run taught you the change. A prompt
+  whose history reads as evidence can be argued with; one that reads as
+  taste cannot."
+                    .into(),
+            },
+            Role {
+                name: ROLE.into(),
+                description: "Implements one GitHub issue in its own worktree, then opens a draft \
                           pull request for review."
-                .into(),
-            model: Some("sonnet".into()),
-            effort: Some("high".into()),
-            hermetic: Some("full".into()),
-            working_dir: Some("{{worktree}}".into()),
-            allowed_tools: vec![
-                "Read".into(),
-                "Glob".into(),
-                "Grep".into(),
-                "Edit".into(),
-                "Write".into(),
-                "Bash(git add:*)".into(),
-                "Bash(git commit:*)".into(),
-                "Bash(git status:*)".into(),
-                "Bash(git diff:*)".into(),
-                "Bash(cargo build:*)".into(),
-                "Bash(cargo test:*)".into(),
-                "Bash(cargo fmt:*)".into(),
-                "Bash(cargo clippy:*)".into(),
-                "Bash(gh issue view:*)".into(),
-                "mcp__ciacola__track".into(),
-                "mcp__ciacola__items".into(),
-            ],
-            max_turns: Some(60),
-            rotate_after_turns: None,
-            loopback: true,
-            arguments: vec!["repo".into(), "issue".into(), "worktree".into()],
-            system_prompt: "\
+                    .into(),
+                model: Some("sonnet".into()),
+                effort: Some("high".into()),
+                hermetic: Some("full".into()),
+                working_dir: Some("{{worktree}}".into()),
+                allowed_tools: vec![
+                    "Read".into(),
+                    "Glob".into(),
+                    "Grep".into(),
+                    "Edit".into(),
+                    "Write".into(),
+                    "Bash(git add:*)".into(),
+                    "Bash(git commit:*)".into(),
+                    "Bash(git status:*)".into(),
+                    "Bash(git diff:*)".into(),
+                    "Bash(cargo build:*)".into(),
+                    "Bash(cargo test:*)".into(),
+                    "Bash(cargo fmt:*)".into(),
+                    "Bash(cargo clippy:*)".into(),
+                    "Bash(cargo doc:*)".into(),
+                    // Step 6 tells it to prefer the repository's own gate.
+                    // An instruction without the matching grant is the same
+                    // defect as a grant without the instruction, and fails
+                    // later and less legibly.
+                    "Bash(just:*)".into(),
+                    "Bash(make:*)".into(),
+                    "Bash(gh issue view:*)".into(),
+                    "mcp__ciacola__track".into(),
+                    "mcp__ciacola__items".into(),
+                ],
+                max_turns: Some(60),
+                rotate_after_turns: None,
+                loopback: true,
+                arguments: vec!["repo".into(), "issue".into(), "worktree".into()],
+                system_prompt: "\
 You are implementing issue #{{issue}} of {{repo}}, working in {{worktree}}, \
 which is a git worktree created for you on its own branch. Nobody else is \
 in it.
 
 Numbered steps, in order:
 1. Read the issue: gh issue view {{issue}} --repo {{repo}}
-2. Read the code the issue concerns before changing anything. If the issue \
+2. Read the repository's own rules before its code: CONTRIBUTING.md, \
+   CLAUDE.md, AGENTS.md, README.md, whichever exist. They outrank what \
+   you would infer from the source, and they are where a project says \
+   how it wants to be verified.
+3. Read the code the issue concerns before changing anything. If the issue \
    turns out to be already fixed, or the fix is not what the issue asks \
    for, say so and stop; do not invent work.
-3. Make the smallest change that resolves it. Match the surrounding code.
-4. Verify: cargo fmt, cargo clippy, cargo test. Do not proceed past a \
-   failure; fix it or report that you cannot.
-5. Commit with a conventional-commit message. House rules, which apply \
+4. Make the smallest change that resolves it. Match the surrounding code. \
+   Where the issue proposes more than one approach, take the one it \
+   prefers; where it proposes none and there is a real choice, say what \
+   you chose against and why.
+5. Cover it with a test, in whatever style the repository already uses. A \
+   fix with no test is not finished. If it genuinely cannot be tested, \
+   say why rather than skipping quietly.
+6. Verify. If the repository has its own gate, run that: `just` when \
+   there is a justfile, `make` when there is a Makefile, whatever \
+   CONTRIBUTING names. It is the set CI runs, and it usually checks more \
+   than the obvious three. Failing that: cargo fmt, cargo clippy, cargo \
+   test. Do not proceed past a failure; fix it or report that you cannot.
+7. Commit with a conventional-commit message. House rules, which apply \
    because a hermetic agent inherits none of the operator's ambient \
    config: no em dashes anywhere; no Co-Authored-By or any other author \
    trailer; no AI attribution or generated-with footer; state what \
    changed and why without editorializing. Do not push; the server \
    handles that.
-6. Reply with: what you changed, the files, the verification output, and \
-   a proposed pull request title and body.
+8. Reply with, in this order: what you changed and why; the files; the \
+   exact command you verified with and its output; then a pull request \
+   title on one line, and a pull request body whose last line is \
+   Closes #{{issue}} and nothing else. Those two go to open_pr exactly \
+   as given, so write them to be used rather than edited.
 
 You cannot push, open pull requests, or comment. Those are the server's \
 to do, on purpose."
-                .into(),
-        }]
+                    .into(),
+            },
+        ]
     }
 
     fn tools(&self, surface: Surface) -> Vec<Tool> {

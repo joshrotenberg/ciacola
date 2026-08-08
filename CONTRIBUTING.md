@@ -50,10 +50,16 @@ just unlink    # back to the pinned revs
 ```
 
 `link` copies `.cargo/config.toml.example` into place, and that path is
-gitignored, so it reaches neither CI nor an agent's clone. This matters
-more than it looks: **an override on your machine hides a broken pin
-from you and from nobody else.** The nightly `drift` lane exists for
-the same reason, and `just drift` runs it locally.
+gitignored, so the config itself reaches neither CI nor an agent's
+clone. This matters more than it looks: **an override on your machine
+hides a broken pin from you and from nobody else.** The nightly `drift`
+lane exists for the same reason, and `just drift` runs it locally.
+
+**Run `just unlink` before committing a lockfile.** The config is
+gitignored; what it produces is not. Building while linked rewrites the
+three entries in `Cargo.lock` to local paths, by dropping their `source`
+line entirely, and a lockfile in that state builds on exactly one
+machine. `unlink` repairs it. This has already broken CI once.
 
 When a sibling change lands, bump the rev here in the same pull request
 that needs it.

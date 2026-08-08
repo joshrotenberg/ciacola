@@ -25,13 +25,20 @@ repl:
     mcp-repl -- cargo run -p ciacola
 
 # Develop against ../tower-mcp, ../claude-wrapper, ../git-spawn instead
-# of the pinned revs. Gitignored, so it never reaches CI or an agent.
+# of the pinned revs. The config itself is gitignored, so it never
+# reaches CI or an agent. What it produces can: see `unlink`.
 link:
     cp .cargo/config.toml.example .cargo/config.toml
-    @echo "siblings patched in; 'just unlink' to go back to the pinned revs"
+    @echo "siblings patched in; run 'just unlink' before committing"
 
+# Drops the patch and repairs Cargo.lock, which is the part that bites.
+# Building while linked rewrites the three entries to local paths by
+# dropping their `source` line, and a lockfile like that builds on
+# exactly one machine: the one that produced it.
 unlink:
     rm -f .cargo/config.toml
+    cargo update -w
+    @git diff --quiet Cargo.lock || echo "Cargo.lock repaired; commit it"
 
 # What the nightly drift lane does: are the pins still good against the
 # three mains? Answers without touching the checked-in Cargo.toml.
