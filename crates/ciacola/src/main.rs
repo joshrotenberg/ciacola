@@ -19,6 +19,8 @@
 //! mcp-repl -- cargo run -p ciacola
 //! ```
 
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,6 +50,53 @@ mod config;
 use tower_mcp::context::notification_channel;
 use tower_mcp::transport::{GenericStdioTransport, HttpTransport};
 
+#[derive(Debug, PartialEq, Eq)]
+struct DatabasePath {
+    path: PathBuf,
+    temporary_fallback: bool,
+}
+
+fn non_empty_path(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+fn resolve_database_path(
+    explicit: Option<OsString>,
+    xdg_data_home: Option<OsString>,
+    home: Option<OsString>,
+    temp_dir: &Path,
+) -> DatabasePath {
+    if let Some(path) = non_empty_path(explicit) {
+        return DatabasePath {
+            path,
+            temporary_fallback: false,
+        };
+    }
+
+    if let Some(path) = non_empty_path(xdg_data_home) {
+        return DatabasePath {
+            path: path.join("ciacola").join("ciacola.db"),
+            temporary_fallback: false,
+        };
+    }
+
+    if let Some(path) = non_empty_path(home) {
+        return DatabasePath {
+            path: path
+                .join(".local")
+                .join("share")
+                .join("ciacola")
+                .join("ciacola.db"),
+            temporary_fallback: false,
+        };
+    }
+
+    DatabasePath {
+        path: temp_dir.join("ciacola.db"),
+        temporary_fallback: true,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Seeded now so the split into real crates inherits instrumentation
@@ -61,12 +110,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_writer(std::io::stderr)
         .init();
 
-    let path = std::env::var("CIACOLA_DB").unwrap_or_else(|_| {
-        std::env::temp_dir()
-            .join("ciacola.db")
-            .display()
-            .to_string()
-    });
+    let database = resolve_database_path(
+        std::env::var_os("CIACOLA_DB"),
+        std::env::var_os("XDG_DATA_HOME"),
+        std::env::var_os("HOME"),
+        &std::env::temp_dir(),
+    );
+    if let Some(parent) = database
+        .path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    eprintln!("[ciacola] ledger: {}", database.path.display());
+    if database.temporary_fallback {
+        eprintln!(
+            "[ciacola] WARNING: no user data directory found; using a temporary ledger. \
+             Set CIACOLA_DB for durable operation."
+        );
+    }
     let concurrency: usize = std::env::var("CIACOLA_CONCURRENCY")
         .ok()
         .and_then(|c| c.parse().ok())
@@ -77,7 +140,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or(4823);
     let config_path = std::env::var("CIACOLA_CONFIG").ok();
 
-    let pool = SqlitePool::connect(&format!("sqlite://{path}?mode=rwc")).await?;
+    let pool =
+        SqlitePool::connect(&format!("sqlite://{}?mode=rwc", database.path.display())).await?;
     let declared_early = config::load_startup(config_path.as_deref())?;
     eprintln!(
         "[ciacola] config: {}",
@@ -141,7 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ledger: ledger.clone(),
         exec: exec.clone(),
         notify: notify.clone(),
-        db_path: path.clone(),
+        db_path: database.path.display().to_string(),
         loopback_mcp_config: mcp_config_path.display().to_string(),
         operator_mcp_config: operator_mcp_config_path.display().to_string(),
         plugin_config: declared.plugins.clone(),
@@ -214,7 +278,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         eprintln!("[ciacola] config: {line}");
     }
 
-    let health = Health::new(pool, path).with_host(host.clone());
+    let health = Health::new(pool, database.path.display().to_string()).with_host(host.clone());
 
     // Core verbs, then every plugin's contribution for this surface.
     // Live values for completion/complete, so a generic REPL completes
@@ -395,4 +459,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_database_path_has_highest_precedence() {
+        let database = resolve_database_path(
+            Some("/explicit/ciacola.db".into()),
+            Some("/xdg".into()),
+            Some("/home/example".into()),
+            Path::new("/tmp"),
+        );
+
+        assert_eq!(database.path, Path::new("/explicit/ciacola.db"));
+        assert!(!database.temporary_fallback);
+    }
+
+    #[test]
+    fn xdg_data_home_precedes_home() {
+        let database = resolve_database_path(
+            None,
+            Some("/xdg".into()),
+            Some("/home/example".into()),
+            Path::new("/tmp"),
+        );
+
+        assert_eq!(database.path, Path::new("/xdg/ciacola/ciacola.db"));
+        assert!(!database.temporary_fallback);
+    }
+
+    #[test]
+    fn home_provides_a_durable_default() {
+        let database =
+            resolve_database_path(None, None, Some("/home/example".into()), Path::new("/tmp"));
+
+        assert_eq!(
+            database.path,
+            Path::new("/home/example/.local/share/ciacola/ciacola.db")
+        );
+        assert!(!database.temporary_fallback);
+    }
+
+    #[test]
+    fn missing_user_directories_use_a_marked_temporary_fallback() {
+        let database = resolve_database_path(None, None, None, Path::new("/tmp"));
+
+        assert_eq!(database.path, Path::new("/tmp/ciacola.db"));
+        assert!(database.temporary_fallback);
+    }
+
+    #[test]
+    fn empty_environment_values_are_ignored() {
+        let database = resolve_database_path(
+            Some(OsString::new()),
+            Some(OsString::new()),
+            Some("/home/example".into()),
+            Path::new("/tmp"),
+        );
+
+        assert_eq!(
+            database.path,
+            Path::new("/home/example/.local/share/ciacola/ciacola.db")
+        );
+    }
 }
