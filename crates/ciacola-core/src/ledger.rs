@@ -570,6 +570,18 @@ impl Ledger {
     /// exchange can still have cost money and learned a session id; both
     /// are recorded on the agent so spend is never under-reported and a
     /// half-finished conversation stays resumable.
+    /// Settle a turn that did not succeed.
+    ///
+    /// `elapsed_ms` is wall clock for the attempt, which is measurable
+    /// whatever went wrong and used to be discarded: a five minute
+    /// failure read as 0ms, so the runs most worth investigating looked
+    /// like the cheapest ones on the board.
+    // Eight positional arguments is past where this stays readable.
+    // Left alone rather than wrapped in a struct because every caller
+    // is in this crate and the next change here is likely a
+    // claimed-at column, which is the thing that would make a struct
+    // worth it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn fail_turn(
         &self,
         agent_id: &str,
@@ -577,11 +589,13 @@ impl Ledger {
         state: &str,
         error: &str,
         cost_micro_usd: i64,
+        elapsed_ms: i64,
         session: Option<&str>,
     ) -> Result<bool, FlatError> {
         let mut tx = self.pool.begin().await?;
         let done = sqlx::query(
-            "UPDATE turns SET state = ?3, error = ?4, cost_micro_usd = ?5
+            "UPDATE turns SET state = ?3, error = ?4, cost_micro_usd = ?5,
+                 elapsed_ms = ?6
              WHERE agent_id = ?1 AND seq = ?2 AND state IN ('queued', 'running')",
         )
         .bind(agent_id)
@@ -589,6 +603,7 @@ impl Ledger {
         .bind(state)
         .bind(error)
         .bind(cost_micro_usd)
+        .bind(elapsed_ms)
         .execute(&mut *tx)
         .await?;
         let recorded = done.rows_affected() == 1;
@@ -808,7 +823,7 @@ mod session_tests {
         // Claimed and then abandoned, exactly as a killed server does.
         l.enqueue_turn(&id, "hi").await.expect("enqueue");
         l.claim_turn(&id, 1).await.expect("claim");
-        l.fail_turn(&id, 1, "failed", "orphaned by server crash", 0, None)
+        l.fail_turn(&id, 1, "failed", "orphaned by server crash", 0, 0, None)
             .await
             .expect("fail");
 

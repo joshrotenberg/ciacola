@@ -491,6 +491,11 @@ pub fn router_with_limits(
                             "killed",
                             "killed by request",
                             0,
+                            // A kill settles the row from outside the
+                            // run, so the elapsed the executor was
+                            // measuring is not reachable here. Would
+                            // need a claimed-at column to do better.
+                            0,
                             None,
                         )
                         .await
