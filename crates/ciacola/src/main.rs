@@ -75,11 +75,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(4823);
-    let config_path =
-        std::env::var("CIACOLA_CONFIG").unwrap_or_else(|_| "spike/flat12.toml".to_string());
+    let config_path = std::env::var("CIACOLA_CONFIG").ok();
 
     let pool = SqlitePool::connect(&format!("sqlite://{path}?mode=rwc")).await?;
-    let declared_early = config::load(&config_path)?;
+    let declared_early = config::load_startup(config_path.as_deref())?;
+    eprintln!(
+        "[ciacola] config: {}",
+        config_path.as_deref().unwrap_or(config::DEFAULT_PATH)
+    );
     let ledger = Ledger::setup(pool.clone())
         .await?
         .with_runtime(declared_early.runtime.clone())?;
@@ -184,7 +187,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let merged_roles_for_completion = merged_roles.clone();
+    let configured_roles = ciacola_core::roles::Roles::with_runtime(
+        merged_roles.clone(),
+        mcp_config_path.display().to_string(),
+        declared.runtime.clone(),
+    )
+    .with_operator_mcp_config(operator_mcp_config_path.display().to_string());
     plugins.push(Box::new(RolesPlugin::new(merged_roles)));
 
     let host = Arc::new(PluginHost::setup(plugins, &ctx).await?);
@@ -198,6 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &declared,
         &ledger,
         host.as_ref(),
+        &configured_roles,
         &mcp_config_path.display().to_string(),
     )
     .await?
@@ -211,12 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Live values for completion/complete, so a generic REPL completes
     // agent ids and role names from this server without knowing what a
     // ciacola is. Enum arguments need no help; they are in the schema.
-    let completing = ciacola_core::roles::Roles::with_runtime(
-        merged_roles_for_completion.clone(),
-        mcp_config_path.display().to_string(),
-        declared.runtime.clone(),
-    )
-    .with_operator_mcp_config(operator_mcp_config_path.display().to_string());
+    let completing = configured_roles;
 
     let mut stdio_router = server::router_with_limits(
         ledger.clone(),

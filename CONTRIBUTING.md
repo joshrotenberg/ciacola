@@ -17,7 +17,9 @@ cargo run -p ciacola
 ```
 
 Nothing else is needed. The board comes up on `4823` and the MCP
-server speaks on stdout.
+server speaks on stdout. That default uses an empty configuration when
+`ciacola.toml` is absent and a temporary ledger; use the durable launch
+in `README.md` for anything beyond a smoke test.
 
 ## The three siblings
 

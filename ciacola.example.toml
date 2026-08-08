@@ -1,5 +1,12 @@
 # ciacola, annotated. Every section is optional; a server with an empty
 # config file starts, serves the six verbs, and does nothing until told.
+# The ledger path is deliberately an environment setting, not TOML:
+#
+#   mkdir -p "$HOME/.local/share/ciacola"
+#   CIACOLA_DB="$HOME/.local/share/ciacola/ciacola.db" cargo run -p ciacola
+#
+# Without CIACOLA_DB the server uses a temporary database. Always set it
+# before unattended work or a restart will not find the conversations.
 
 [runtime]
 # Seal the ambient provider config. "full" drops user, project, and
@@ -26,6 +33,8 @@ house_rules_file = "~/.claude/CLAUDE.md"
 # Circuit breakers, not budgets. Measured spend across real turns spans
 # 54x, so no number is correct; a breaker only has to be wrong in the
 # safe direction. Applies to new submissions, never to running work.
+# Set both before adding a schedule. Leaving them commented is an
+# explicit choice to run without a monetary circuit breaker.
 # daily_warn_usd = 25.0
 # daily_stop_usd = 50.0
 
@@ -62,6 +71,7 @@ repos = ["joshrotenberg/mdbook-lint"]
 # [[agents]]
 # name = "tower-mcp-manager"
 # role = "repo-manager"
+# arguments = { checkout = "/path/to/your/ciacola/checkout" }
 #
 # Config belonging to a plugin goes under its name. Core does not read
 # these; the named plugin is handed its own section and parses it.

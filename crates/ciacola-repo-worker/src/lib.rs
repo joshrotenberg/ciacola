@@ -20,7 +20,7 @@
 //!
 //! ```toml
 //! [plugins.repo-worker]
-//! root = "~/.local/share/flat/repos"      # clones and worktrees
+//! root = "~/.local/share/ciacola/repos"   # clones and worktrees
 //! repos = ["joshrotenberg/tower-mcp"]     # what may be worked on
 //! ```
 //!
@@ -361,7 +361,7 @@ impl Plugin for RepoWorkerPlugin {
                 config
                     .root
                     .as_deref()
-                    .unwrap_or("~/.local/share/flat/repos"),
+                    .unwrap_or("~/.local/share/ciacola/repos"),
             );
             self.repos = Some(Repos {
                 root,

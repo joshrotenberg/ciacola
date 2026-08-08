@@ -30,6 +30,14 @@ use ciacola_core::ledger::Ledger;
 const MIN_EVERY_SECS: i64 = 10;
 const MAX_EVERY_SECS: i64 = 86_400;
 
+fn validate_interval(every_secs: i64) -> Result<(), FlatError> {
+    if (MIN_EVERY_SECS..=MAX_EVERY_SECS).contains(&every_secs) {
+        Ok(())
+    } else {
+        Err(format!("every_secs must be {MIN_EVERY_SECS}..={MAX_EVERY_SECS}").into())
+    }
+}
+
 /// The shape of `[agents.plugins.schedule]`. Owned here rather than by
 /// the binary's config types, which is the point of the hook.
 #[derive(Debug, serde::Deserialize)]
@@ -106,6 +114,7 @@ impl Schedules {
         text: &str,
         every_secs: i64,
     ) -> Result<ScheduleRow, FlatError> {
+        validate_interval(every_secs)?;
         let schedule_id = ulid::Ulid::new().to_string();
         let next = now_unix() + every_secs;
         sqlx::query(
@@ -270,10 +279,8 @@ pub fn tools(schedules: Schedules, ledger: Ledger) -> Vec<Tool> {
                 let schedules = schedules.clone();
                 let ledger = ledger.clone();
                 async move {
-                    if !(MIN_EVERY_SECS..=MAX_EVERY_SECS).contains(&args.every_secs) {
-                        return Ok(CallToolResult::error(format!(
-                            "every_secs must be {MIN_EVERY_SECS}..={MAX_EVERY_SECS}"
-                        )));
+                    if let Err(error) = validate_interval(args.every_secs) {
+                        return Ok(CallToolResult::error(error.to_string()));
                     }
                     match ledger.get_agent(&args.agent_id).await {
                         Ok(Some(agent)) if agent.retired => {
@@ -425,6 +432,7 @@ impl Plugin for SchedulePlugin {
                 .clone()
                 .try_into()
                 .map_err(|e| -> FlatError { format!("[agents.plugins.schedule]: {e}").into() })?;
+            validate_interval(wake.every_secs)?;
             for existing in schedules.list().await? {
                 if existing.agent_id == agent_id {
                     schedules.delete(&existing.schedule_id).await?;
@@ -701,5 +709,48 @@ mod tests {
                 .expect("delete again"),
             "a second unschedule of the same id is not an error"
         );
+    }
+
+    #[tokio::test]
+    async fn every_creation_path_rejects_an_out_of_range_interval() {
+        let (schedules, _ctx, _exec, ledger) = setup().await;
+        let agent_id = new_agent(&ledger).await;
+
+        let error = schedules
+            .create(&agent_id, "too fast", MIN_EVERY_SECS - 1)
+            .await
+            .expect_err("config and tools converge on create");
+        assert!(error.to_string().contains("10..=86400"), "{error}");
+        assert!(schedules.list().await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_config_schedule_does_not_replace_the_previous_wake() {
+        let (schedules, _ctx, _exec, ledger) = setup().await;
+        let agent_id = new_agent(&ledger).await;
+        schedules
+            .create(&agent_id, "valid", 60)
+            .await
+            .expect("existing schedule");
+        let plugin = SchedulePlugin {
+            schedules: Some(schedules.clone()),
+            ledger: Some(ledger),
+        };
+        let invalid: toml::Value = toml::from_str(
+            r#"
+                every_secs = 1
+                text = "invalid"
+            "#,
+        )
+        .expect("config section");
+
+        let error = plugin
+            .agent_config(&agent_id, &invalid)
+            .await
+            .expect_err("invalid config must fail at startup");
+        assert!(error.to_string().contains("10..=86400"), "{error}");
+        let remaining = schedules.list().await.expect("list");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].text, "valid");
     }
 }

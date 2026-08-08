@@ -13,6 +13,9 @@
 //! system prompt is substituted at upsert time, so an orchestrator
 //! knows its own id and can tag the helpers it spawns.
 
+use std::collections::{BTreeMap, HashMap};
+use std::io::ErrorKind;
+
 use serde::Deserialize;
 
 use ciacola_core::agent::{AgentDef, FlatError};
@@ -42,6 +45,18 @@ pub struct Config {
     pub runtime: ciacola_core::roles::Runtime,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            agents: Vec::new(),
+            roles: Vec::new(),
+            plugins: empty_table(),
+            limits: Default::default(),
+            runtime: Default::default(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigAgent {
@@ -49,6 +64,10 @@ pub struct ConfigAgent {
     /// Instantiate this role instead of spelling out a definition. The
     /// fields below still override what the role provides.
     pub role: Option<String>,
+    /// Values for the role's declared `{{arguments}}`. Unknown and
+    /// missing names are rejected at boot, before the agent is upserted.
+    #[serde(default)]
+    pub arguments: HashMap<String, String>,
     #[serde(default)]
     pub system_prompt: String,
     pub model: Option<String>,
@@ -67,7 +86,7 @@ pub struct ConfigAgent {
     /// not read these; each plugin is offered its own and parses it
     /// itself. See `Plugin::agent_config`.
     #[serde(default)]
-    pub plugins: std::collections::BTreeMap<String, toml::Value>,
+    pub plugins: BTreeMap<String, toml::Value>,
 }
 
 fn empty_table() -> toml::Value {
@@ -78,6 +97,108 @@ pub fn load(path: &str) -> Result<Config, FlatError> {
     Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
 }
 
+pub const DEFAULT_PATH: &str = "ciacola.toml";
+
+/// Load an explicitly selected config strictly. With no override, use
+/// `ciacola.toml` when present and otherwise start from the documented
+/// empty configuration. A typo in `CIACOLA_CONFIG` must still be loud.
+pub fn load_startup(explicit_path: Option<&str>) -> Result<Config, FlatError> {
+    load_startup_at(explicit_path, DEFAULT_PATH)
+}
+
+fn load_startup_at(explicit_path: Option<&str>, default_path: &str) -> Result<Config, FlatError> {
+    match explicit_path {
+        Some(path) => load(path),
+        None => match std::fs::read_to_string(default_path) {
+            Ok(text) => Ok(toml::from_str(&text)?),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(Config::default()),
+            Err(error) => Err(error.into()),
+        },
+    }
+}
+
+fn role_definition(
+    config: &Config,
+    declared: &ConfigAgent,
+    roles: &Roles,
+    loopback_mcp_config: &str,
+) -> Result<AgentDef, FlatError> {
+    let mut def = match &declared.role {
+        Some(role_name) => {
+            let role = roles
+                .get(role_name)
+                .ok_or_else(|| format!("agent '{}': no role '{role_name}'", declared.name))?;
+            let missing: Vec<&str> = role
+                .arguments
+                .iter()
+                .filter(|name| !declared.arguments.contains_key(*name))
+                .map(String::as_str)
+                .collect();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "agent '{}': role '{}' needs arguments {missing:?}",
+                    declared.name, role.name
+                )
+                .into());
+            }
+            let unknown: Vec<&str> = declared
+                .arguments
+                .keys()
+                .filter(|name| !role.arguments.contains(name))
+                .map(String::as_str)
+                .collect();
+            if !unknown.is_empty() {
+                return Err(format!(
+                    "agent '{}': role '{}' has no arguments {unknown:?}",
+                    declared.name, role.name
+                )
+                .into());
+            }
+            let mut def = roles.to_def(role, &declared.arguments);
+            def.name = declared.name.clone();
+            def
+        }
+        None => {
+            if !declared.arguments.is_empty() {
+                return Err(format!("agent '{}': arguments require a role", declared.name).into());
+            }
+            AgentDef::new(&declared.name, &declared.system_prompt)
+        }
+    };
+    if let Some(model) = &declared.model {
+        def = def.model(model);
+    }
+    if let Some(effort) = &declared.effort {
+        def = def.effort(effort);
+    }
+    if let Some(dir) = &declared.working_dir {
+        def = def.working_dir(dir);
+    }
+    if !declared.allowed_tools.is_empty() {
+        def = def.allowed_tools(declared.allowed_tools.clone());
+    }
+    if let Some(max_turns) = declared.max_turns {
+        def = def.max_turns(max_turns);
+    }
+    if let Some(rotate) = declared.rotate_after_turns {
+        def = def.rotate_after_turns(rotate);
+    }
+    if declared.loopback {
+        def = def.mcp_config(loopback_mcp_config);
+    }
+    if let Some(scope) = declared
+        .hermetic
+        .as_ref()
+        .or(config.runtime.hermetic.as_ref())
+    {
+        def = def.hermetic(scope);
+    }
+    if let Some(home) = &config.runtime.claude_home {
+        def = def.claude_home(home);
+    }
+    Ok(def)
+}
+
 /// Upsert every declared agent and its schedule. Boot-idempotent:
 /// running twice changes nothing; editing the file and rebooting
 /// updates definitions in place without touching conversations.
@@ -85,61 +206,16 @@ pub async fn apply(
     config: &Config,
     ledger: &Ledger,
     host: &ciacola_core::plugin::PluginHost,
+    roles: &Roles,
     loopback_mcp_config: &str,
 ) -> Result<Vec<String>, FlatError> {
     let house_rules = config.runtime.resolved_house_rules()?;
-    let roles = Roles::with_runtime(
-        config.roles.clone(),
-        loopback_mcp_config,
-        config.runtime.clone(),
-    );
     let mut report = Vec::new();
     for declared in &config.agents {
         // A persistent agent is either spelled out or an instance of a
         // role; the same definitions serve both, which is the whole
         // point of roles.
-        let mut def = match &declared.role {
-            Some(role) => {
-                let role = roles
-                    .get(role)
-                    .ok_or_else(|| format!("agent '{}': no role '{role}'", declared.name))?;
-                let mut def = roles.to_def(role, &std::collections::HashMap::new());
-                def.name = declared.name.clone();
-                def
-            }
-            None => AgentDef::new(&declared.name, &declared.system_prompt),
-        };
-        if let Some(model) = &declared.model {
-            def = def.model(model);
-        }
-        if let Some(effort) = &declared.effort {
-            def = def.effort(effort);
-        }
-        if let Some(dir) = &declared.working_dir {
-            def = def.working_dir(dir);
-        }
-        if !declared.allowed_tools.is_empty() {
-            def = def.allowed_tools(declared.allowed_tools.clone());
-        }
-        if let Some(max_turns) = declared.max_turns {
-            def = def.max_turns(max_turns);
-        }
-        if let Some(rotate) = declared.rotate_after_turns {
-            def = def.rotate_after_turns(rotate);
-        }
-        if declared.loopback {
-            def = def.mcp_config(loopback_mcp_config);
-        }
-        if let Some(scope) = declared
-            .hermetic
-            .as_ref()
-            .or(config.runtime.hermetic.as_ref())
-        {
-            def = def.hermetic(scope);
-        }
-        if let Some(home) = &config.runtime.claude_home {
-            def = def.claude_home(home);
-        }
+        let mut def = role_definition(config, declared, roles, loopback_mcp_config)?;
         if let Some(rules) = &house_rules {
             def = def.house_rules(rules.as_str());
         }
@@ -175,4 +251,102 @@ pub async fn apply(
         report.push(format!("{verb} {} ({agent_id}){claimed}", declared.name));
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn missing_path(label: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "ciacola-{label}-{}-{}.toml",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ))
+            .display()
+            .to_string()
+    }
+
+    #[test]
+    fn missing_default_config_is_an_empty_server() {
+        let path = missing_path("default");
+        let config = load_startup_at(None, &path).expect("an absent default is optional");
+        assert!(config.agents.is_empty());
+        assert!(config.roles.is_empty());
+    }
+
+    #[test]
+    fn missing_explicit_config_is_an_error() {
+        let path = missing_path("explicit");
+        let error = load_startup_at(Some(&path), "ignored")
+            .expect_err("an explicit typo must not silently become an empty server");
+        assert!(error.to_string().contains("No such file"), "{error}");
+    }
+
+    #[test]
+    fn persistent_role_arguments_render_and_keep_operator_authority() {
+        let config: Config = toml::from_str(
+            r#"
+                [[agents]]
+                name = "repo-manager"
+                role = "manager"
+                arguments = { checkout = "/tmp/repo" }
+            "#,
+        )
+        .expect("config");
+        let role: Role = toml::from_str(
+            r#"
+                name = "manager"
+                description = "manager"
+                working_dir = "{{checkout}}"
+                loopback = true
+                surface = "operator"
+                arguments = ["checkout"]
+                system_prompt = "Manage {{checkout}}"
+            "#,
+        )
+        .expect("shipped role");
+        let roles = Roles::with_runtime(vec![role], "agent.json", Default::default())
+            .with_operator_mcp_config("operator.json");
+
+        let def =
+            role_definition(&config, &config.agents[0], &roles, "agent.json").expect("definition");
+        assert_eq!(def.name, "repo-manager");
+        assert_eq!(def.system_prompt, "Manage /tmp/repo");
+        assert_eq!(
+            def.working_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/repo"))
+        );
+        assert_eq!(def.mcp_config.as_deref(), Some("operator.json"));
+    }
+
+    #[test]
+    fn persistent_role_missing_an_argument_fails_at_boot() {
+        let config: Config = toml::from_str(
+            r#"
+                [[agents]]
+                name = "repo-manager"
+                role = "manager"
+            "#,
+        )
+        .expect("config");
+        let role: Role = toml::from_str(
+            r#"
+                name = "manager"
+                description = "manager"
+                arguments = ["checkout"]
+                system_prompt = "Manage {{checkout}}"
+            "#,
+        )
+        .expect("shipped role");
+        let roles = Roles::new(vec![role], "agent.json");
+
+        let error = role_definition(&config, &config.agents[0], &roles, "agent.json")
+            .expect_err("an unresolved persistent role must not be created");
+        assert!(error.to_string().contains("checkout"), "{error}");
+    }
 }
