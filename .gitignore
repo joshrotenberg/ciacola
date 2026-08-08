@@ -3,3 +3,6 @@
 *.db-shm
 *.db-wal
 ciacola.toml
+
+# Local sibling patches. See CONTRIBUTING.md; .example is the committed one.
+.cargo/config.toml
