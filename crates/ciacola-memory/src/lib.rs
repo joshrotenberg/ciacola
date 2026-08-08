@@ -131,6 +131,107 @@ impl Memory {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn memory() -> Memory {
+        let pool = SqlitePool::connect("sqlite::memory:").await.expect("pool");
+        Memory::setup(pool).await.expect("setup")
+    }
+
+    #[tokio::test]
+    async fn remember_upserts_on_key_replacing_value_and_author() {
+        let m = memory().await;
+        m.remember("k", "first", Some("agent-1"))
+            .await
+            .expect("first write");
+        // Same key again: this must replace the row, not duplicate it,
+        // and the second write's author (even absent) wins outright --
+        // that is the UPSERT's `author = ?3` unconditionally, so a
+        // second write with no author clears the first one's.
+        m.remember("k", "second", None).await.expect("second write");
+
+        let all = m.recall(None).await.expect("recall");
+        assert_eq!(all.len(), 1, "same key must replace, not duplicate");
+        assert_eq!(all[0].value, "second");
+        assert_eq!(all[0].author, None);
+    }
+
+    #[tokio::test]
+    async fn remember_upsert_moves_updated_unix() {
+        let m = memory().await;
+        m.remember("k", "first", None).await.expect("first write");
+        let first_updated = m.recall(None).await.expect("recall")[0].updated_unix;
+
+        // now_unix() is second-granularity, so the clock has to be
+        // pushed past a boundary for the second write to prove it
+        // actually recomputed the timestamp rather than reusing it.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        m.remember("k", "second", None).await.expect("second write");
+        let second_updated = m.recall(None).await.expect("recall")[0].updated_unix;
+
+        assert!(
+            second_updated > first_updated,
+            "updated_unix must move on the second write"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_matches_a_term_found_only_in_the_key() {
+        let m = memory().await;
+        m.remember("spokes/provisioning", "unrelated value", None)
+            .await
+            .expect("remember");
+
+        let hits = m.recall(Some("provisioning")).await.expect("recall");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "spokes/provisioning");
+    }
+
+    #[tokio::test]
+    async fn recall_matches_a_term_found_only_in_the_value() {
+        let m = memory().await;
+        m.remember("unrelated/key", "the answer is forty-two", None)
+            .await
+            .expect("remember");
+
+        let hits = m.recall(Some("forty-two")).await.expect("recall");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].key, "unrelated/key");
+    }
+
+    #[tokio::test]
+    async fn recall_returns_empty_for_a_term_in_neither_column() {
+        let m = memory().await;
+        m.remember("some/key", "some value", None)
+            .await
+            .expect("remember");
+
+        let hits = m.recall(Some("nowhere-to-be-found")).await.expect("recall");
+        assert!(
+            hits.is_empty(),
+            "a term absent from every key and value must not fall back to everything"
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_reports_whether_the_key_existed() {
+        let m = memory().await;
+        m.remember("k", "v", None).await.expect("remember");
+
+        assert!(
+            m.forget("k").await.expect("forget existing"),
+            "forgetting a key that existed must report true"
+        );
+        assert!(
+            !m.forget("k").await.expect("forget absent"),
+            "forgetting an already-absent key must report false"
+        );
+    }
+}
+
 fn memory_json(m: &MemoryRow) -> serde_json::Value {
     json!({
         "key": m.key,
