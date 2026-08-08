@@ -9,11 +9,20 @@
 # before unattended work or a restart will not find the conversations.
 
 [runtime]
+# Backend used when a role or agent does not select one. Omit for Claude.
+# default_provider = "codex"
+
 # Seal the ambient provider config. "full" drops user, project, and
 # local settings; "project" keeps the user's global ones. Worth having
 # on for unattended work: an interactive session inherits a CLAUDE.md
 # the person can see, a scheduled agent inherits it invisibly.
 hermetic = "full"
+
+# Provider-native containment. Codex write-capable workers usually want
+# workspace-write-no-network, or workspace-write when their task needs the
+# network. Claude refuses a sandbox request because permission prompts are not
+# an OS boundary.
+# sandbox = "workspace-write-no-network"
 
 # Isolation removes the operator's standing rules along with everything
 # else, so put them back deliberately. Inline, or a file, or both.
@@ -28,6 +37,11 @@ house_rules_file = "~/.claude/CLAUDE.md"
 # holding it below.
 # claude_home = "~/.local/share/ciacola/claude"
 # token_env = "CIACOLA_CLAUDE_TOKEN"
+
+# Codex keeps its own auth and sessions here. `codex_token_env` names a source
+# variable whose value is passed only to Codex's child environment.
+# codex_home = "~/.local/share/ciacola/codex"
+# codex_token_env = "CIACOLA_CODEX_TOKEN"
 
 [limits]
 # Circuit breakers, not budgets. Measured spend across real turns spans
@@ -62,7 +76,10 @@ repos = ["joshrotenberg/mdbook-lint"]
 # [[roles]]
 # name = "summarizer"
 # description = "Summarizes one PR in five bullets."
-# model = "haiku"
+# provider = "codex"
+# inherit_provider_tools = true
+# sandbox = "read-only"
+# model = "gpt-5.6-sol"
 # arguments = ["repo", "pr"]
 # system_prompt = "..."
 

@@ -152,9 +152,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // this registry and never learns what is behind it. A second
     // adapter is one more line here plus one more dependency, which is
     // the whole point of the seam.
+    let codex_provider = ciacola_agent_codex::CodexProvider::new();
+    match codex_provider.cli_version_status().await {
+        Ok(status) => eprintln!("[ciacola] codex CLI: {status:?}"),
+        Err(error) => eprintln!("[ciacola] warning: Codex provider unavailable: {error}"),
+    }
     let providers = ciacola_agent::ProviderRegistry::new()
         .with(std::sync::Arc::new(ciacola_agent_claude::ClaudeProvider))
+        .and_then(|providers| providers.with(std::sync::Arc::new(codex_provider)))
         .map_err(|e| -> ciacola_core::FlatError { e.to_string().into() })?;
+    providers
+        .get(&declared_early.runtime.default_provider_key())
+        .map_err(|error| -> ciacola_core::FlatError { error.to_string().into() })?;
     eprintln!("[ciacola] providers: {}", providers.keys().join(", "));
 
     let ledger = Ledger::setup(pool.clone())
@@ -223,7 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         limits: declared.limits.clone(),
         runtime: declared.runtime.clone(),
     };
-    declared.runtime.check_claude_home();
+    declared.runtime.check_provider_homes();
     eprintln!("[ciacola] limits: {}", declared.limits.summary());
 
     // The whole registration surface. Order is contribution order:

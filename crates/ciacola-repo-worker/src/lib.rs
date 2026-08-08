@@ -424,6 +424,8 @@ impl Plugin for RepoWorkerPlugin {
                     // playing the role is unaffected.
                     "mcp__ciacola".into(),
                 ],
+                inherit_provider_tools: false,
+                sandbox: None,
                 max_turns: None,
                 rotate_after_turns: None,
                 loopback: true,
@@ -508,6 +510,8 @@ effect:
                     "mcp__ciacola__track".into(),
                     "mcp__ciacola__items".into(),
                 ],
+                inherit_provider_tools: false,
+                sandbox: None,
                 max_turns: Some(60),
                 rotate_after_turns: None,
                 loopback: true,

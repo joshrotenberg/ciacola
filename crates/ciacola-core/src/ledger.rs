@@ -466,17 +466,26 @@ impl Ledger {
     /// create-only guard let those writes erase isolation and credentials.
     fn normalized_def(&self, def: &AgentDef) -> AgentDef {
         let mut def = def.clone();
+        def.resolve_provider(self.runtime.default_provider_key());
         if def.hermetic.is_none() {
             def.hermetic = self.runtime.hermetic.clone();
         }
-        if def.claude_home.is_none() {
-            def.claude_home = self.runtime.claude_home.clone();
+        if def.sandbox.is_none() {
+            def.sandbox = self.runtime.sandbox.clone();
+        }
+        let (home, token_env) = if def.provider.as_str() == "codex" {
+            (&self.runtime.codex_home, &self.runtime.codex_token_env)
+        } else {
+            (&self.runtime.claude_home, &self.runtime.token_env)
+        };
+        if def.config_home.is_none() {
+            def.config_home = home.clone();
         }
         if def.house_rules.is_none() {
             def.house_rules = self.house_rules.clone();
         }
         if def.token_env.is_none() {
-            def.token_env = self.runtime.token_env.clone();
+            def.token_env = token_env.clone();
         }
         def
     }
@@ -511,6 +520,16 @@ impl Ledger {
     /// the def follows the config file; the conversation persists.
     pub async fn update_agent_def(&self, agent_id: &str, def: &AgentDef) -> Result<(), FlatError> {
         let def = self.normalized_def(def);
+        if let Some(existing) = self.get_agent(agent_id).await?
+            && existing.turns > 0
+            && existing.def.provider != def.provider
+        {
+            return Err(format!(
+                "agent '{agent_id}' has {} recorded turn(s) with provider '{}'; refusing to move its conversation to '{}'. Retire it and create a new agent instead",
+                existing.turns, existing.def.provider, def.provider
+            )
+            .into());
+        }
         sqlx::query("UPDATE agents SET name = ?2, def = ?3 WHERE agent_id = ?1")
             .bind(agent_id)
             .bind(&def.name)
@@ -1190,11 +1209,15 @@ mod session_tests {
             .await
             .expect("pool");
         let runtime = crate::roles::Runtime {
+            default_provider: None,
             hermetic: Some("full".into()),
+            sandbox: Some("read-only".into()),
             claude_home: Some("/tmp/ciacola-test-home".into()),
+            codex_home: Some("/tmp/ciacola-test-codex-home".into()),
             house_rules: Some("keep the rule".into()),
             house_rules_file: None,
             token_env: Some("CIACOLA_TEST_TOKEN".into()),
+            codex_token_env: Some("CIACOLA_TEST_CODEX_TOKEN".into()),
         };
         let l = Ledger::setup(pool)
             .await
@@ -1211,9 +1234,105 @@ mod session_tests {
             .expect("replace");
         let def = l.get_agent(&id).await.expect("get").expect("row").def;
         assert_eq!(def.hermetic.as_deref(), Some("full"));
-        assert_eq!(def.claude_home.as_deref(), Some("/tmp/ciacola-test-home"));
+        assert_eq!(def.sandbox.as_deref(), Some("read-only"));
+        assert_eq!(def.config_home.as_deref(), Some("/tmp/ciacola-test-home"));
         assert_eq!(def.house_rules.as_deref(), Some("keep the rule"));
         assert_eq!(def.token_env.as_deref(), Some("CIACOLA_TEST_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn runtime_default_applies_to_new_definitions_but_not_legacy_rows() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let runtime = crate::roles::Runtime {
+            default_provider: Some("codex".into()),
+            sandbox: Some("workspace-write-no-network".into()),
+            claude_home: Some("/tmp/ciacola-legacy-claude-home".into()),
+            codex_home: Some("/tmp/ciacola-default-codex-home".into()),
+            token_env: Some("CIACOLA_LEGACY_CLAUDE_TOKEN".into()),
+            codex_token_env: Some("CIACOLA_DEFAULT_CODEX_TOKEN".into()),
+            ..Default::default()
+        };
+        let l = Ledger::setup(pool)
+            .await
+            .expect("ledger")
+            .with_runtime(runtime)
+            .expect("runtime");
+
+        let current_id = l
+            .create_agent(&AgentDef::new("current", "s"), None)
+            .await
+            .expect("current");
+        let current = l
+            .get_agent(&current_id)
+            .await
+            .expect("get")
+            .expect("row")
+            .def;
+        assert_eq!(current.provider, ciacola_agent::ProviderKey::codex());
+        assert_eq!(
+            current.config_home.as_deref(),
+            Some("/tmp/ciacola-default-codex-home")
+        );
+        assert_eq!(
+            current.token_env.as_deref(),
+            Some("CIACOLA_DEFAULT_CODEX_TOKEN")
+        );
+        assert_eq!(
+            current.sandbox.as_deref(),
+            Some("workspace-write-no-network")
+        );
+
+        let legacy: AgentDef = serde_json::from_str(
+            r#"{
+                "name": "legacy",
+                "system_prompt": "s",
+                "model": null,
+                "allowed_tools": [],
+                "working_dir": null,
+                "max_turns": null
+            }"#,
+        )
+        .expect("legacy definition");
+        let legacy_id = l.create_agent(&legacy, None).await.expect("legacy");
+        let legacy = l
+            .get_agent(&legacy_id)
+            .await
+            .expect("get")
+            .expect("row")
+            .def;
+        assert_eq!(legacy.provider, ciacola_agent::ProviderKey::claude());
+        assert_eq!(
+            legacy.config_home.as_deref(),
+            Some("/tmp/ciacola-legacy-claude-home")
+        );
+        assert_eq!(
+            legacy.token_env.as_deref(),
+            Some("CIACOLA_LEGACY_CLAUDE_TOKEN")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recorded_conversation_cannot_move_between_providers() {
+        let l = ledger().await;
+        let id = l
+            .create_agent(&AgentDef::new("claude-agent", "s"), None)
+            .await
+            .expect("create");
+        l.enqueue_turn(&id, "queued once")
+            .await
+            .expect("record a turn");
+
+        let error = l
+            .update_agent_def(&id, &AgentDef::new("codex-agent", "s").provider("codex"))
+            .await
+            .expect_err("provider session ids are not portable");
+        assert!(error.to_string().contains("refusing to move"), "{error}");
+
+        let stored = l.get_agent(&id).await.expect("get").expect("row");
+        assert_eq!(stored.def.provider, ciacola_agent::ProviderKey::claude());
+        assert_eq!(stored.name, "claude-agent");
     }
 
     #[tokio::test]

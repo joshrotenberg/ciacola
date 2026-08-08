@@ -60,6 +60,21 @@ handed an MCP config; any other MCP server can be added to it and the
 agent cannot tell the difference. A plugin earns its keep only when it
 needs something core owns.
 
+## Providers
+
+Claude and Codex are built-in adapters behind the same provider contract.
+An agent can select `provider = "claude"` or `provider = "codex"`; a
+server-wide `default_provider` covers definitions that omit it. Existing
+stored conversations cannot be moved between providers after their first
+recorded turn; retire one and create a new agent to change backends.
+
+Provider controls stay explicit where the CLIs differ. Claude accepts named
+tool grants. Codex uses its native execution policy plus `read-only`,
+`workspace-write`, or `workspace-write-no-network` containment. Codex reports
+real token usage, but not a monetary price, so the ledger records those turns
+as unpriced rather than inventing a dollar value. See `ciacola.example.toml`
+for the complete configuration surface.
+
 ## Running it
 
 For a durable server, copy the annotated config and start it:
