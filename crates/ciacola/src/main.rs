@@ -58,12 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .with_writer(std::io::stderr)
         .init();
 
-    #[tracing::instrument]
-    fn probe_span(n: i32) {}
-    probe_span(1);
     let path = std::env::var("CIACOLA_DB").unwrap_or_else(|_| {
         std::env::temp_dir()
             .join("ciacola.db")

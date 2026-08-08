@@ -115,21 +115,17 @@ forbid. House rules are now an explicit layer of the system prompt.
    declares `[agents.schedule]`, so the binary's config pass needs a
    `Schedules` handle. The right fix is a plugin config hook: let a
    plugin claim part of an agent's declaration.
-2. **Span-close events do not render.** `tracing` is seeded and the
-   spans nest correctly, but `FmtSpan::CLOSE` emits nothing through the
-   layered subscriber, so explicit `info!` events carry the payload.
-   Worth understanding before wiring a real collector.
-3. **`spawned_by` is honour-system.** The loopback has no caller
+2. **`spawned_by` is honour-system.** The loopback has no caller
    identity, so an agent reports its own parentage and could lie. Fix
    is per-agent tokens or per-agent mount paths.
-4. **No capability ceiling.** A spawned helper's tools are not required
+3. **No capability ceiling.** A spawned helper's tools are not required
    to be a subset of its parent's. Depth is capped; breadth is not.
-5. **`CLAUDE_CONFIG_DIR` isolates the login.** A fresh `claude_home`
+4. **`CLAUDE_CONFIG_DIR` isolates the login.** A fresh `claude_home`
    authenticates as nobody. `claude setup-token` plus `token_env` is
    the route through, and the server warns at boot.
-6. **No graceful shutdown for the HTTP side.** `drain` handles
+5. **No graceful shutdown for the HTTP side.** `drain` handles
    in-flight turns; the axum server is dropped.
-7. **`wait` is shadowed in mcp-repl.** `wait` is one of the six verbs
+6. **`wait` is shadowed in mcp-repl.** `wait` is one of the six verbs
    and also an mcp-repl built-in (wait for a background task), and the
    built-in wins: typing `wait` gets "no tasks in this session to wait
    for". `find wait` lists both, so the client knows about the clash
@@ -138,7 +134,7 @@ forbid. House rules are now an explicit layer of the system prompt.
    one client is the wrong direction, so this is filed upstream as
    [mcp-repl#87](https://github.com/joshrotenberg/mcp-repl/issues/87)
    and nothing here changes.
-8. **Cost is Claude-only.** codex reports tokens and no price at all
+7. **Cost is Claude-only.** codex reports tokens and no price at all
    and deliberately refuses to synthesize one, which is why tokens are
    in the ledger beside cost. A second provider will find `cost_usd`
    optional in practice but not in shape.
