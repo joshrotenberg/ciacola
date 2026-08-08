@@ -151,58 +151,46 @@ impl Repos {
         self.allowed.iter().any(|r| r == repo)
     }
 
-    /// Clone once into the plugin's own root, then reuse.
+    #[cfg(test)]
     async fn ensure_clone(&self, repo: &str) -> Result<PathBuf, FlatError> {
+        self.ensure_clone_from(repo, &format!("https://github.com/{repo}.git"))
+            .await
+    }
+
+    /// Clone once into the plugin's own root, then refresh and reuse.
+    async fn ensure_clone_from(&self, repo: &str, url: &str) -> Result<PathBuf, FlatError> {
         let bare = self.bare(repo);
         let _guard = self.cloning.lock().await;
-        if bare.exists() {
-            // The refspec is not optional, and its absence is silent.
-            // `git clone --bare` writes no `remote.origin.fetch`, so a
-            // plain `git fetch origin` against a bare repository updates
-            // FETCH_HEAD and leaves `refs/heads/*` exactly where they
-            // were. The clone's `main` then never moves after the day it
-            // was made, and every worktree is cut from that frozen
-            // commit while looking perfectly healthy.
-            //
-            // This shipped. Four agents worked issues against a `main`
-            // three merges behind, and it surfaced only because one of
-            // them reasoned about a file that had changed since.
-            // Fetch into remote-tracking refs, which is what a normal
-            // clone configures and what `git clone --bare` does not.
-            //
-            // The obvious refspec, `+refs/heads/*:refs/heads/*`, is
-            // wrong here in three separate ways, all of them found the
-            // hard way. It prunes this plugin's own `agent/*` branches,
-            // because they do not exist on origin until open_pr pushes
-            // them. It refuses to run at all once a worktree has one
-            // checked out, since git will not fetch into a checked-out
-            // branch. And it makes local branches the same namespace as
-            // the remote's, so the two collide by design.
-            //
-            // Mapping to `refs/remotes/origin/*` avoids all three: local
-            // branches are never written, so nothing collides, nothing
-            // is pruned, and no worktree can block it.
-            let mut fetch = bare_repo(&bare).fetch();
-            fetch
-                .remote("origin")
-                .refspec("+refs/heads/*:refs/remotes/origin/*");
-            // The result is not optional. A discarded error here reads
-            // exactly like a refresh that worked, which is how a frozen
-            // clone went unnoticed for two batches.
-            fetch
+        if !bare.exists() {
+            std::fs::create_dir_all(&self.root)?;
+            eprintln!("[repo-worker] cloning {repo} (once)");
+            CloneCommand::new(url)
+                .bare()
+                .directory(&bare)
                 .execute()
                 .await
-                .map_err(|e| -> FlatError { format!("fetch {repo}: {e}").into() })?;
-            return Ok(bare);
+                .map_err(|e| -> FlatError { format!("clone {repo}: {e}").into() })?;
         }
-        std::fs::create_dir_all(&self.root)?;
-        eprintln!("[repo-worker] cloning {repo} (once)");
-        CloneCommand::new(format!("https://github.com/{repo}.git"))
-            .bare()
-            .directory(&bare)
+
+        // The refspec is not optional, even immediately after cloning.
+        // `git clone --bare` writes no `remote.origin.fetch` and creates
+        // `refs/heads/main`, while add_worktree deliberately starts from
+        // `refs/remotes/origin/main`. Returning before this fetch made
+        // the first start_issue fail and the identical retry succeed.
+        //
+        // Mapping to remote-tracking refs also keeps refreshes away from
+        // local agent branches and branches checked out by worktrees.
+        // `+refs/heads/*:refs/heads/*` would instead prune unpublished
+        // agent branches, collide with the local namespace, and refuse
+        // to update a branch held by a live worktree.
+        let mut fetch = bare_repo(&bare).fetch();
+        fetch
+            .remote("origin")
+            .refspec("+refs/heads/*:refs/remotes/origin/*");
+        fetch
             .execute()
             .await
-            .map_err(|e| -> FlatError { format!("clone {repo}: {e}").into() })?;
+            .map_err(|e| -> FlatError { format!("fetch {repo}: {e}").into() })?;
         Ok(bare)
     }
 
@@ -213,7 +201,18 @@ impl Repos {
         slug: &str,
         base: &str,
     ) -> Result<(PathBuf, String), FlatError> {
-        let bare = self.ensure_clone(repo).await?;
+        self.add_worktree_from(repo, slug, base, &format!("https://github.com/{repo}.git"))
+            .await
+    }
+
+    async fn add_worktree_from(
+        &self,
+        repo: &str,
+        slug: &str,
+        base: &str,
+        url: &str,
+    ) -> Result<(PathBuf, String), FlatError> {
+        let bare = self.ensure_clone_from(repo, url).await?;
         let path = self.root.join(format!("wt-{slug}"));
         let branch = format!("agent/{slug}");
         if path.exists() {
@@ -1306,6 +1305,58 @@ mod tests {
 
         std::fs::remove_dir_all(&tmp).ok();
         assert_eq!(got, want, "the clone's main did not follow origin's");
+    }
+
+    /// The initial clone and worktree add are one start_issue call. A
+    /// test that primes the bare clone first misses the exact boundary
+    /// where a bare clone has `main` but no `origin/main` yet.
+    #[tokio::test]
+    async fn first_add_worktree_populates_its_remote_tracking_base() {
+        let tmp = std::env::temp_dir().join(format!("ciacola-first-clone-{}", ulid::Ulid::new()));
+        let origin = tmp.join("origin");
+        std::fs::create_dir_all(&origin).expect("mkdir");
+        git(&origin, &["init", "-q", "-b", "main"]).await;
+        git(&origin, &["config", "user.email", "t@example.com"]).await;
+        git(&origin, &["config", "user.name", "t"]).await;
+        std::fs::write(origin.join("a"), "first clone").expect("write");
+        git(&origin, &["add", "."]).await;
+        git(&origin, &["commit", "-qm", "initial"]).await;
+        let want = String::from_utf8_lossy(
+            &tokio::process::Command::new("git")
+                .args(["rev-parse", "main"])
+                .current_dir(&origin)
+                .output()
+                .await
+                .expect("rev-parse")
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let repos = Repos {
+            root: tmp.join("root"),
+            allowed: Arc::new(vec!["local/repo".into()]),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let url = format!("file://{}", origin.display());
+
+        let (worktree, _) = repos
+            .add_worktree_from("local/repo", "local-repo-1", "main", &url)
+            .await
+            .expect("the first add must not require a retry");
+        let got = String::from_utf8_lossy(
+            &tokio::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&worktree)
+                .output()
+                .await
+                .expect("rev-parse")
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        std::fs::remove_dir_all(&tmp).ok();
+        assert_eq!(got, want, "the first worktree did not start at origin/main");
     }
 
     /// The refresh must not delete the branches this plugin creates.
