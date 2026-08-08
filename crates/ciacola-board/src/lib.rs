@@ -36,6 +36,8 @@ use axum::routing::get;
 
 use std::sync::Arc;
 
+use tokio_util::sync::CancellationToken;
+
 use ciacola_core::ledger::{Ledger, TurnRow};
 use ciacola_core::plugin::PluginHost;
 use ciacola_core::render::{ago, chip, esc, human_count, page_with, usd};
@@ -45,6 +47,7 @@ struct BoardState {
     ledger: Ledger,
     host: Arc<PluginHost>,
     limits: ciacola_core::limits::Limits,
+    shutdown: CancellationToken,
 }
 
 /// The board knows core (agents) and asks the host for everything
@@ -52,13 +55,18 @@ struct BoardState {
 /// what `Option<Items>`, `Option<Findings>`, and three constructors
 /// were failing to achieve.
 pub fn router(ledger: Ledger, host: Arc<PluginHost>) -> Router {
-    router_with_limits(ledger, host, Default::default())
+    router_with_limits(ledger, host, Default::default(), CancellationToken::new())
 }
 
+/// `shutdown` is the same token the caller cancels to start graceful
+/// shutdown of the whole server. The board's own long-lived response,
+/// `/board/events`, watches it too: without that, the SSE loop never
+/// ends on its own and a graceful shutdown waits on it forever.
 pub fn router_with_limits(
     ledger: Ledger,
     host: Arc<PluginHost>,
     limits: ciacola_core::limits::Limits,
+    shutdown: CancellationToken,
 ) -> Router {
     let plugin_routes = host.routes();
     Router::new()
@@ -71,6 +79,7 @@ pub fn router_with_limits(
             ledger,
             host,
             limits,
+            shutdown,
         })
         .merge(plugin_routes)
 }
@@ -220,10 +229,17 @@ fn version_of(body: &str) -> u64 {
 /// Rendering server-side to decide is the honest cheap trick: it costs
 /// a few queries a second at this scale, and it means an idle system
 /// sends nothing, so an open board is not a busy one.
-async fn events(
-    State(state): State<BoardState>,
-) -> Sse<impl futures_core::Stream<Item = Result<Event, std::convert::Infallible>>> {
-    let stream = async_stream::stream! {
+/// The stream half of `/board/events`, split out so a test can drive it
+/// without a live HTTP connection.
+///
+/// The loop is otherwise infinite (an open board is a long-lived
+/// response by design), so it has to race its own sleep against
+/// `shutdown`: without that, a graceful shutdown that waits for
+/// in-flight responses to finish would wait on this one forever.
+fn board_event_stream(
+    state: BoardState,
+) -> impl futures_core::Stream<Item = Result<Event, std::convert::Infallible>> {
+    async_stream::stream! {
         let mut last = 0u64;
         loop {
             let version = version_of(&overview_body(&state).await);
@@ -231,10 +247,18 @@ async fn events(
                 last = version;
                 yield Ok(Event::default().event("board").data(version.to_string()));
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                _ = state.shutdown.cancelled() => break,
+            }
         }
-    };
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    }
+}
+
+async fn events(
+    State(state): State<BoardState>,
+) -> Sse<impl futures_core::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    Sse::new(board_event_stream(state)).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 fn turn_html(turn: &TurnRow) -> String {
@@ -327,4 +351,63 @@ async fn agent_page(State(state): State<BoardState>, Path(agent_id): Path<String
         body.push_str(&turn_html(turn));
     }
     page_with(&agent.name, &body, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_stream::StreamExt;
+
+    async fn state() -> BoardState {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+        let notify = ciacola_core::Notifier(tx);
+        let exec = ciacola_core::HandExecutor::start(ledger.clone(), notify.clone(), 1);
+        let ctx = ciacola_core::PluginContext {
+            pool,
+            ledger: ledger.clone(),
+            exec,
+            notify,
+            db_path: String::new(),
+            loopback_mcp_config: String::new(),
+            plugin_config: toml::Value::Table(toml::map::Map::new()),
+            limits: Default::default(),
+            runtime: Default::default(),
+        };
+        let host = Arc::new(PluginHost::setup(vec![], &ctx).await.expect("host"));
+        BoardState {
+            ledger,
+            host,
+            limits: Default::default(),
+            shutdown: CancellationToken::new(),
+        }
+    }
+
+    /// `/board/events` is a long-lived SSE response by design: without
+    /// this, `axum::serve(...).with_graceful_shutdown(...)` would wait
+    /// on it forever, because a graceful shutdown waits for in-flight
+    /// responses to finish rather than cutting them off.
+    #[tokio::test]
+    async fn event_stream_ends_when_shutdown_is_cancelled() {
+        let state = state().await;
+        let shutdown = state.shutdown.clone();
+        let mut stream = Box::pin(board_event_stream(state));
+
+        // The board always renders as different from the sentinel
+        // `last = 0`, so the first tick yields immediately; drain it
+        // before cancelling so the test exercises the loop, not just
+        // its first iteration.
+        let _ = stream.next().await.expect("first tick");
+
+        shutdown.cancel();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stream.next().await.is_some() {}
+        })
+        .await
+        .expect("stream did not end after shutdown was cancelled");
+    }
 }
