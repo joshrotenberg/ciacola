@@ -1798,7 +1798,7 @@ checksum = "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e"
 [[package]]
 name = "tower-mcp"
 version = "0.21.0"
-source = "git+https://github.com/joshrotenberg/tower-mcp?rev=a63cb73c5c2b912894f5af6f8158d4c499763aba#a63cb73c5c2b912894f5af6f8158d4c499763aba"
+source = "git+https://github.com/joshrotenberg/tower-mcp?rev=9c8b53973e650a140fe4c180e6c3fad4a6e65b9b#9c8b53973e650a140fe4c180e6c3fad4a6e65b9b"
 dependencies = [
  "async-trait",
  "axum",
@@ -1827,7 +1827,7 @@ dependencies = [
 [[package]]
 name = "tower-mcp-types"
 version = "0.21.0"
-source = "git+https://github.com/joshrotenberg/tower-mcp?rev=a63cb73c5c2b912894f5af6f8158d4c499763aba#a63cb73c5c2b912894f5af6f8158d4c499763aba"
+source = "git+https://github.com/joshrotenberg/tower-mcp?rev=9c8b53973e650a140fe4c180e6c3fad4a6e65b9b#9c8b53973e650a140fe4c180e6c3fad4a6e65b9b"
 dependencies = [
  "base64 0.23.1",
  "indexmap",

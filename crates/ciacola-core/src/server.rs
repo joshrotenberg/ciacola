@@ -12,10 +12,12 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
+use tower_mcp::extract::{Context, Json, State};
 use tower_mcp::{CallToolResult, LogLevel, McpRouter, ToolBuilder};
 
 use crate::agent::AgentDef;
 use crate::exec::TurnExecutor;
+use crate::identity::AgentIdentity;
 use crate::ledger::{AgentRow, Ledger, TurnRow};
 use crate::notify::Notifier;
 
@@ -217,6 +219,110 @@ pub fn router_with(
     router_with_limits(ledger, exec, notify, include_kill, Default::default())
 }
 
+/// The spawn tool, on its own so the identity policy is testable
+/// without a transport: tests hand it a RequestContext directly.
+fn spawn_tool(ledger: Ledger, max_depth: i64, operator_surface: bool) -> tower_mcp::Tool {
+    ToolBuilder::new("spawn")
+            .description(
+                "Define an agent: a durable conversation with a system \
+                 prompt. Spawning runs nothing and costs nothing.",
+            )
+            .non_destructive()
+            .extractor_handler(
+                ledger,
+                move |State(ledger): State<Ledger>,
+                      ctx: Context,
+                      Json(args): Json<SpawnArgs>| async move {
+                    // Derived beats claimed. An authenticated caller IS
+                    // the parent, whatever it says; an anonymous caller
+                    // on the agent surface can claim nothing; only the
+                    // operator's own terminal, where there is no HTTP
+                    // request to authenticate, is taken at its word.
+                    let caller = ctx.extension::<AgentIdentity>().map(|i| i.0.clone());
+                    let spawned_by = match (&caller, operator_surface) {
+                        (Some(id), _) => Some(id.clone()),
+                        (None, true) => args.spawned_by.clone(),
+                        (None, false) => None,
+                    };
+
+                    let mut def = AgentDef::new(args.name, args.system_prompt);
+                    if let Some(model) = args.model {
+                        def = def.model(model);
+                    }
+                    if let Some(max_turns) = args.max_turns {
+                        def = def.max_turns(max_turns);
+                    }
+
+                    // The capability ceiling. A child's tools are at
+                    // most its parent's, so breadth is bounded the way
+                    // depth already was; anything requested past the
+                    // ceiling is reported, not silently dropped. And an
+                    // authenticated caller does not get to pick the
+                    // child's MCP config: the loopback the child
+                    // inherits is decided by this server, or handing an
+                    // agent the operator surface would be one guessable
+                    // path away.
+                    let mut denied: Vec<String> = Vec::new();
+                    match (&caller, args.allowed_tools) {
+                        (Some(parent_id), Some(requested)) => {
+                            let parent = match ledger.get_agent(parent_id).await {
+                                Ok(Some(parent)) => parent,
+                                Ok(None) => {
+                                    return Ok(CallToolResult::error(format!(
+                                        "caller '{parent_id}' not found"
+                                    )));
+                                }
+                                Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                            };
+                            let (granted, refused): (Vec<String>, Vec<String>) = requested
+                                .into_iter()
+                                .partition(|t| parent.def.allowed_tools.contains(t));
+                            denied = refused;
+                            def = def.allowed_tools(granted);
+                        }
+                        (None, Some(requested)) => {
+                            def = def.allowed_tools(requested);
+                        }
+                        (_, None) => {}
+                    }
+                    match (&caller, args.mcp_config) {
+                        (Some(_), Some(_)) => {
+                            return Ok(CallToolResult::error(
+                                "an agent does not choose its child's mcp_config; \
+                                 the child gets this server's loopback"
+                                    .to_string(),
+                            ));
+                        }
+                        (None, Some(mcp_config)) => {
+                            def = def.mcp_config(mcp_config);
+                        }
+                        (_, None) => {}
+                    }
+
+                    if let Some(reason) =
+                        depth_refusal(&ledger, spawned_by.as_deref(), max_depth).await
+                    {
+                        return Ok(CallToolResult::error(reason));
+                    }
+                    match ledger.create_agent(&def, spawned_by.as_deref()).await {
+                        Ok(agent_id) => {
+                            let mut out = json!({ "agent_id": agent_id });
+                            if !denied.is_empty() {
+                                out["tools_denied"] = json!(denied);
+                                out["note"] = json!(
+                                    "denied tools are ones you do not hold yourself; \
+                                     a child's reach is at most its parent's"
+                                );
+                            }
+                            Ok(CallToolResult::json(out))
+                        }
+                        Err(e) => Ok(CallToolResult::error(e.to_string())),
+                    }
+                },
+            )
+            .build()
+}
+
 /// Depth is checked here rather than in the ledger because it is a
 /// policy, not an invariant: a spawn that would exceed it is refused
 /// with an explanation the calling agent can act on.
@@ -228,43 +334,10 @@ pub fn router_with_limits(
     limits: crate::limits::Limits,
 ) -> McpRouter {
     let max_depth = limits.max_spawn_depth;
-    let spawn = {
-        let ledger = ledger.clone();
-        ToolBuilder::new("spawn")
-            .description(
-                "Define an agent: a durable conversation with a system \
-                 prompt. Spawning runs nothing and costs nothing.",
-            )
-            .non_destructive()
-            .handler(move |args: SpawnArgs| {
-                let ledger = ledger.clone();
-                async move {
-                    let mut def = AgentDef::new(args.name, args.system_prompt);
-                    if let Some(model) = args.model {
-                        def = def.model(model);
-                    }
-                    if let Some(tools) = args.allowed_tools {
-                        def = def.allowed_tools(tools);
-                    }
-                    if let Some(max_turns) = args.max_turns {
-                        def = def.max_turns(max_turns);
-                    }
-                    if let Some(mcp_config) = args.mcp_config {
-                        def = def.mcp_config(mcp_config);
-                    }
-                    if let Some(reason) =
-                        depth_refusal(&ledger, args.spawned_by.as_deref(), max_depth).await
-                    {
-                        return Ok(CallToolResult::error(reason));
-                    }
-                    match ledger.create_agent(&def, args.spawned_by.as_deref()).await {
-                        Ok(agent_id) => Ok(CallToolResult::json(json!({ "agent_id": agent_id }))),
-                        Err(e) => Ok(CallToolResult::error(e.to_string())),
-                    }
-                }
-            })
-            .build()
-    };
+    // The operator surface is the one carrying kill; the same flag says
+    // whose word to take about parentage when a call arrives without an
+    // identity, so it is threaded into spawn under its real meaning.
+    let spawn = spawn_tool(ledger.clone(), max_depth, include_kill);
 
     let send = {
         let ledger = ledger.clone();
@@ -539,5 +612,230 @@ pub fn router_with_limits(
         router.tool(kill)
     } else {
         router
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::identity::AgentIdentity;
+    use std::sync::Arc;
+    use tower_mcp::context::{Extensions, RequestContext};
+    use tower_mcp::protocol::RequestId;
+
+    async fn ledger() -> Ledger {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        Ledger::setup(pool).await.expect("ledger")
+    }
+
+    fn ctx_as(agent_id: Option<&str>) -> RequestContext {
+        let mut ext = Extensions::new();
+        if let Some(id) = agent_id {
+            ext.insert(AgentIdentity(id.to_string()));
+        }
+        RequestContext::new(RequestId::Number(1)).with_extensions(Arc::new(ext))
+    }
+
+    fn structured(result: &CallToolResult) -> serde_json::Value {
+        serde_json::to_value(result)
+            .ok()
+            .and_then(|v| v.get("structuredContent").cloned())
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    fn rendered(result: &CallToolResult) -> String {
+        serde_json::to_string(result).unwrap_or_default()
+    }
+
+    /// The hole this closes: an authenticated caller claimed to be
+    /// someone else, and the claim used to be believed. Lineage drives
+    /// the cost rollup and the depth cap, so the claim was load-bearing.
+    #[tokio::test]
+    async fn an_authenticated_caller_cannot_claim_another_parent() {
+        let l = ledger().await;
+        let real = l
+            .create_agent(&AgentDef::new("real-parent", "s"), None)
+            .await
+            .expect("parent");
+        let spawn = spawn_tool(l.clone(), 3, false);
+        let out = spawn
+            .call_with_context(
+                ctx_as(Some(&real)),
+                serde_json::json!({
+                    "name": "child",
+                    "system_prompt": "s",
+                    "spawned_by": "someone-else-entirely"
+                }),
+            )
+            .await;
+        let child_id = structured(&out)["agent_id"]
+            .as_str()
+            .expect("agent_id")
+            .to_string();
+        let child = l.get_agent(&child_id).await.expect("get").expect("row");
+        assert_eq!(
+            child.spawned_by.as_deref(),
+            Some(real.as_str()),
+            "identity must beat the claimed parent"
+        );
+    }
+
+    /// Anonymous on the agent surface: the claim is discarded, and the
+    /// child is a visible orphan rather than a forged descendant.
+    #[tokio::test]
+    async fn an_anonymous_agent_surface_caller_gets_no_parentage() {
+        let l = ledger().await;
+        let spawn = spawn_tool(l.clone(), 3, false);
+        let out = spawn
+            .call_with_context(
+                ctx_as(None),
+                serde_json::json!({
+                    "name": "child",
+                    "system_prompt": "s",
+                    "spawned_by": "invented"
+                }),
+            )
+            .await;
+        let child_id = structured(&out)["agent_id"]
+            .as_str()
+            .expect("agent_id")
+            .to_string();
+        let child = l.get_agent(&child_id).await.expect("get").expect("row");
+        assert_eq!(child.spawned_by, None, "anonymous callers claim nothing");
+    }
+
+    /// The operator's terminal has no identity to check and stays
+    /// trusted; drivers and boot-applied config attribute this way.
+    #[tokio::test]
+    async fn the_operator_surface_still_takes_the_claim() {
+        let l = ledger().await;
+        let parent = l
+            .create_agent(&AgentDef::new("p", "s"), None)
+            .await
+            .expect("parent");
+        let spawn = spawn_tool(l.clone(), 3, true);
+        let out = spawn
+            .call_with_context(
+                ctx_as(None),
+                serde_json::json!({
+                    "name": "child",
+                    "system_prompt": "s",
+                    "spawned_by": parent
+                }),
+            )
+            .await;
+        let child_id = structured(&out)["agent_id"]
+            .as_str()
+            .expect("agent_id")
+            .to_string();
+        let child = l.get_agent(&child_id).await.expect("get").expect("row");
+        assert_eq!(child.spawned_by.as_deref(), Some(parent.as_str()));
+    }
+
+    /// The ceiling: a child's tools are at most its parent's, and what
+    /// was refused is named rather than silently dropped.
+    #[tokio::test]
+    async fn a_child_cannot_out_reach_its_parent() {
+        let l = ledger().await;
+        let parent = l
+            .create_agent(
+                &AgentDef::new("p", "s").allowed_tools(["Read".to_string(), "Grep".to_string()]),
+                None,
+            )
+            .await
+            .expect("parent");
+        let spawn = spawn_tool(l.clone(), 3, false);
+        let out = spawn
+            .call_with_context(
+                ctx_as(Some(&parent)),
+                serde_json::json!({
+                    "name": "child",
+                    "system_prompt": "s",
+                    "allowed_tools": ["Read", "Bash(rm:*)"]
+                }),
+            )
+            .await;
+        let sc = structured(&out);
+        let child_id = sc["agent_id"].as_str().expect("agent_id");
+        assert_eq!(
+            sc["tools_denied"].as_array().map(|a| a.len()),
+            Some(1),
+            "the refused tool is reported: {sc}"
+        );
+        let child = l.get_agent(child_id).await.expect("get").expect("row");
+        assert_eq!(child.def.allowed_tools, vec!["Read".to_string()]);
+    }
+
+    /// An authenticated caller does not pick its child's MCP config.
+    /// The operator config path is guessable, and this is the door it
+    /// would walk through.
+    #[tokio::test]
+    async fn an_authenticated_caller_cannot_choose_the_childs_mcp_config() {
+        let l = ledger().await;
+        let parent = l
+            .create_agent(&AgentDef::new("p", "s"), None)
+            .await
+            .expect("parent");
+        let spawn = spawn_tool(l.clone(), 3, false);
+        let out = spawn
+            .call_with_context(
+                ctx_as(Some(&parent)),
+                serde_json::json!({
+                    "name": "child",
+                    "system_prompt": "s",
+                    "mcp_config": "/tmp/ciacola-mcp-operator.json"
+                }),
+            )
+            .await;
+        assert!(
+            rendered(&out).contains("does not choose"),
+            "must refuse: {}",
+            rendered(&out)
+        );
+    }
+
+    /// An agent never mints a supervisor, even through a role that
+    /// carries one.
+    #[tokio::test]
+    async fn an_agent_cannot_spawn_an_operator_surface_role() {
+        let l = ledger().await;
+        let parent = l
+            .create_agent(&AgentDef::new("p", "s"), None)
+            .await
+            .expect("parent");
+        let role = crate::roles::Role {
+            name: "boss".into(),
+            description: "d".into(),
+            model: None,
+            effort: None,
+            hermetic: None,
+            working_dir: None,
+            allowed_tools: Vec::new(),
+            max_turns: None,
+            rotate_after_turns: None,
+            loopback: true,
+            surface: Some("operator".into()),
+            arguments: Vec::new(),
+            system_prompt: "s".into(),
+        };
+        let roles = crate::roles::Roles::new(vec![role], "agent.json");
+        let tools = crate::roles::tools_with_depth(roles, l.clone(), 3, false);
+        let spawn_role = tools
+            .iter()
+            .find(|t| t.definition().name == "spawn_role")
+            .expect("spawn_role");
+        let out = spawn_role
+            .call_with_context(
+                ctx_as(Some(&parent)),
+                serde_json::json!({"role": "boss", "arguments": {}}),
+            )
+            .await;
+        assert!(
+            rendered(&out).contains("may not spawn it"),
+            "must refuse: {}",
+            rendered(&out)
+        );
     }
 }

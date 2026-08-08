@@ -52,6 +52,7 @@ pub mod agent;
 pub mod complete;
 pub mod exec;
 pub mod health;
+pub mod identity;
 pub mod ledger;
 pub mod limits;
 pub mod notify;
@@ -67,6 +68,7 @@ pub mod time;
 
 pub use agent::{Agent, AgentDef, Exchange, FlatError, Turn, prompt, run_exchange};
 pub use exec::{HandExecutor, TurnExecutor, run_turn};
+pub use identity::{AgentIdentity, TOKEN_HEADER};
 pub use ledger::{AgentRow, Ledger, TurnRow};
 pub use limits::Limits;
 pub use notify::Notifier;

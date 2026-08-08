@@ -30,6 +30,7 @@ use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tower_mcp::extract::{Context, Json, State};
 use tower_mcp::{
     CallToolResult, GetPromptResult, Prompt, PromptArgument, PromptBuilder, Tool, ToolBuilder,
 };
@@ -323,10 +324,15 @@ struct SpawnRoleArgs {
 /// `spawn_role` and `roles`. Both surfaces: an orchestrator provisions
 /// from the catalog rather than inventing a system prompt.
 pub fn tools(roles: Roles, ledger: Ledger) -> Vec<Tool> {
-    tools_with_depth(roles, ledger, crate::limits::DEFAULT_MAX_SPAWN_DEPTH)
+    tools_with_depth(roles, ledger, crate::limits::DEFAULT_MAX_SPAWN_DEPTH, true)
 }
 
-pub fn tools_with_depth(roles: Roles, ledger: Ledger, max_depth: i64) -> Vec<Tool> {
+pub fn tools_with_depth(
+    roles: Roles,
+    ledger: Ledger,
+    max_depth: i64,
+    operator_surface: bool,
+) -> Vec<Tool> {
     let spawn_role = {
         let roles = roles.clone();
         ToolBuilder::new("spawn_role")
@@ -337,16 +343,40 @@ pub fn tools_with_depth(roles: Roles, ledger: Ledger, max_depth: i64) -> Vec<Too
                  is known to need.",
             )
             .non_destructive()
-            .handler(move |args: SpawnRoleArgs| {
-                let roles = roles.clone();
-                let ledger = ledger.clone();
-                async move {
+            .extractor_handler(
+                (roles.clone(), ledger.clone()),
+                move |State((roles, ledger)): State<(Roles, Ledger)>,
+                      ctx: Context,
+                      Json(args): Json<SpawnRoleArgs>| async move {
+                    // Same policy as spawn: derived beats claimed, the
+                    // operator's terminal is trusted, an anonymous
+                    // caller on the agent surface claims nothing.
+                    let caller = ctx
+                        .extension::<crate::identity::AgentIdentity>()
+                        .map(|i| i.0.clone());
+                    let spawned_by = match (&caller, operator_surface) {
+                        (Some(id), _) => Some(id.clone()),
+                        (None, true) => args.spawned_by.clone(),
+                        (None, false) => None,
+                    };
                     let Some(role) = roles.get(&args.role) else {
                         return Ok(CallToolResult::error(format!(
                             "no role '{}'; see the roles tool",
                             args.role
                         )));
                     };
+                    // An agent never mints a supervisor. The operator
+                    // surface is granted by a person at the terminal;
+                    // letting any authenticated caller instantiate a
+                    // role that carries it would make every agent one
+                    // spawn away from kill and open_pr.
+                    if caller.is_some() && role.surface.as_deref() == Some("operator") {
+                        return Ok(CallToolResult::error(format!(
+                            "role '{}' carries the operator surface, and agents may \
+                             not spawn it; ask the operator",
+                            role.name
+                        )));
+                    }
                     let missing: Vec<&String> = role
                         .arguments
                         .iter()
@@ -359,7 +389,7 @@ pub fn tools_with_depth(roles: Roles, ledger: Ledger, max_depth: i64) -> Vec<Too
                         )));
                     }
                     if let Some(reason) =
-                        crate::server::depth_refusal(&ledger, args.spawned_by.as_deref(), max_depth)
+                        crate::server::depth_refusal(&ledger, spawned_by.as_deref(), max_depth)
                             .await
                     {
                         return Ok(CallToolResult::error(reason));
@@ -374,7 +404,7 @@ pub fn tools_with_depth(roles: Roles, ledger: Ledger, max_depth: i64) -> Vec<Too
                     if let Some(effort) = args.effort {
                         def.effort = Some(effort);
                     }
-                    match ledger.create_agent(&def, args.spawned_by.as_deref()).await {
+                    match ledger.create_agent(&def, spawned_by.as_deref()).await {
                         Ok(agent_id) => {
                             // The role's prompt may mention its own id;
                             // fill it in now that one exists.
@@ -388,8 +418,8 @@ pub fn tools_with_depth(roles: Roles, ledger: Ledger, max_depth: i64) -> Vec<Too
                         }
                         Err(e) => Ok(CallToolResult::error(e.to_string())),
                     }
-                }
-            })
+                },
+            )
             .build()
     };
 
@@ -494,11 +524,14 @@ impl Plugin for RolesPlugin {
         })
     }
 
-    fn tools(&self, _surface: Surface) -> Vec<Tool> {
+    fn tools(&self, surface: Surface) -> Vec<Tool> {
         match (&self.roles, &self.ledger) {
-            (Some(roles), Some(ledger)) => {
-                tools_with_depth(roles.clone(), ledger.clone(), self.max_depth)
-            }
+            (Some(roles), Some(ledger)) => tools_with_depth(
+                roles.clone(),
+                ledger.clone(),
+                self.max_depth,
+                surface == Surface::Operator,
+            ),
             _ => Vec::new(),
         }
     }
