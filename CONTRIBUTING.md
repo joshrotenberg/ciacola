@@ -21,13 +21,14 @@ server speaks on stdout. That default uses an empty configuration when
 `ciacola.toml` is absent and a temporary ledger; use the durable launch
 in `README.md` for anything beyond a smoke test.
 
-## The three siblings
+## The four siblings
 
-ciacola depends on three crates of its own, pinned to git revisions:
+ciacola depends on four crates of its own, pinned to git revisions:
 
 ```toml
 tower-mcp      = { git = "...", rev = "..." }   # the MCP layer
-claude-wrapper = { git = "...", rev = "..." }   # the provider
+claude-wrapper = { git = "...", rev = "..." }   # Claude provider CLI
+codex-wrapper  = { git = "...", rev = "..." }   # Codex provider CLI
 git-spawn      = { git = "...", rev = "..." }   # git, without shelling out
 ```
 
@@ -35,7 +36,7 @@ Revisions rather than published versions because ciacola uses things
 that are not released yet: `QueryResult::usage`, which is how a turn
 gets its token counts, is one of twenty commits sitting past
 claude-wrapper v0.13.5. These become version requirements once the
-three settle enough to release.
+four settle enough to release.
 
 Revisions rather than branches because the build has to be
 reproducible. Agents build this repository in their own clones, and a
@@ -47,7 +48,7 @@ target.
 If you have the checkouts next to this one:
 
 ```sh
-just link      # patch the three to ../tower-mcp, ../claude-wrapper, ../git-spawn
+just link      # patch all four to their sibling checkouts
 just unlink    # back to the pinned revs
 ```
 
@@ -59,7 +60,7 @@ lane exists for the same reason, and `just drift` runs it locally.
 
 **Run `just unlink` before committing a lockfile.** The config is
 gitignored; what it produces is not. Building while linked rewrites the
-three entries in `Cargo.lock` to local paths, by dropping their `source`
+four entries in `Cargo.lock` to local paths, by dropping their `source`
 line entirely, and a lockfile in that state builds on exactly one
 machine. `unlink` repairs it. This has already broken CI once.
 
@@ -86,9 +87,9 @@ that needs it.
 
 ## Tests
 
-CI-safe only. Never a live agent CLI: use the scripted provider and
-real temporary sqlite files. A test that needs Claude is a manual smoke
-test and does not belong in the suite.
+CI-safe only. Never a live agent CLI: use the scripted providers and
+real temporary sqlite files. A test that needs Claude or Codex is a
+manual smoke test and does not belong in the suite.
 
 ## Where the line falls
 
