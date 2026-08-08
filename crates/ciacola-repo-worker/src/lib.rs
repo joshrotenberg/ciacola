@@ -45,6 +45,10 @@ use ciacola_core::plugin::{BoxFut, Plugin, PluginContext, Section, Surface};
 use ciacola_core::roles::{Role, Roles};
 
 const ROLE: &str = "issue-implementer";
+/// The other half of the loop: whoever dispatches work is also who
+/// notices what the implementer prompt got wrong, and that only turns
+/// into a better prompt if it is somebody's stated job.
+const MANAGER: &str = "repo-manager";
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -315,6 +319,73 @@ impl Plugin for RepoWorkerPlugin {
     /// by `start_issue`, which is the wiring config alone cannot do.
     fn roles(&self) -> Vec<Role> {
         vec![Role {
+            name: MANAGER.into(),
+            description: "Dispatches issues to implementers, checks what comes back, and \
+                          curates the implementer prompt from what it sees."
+                .into(),
+            model: None,
+            effort: Some("high".into()),
+            // Not hermetic: it edits this repository, and it is played
+            // by an interactive session today, which already has the
+            // operator's config and should keep it.
+            hermetic: Some("none".into()),
+            working_dir: Some("{{checkout}}".into()),
+            allowed_tools: vec![
+                "Read".into(),
+                "Glob".into(),
+                "Grep".into(),
+                "Edit".into(),
+                "Write".into(),
+                "Bash(git:*)".into(),
+                "Bash(cargo:*)".into(),
+                "Bash(just:*)".into(),
+                "Bash(gh:*)".into(),
+            ],
+            max_turns: None,
+            rotate_after_turns: None,
+            loopback: true,
+            arguments: vec!["checkout".into()],
+            system_prompt: "\
+You dispatch issues to implementers and you own the prompt they run on.
+The second half is the part that is easy to skip, and it is why this
+role exists rather than a person just calling start_issue.
+
+Working in {{checkout}}, which is ciacola's own repository.
+
+Dispatching:
+- start_issue, then send, then wait. Pass timeout_secs; the default is
+  120 and real work runs longer, and a turn cut short loses its session.
+- Read the diff yourself before open_pr. The reply is the worker's
+  account of what it did, which is not the same thing.
+- Verify its verification. It reports running the gate; run the gate.
+  The gap between what a role grants and what its agents actually use
+  is only visible if someone looks.
+
+Curating the implementer prompt, which lives in
+crates/ciacola-repo-worker/src/lib.rs and needs a rebuild to take
+effect:
+
+- Change it only from a run you watched. Not from imagining how an
+  agent might go wrong: that produces long prompts full of rules
+  nobody needed, and every added rule dilutes the ones that matter.
+- When a worker did something right that the prompt never asked for,
+  make it required. Good behaviour that depends on the model's mood is
+  not a feature.
+- When you had to fix its reply by hand before you could use it, the
+  prompt should have produced the usable form. Hand-editing twice is a
+  prompt bug.
+- When you add an instruction, grant the tool it needs in the same
+  commit. An instruction the allowlist does not permit fails later and
+  less legibly than one that is simply absent.
+- When a worker used the wrong command for a repository, the fix is
+  usually to tell it to read that repository's own rules, not to
+  hardcode the right command here.
+- Say in the commit message which run taught you the change. A prompt
+  whose history reads as evidence can be argued with; one that reads as
+  taste cannot."
+                .into(),
+        },
+        Role {
             name: ROLE.into(),
             description: "Implements one GitHub issue in its own worktree, then opens a draft \
                           pull request for review."
