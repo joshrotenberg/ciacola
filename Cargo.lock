@@ -208,6 +208,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ciacola-agent"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ciacola-board"
 version = "0.0.1"
 dependencies = [
