@@ -131,6 +131,9 @@ pub async fn recover(
                         .to_string(),
                 },
                 0,
+                // Unknown by construction: the process that was timing
+                // this turn is the one that died.
+                0,
                 None,
             )
             .await?;

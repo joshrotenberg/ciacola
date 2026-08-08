@@ -72,9 +72,21 @@ pub async fn run_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str, seq: i
 /// nothing can be left `running` by anything short of a crash.
 #[tracing::instrument(skip_all, fields(agent = %agent_id, seq, outcome = tracing::field::Empty))]
 pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str, seq: i64) {
-    let fail = |state: &'static str, error: String, cost: i64, session: Option<String>| async move {
+    let fail = |state: &'static str,
+                error: String,
+                cost: i64,
+                elapsed_ms: u64,
+                session: Option<String>| async move {
         if let Err(e) = ledger
-            .fail_turn(agent_id, seq, state, &error, cost, session.as_deref())
+            .fail_turn(
+                agent_id,
+                seq,
+                state,
+                &error,
+                cost,
+                elapsed_ms as i64,
+                session.as_deref(),
+            )
             .await
         {
             eprintln!("[exec] record failure {agent_id}/{seq}: {e}");
@@ -85,9 +97,10 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
 
     let (def, session, started, prompt) = match load(ledger, agent_id, seq).await {
         Ok(loaded) => loaded,
-        Err(e) => return fail("failed", e.to_string(), 0, None).await,
+        Err(e) => return fail("failed", e.to_string(), 0, 0, None).await,
     };
 
+    let wall = std::time::Instant::now();
     match run_exchange(&def, session.as_deref(), started, &prompt).await {
         Ok(exchange) => {
             if let Some(error) = &exchange.error {
@@ -98,6 +111,7 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
                     "failed",
                     error.clone(),
                     exchange.cost_micro_usd as i64,
+                    exchange.elapsed_ms,
                     session,
                 )
                 .await;
@@ -119,13 +133,23 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
                         "failed",
                         format!("exchange succeeded but recording failed: {e}"),
                         exchange.cost_micro_usd as i64,
+                        exchange.elapsed_ms,
                         Some(exchange.session.clone()),
                     )
                     .await;
                 }
             }
         }
-        Err(e) => fail("failed", e.to_string(), 0, None).await,
+        Err(e) => {
+            fail(
+                "failed",
+                e.to_string(),
+                0,
+                wall.elapsed().as_millis() as u64,
+                None,
+            )
+            .await
+        }
     }
 }
 

@@ -416,7 +416,13 @@ pub async fn run_exchange(
     }
 
     let started = std::time::Instant::now();
-    let result = command.execute_json(&claude).await?;
+    let result = match command.execute_json(&claude).await {
+        Ok(result) => result,
+        Err(e) => match capped(&e, started.elapsed().as_millis() as u64) {
+            Some(exchange) => return Ok(exchange),
+            None => return Err(e.into()),
+        },
+    };
 
     let usage = result.usage.unwrap_or_default();
     let span = tracing::Span::current();
@@ -457,6 +463,53 @@ pub async fn run_exchange(
     })
 }
 
+/// A run that hit a ceiling we set, rendered as the exchange it was.
+///
+/// The provider ran, at length, and stopped at a cap. That is not the
+/// same as failing to run, and the difference is worth real money: the
+/// wrapper keeps `cost_usd` and `session_id` off the terminal result
+/// event, and stringifying the error throws both away. A five minute
+/// run then lands in the ledger as costing nothing, which is invisible
+/// to the spend limit and to anything reading the board.
+///
+/// Returning an `Exchange` with `error` set routes it through the path
+/// that already records spend for a run that errored, rather than
+/// adding a second one. Both variants are `#[non_exhaustive]`, hence
+/// the `..`.
+fn capped(e: &claude_wrapper::Error, elapsed_ms: u64) -> Option<Exchange> {
+    let (cost_usd, num_turns, session_id) = match e {
+        claude_wrapper::Error::MaxTurnsExceeded {
+            cost_usd,
+            num_turns,
+            session_id,
+            ..
+        }
+        | claude_wrapper::Error::MaxBudgetExceeded {
+            cost_usd,
+            num_turns,
+            session_id,
+            ..
+        } => (*cost_usd, *num_turns, session_id.clone()),
+        _ => return None,
+    };
+    Some(Exchange {
+        error: Some(e.to_string()),
+        reply: String::new(),
+        session: session_id.unwrap_or_default(),
+        cost_micro_usd: cost_usd
+            .map(|u| (u * 1_000_000.0) as u64)
+            .unwrap_or_default(),
+        // The cap events carry no usage breakdown, so tokens stay zero
+        // rather than being invented. Cost is the number that matters
+        // here and it is real.
+        tokens_in: 0,
+        tokens_out: 0,
+        tokens_cached: 0,
+        num_turns: num_turns.unwrap_or_default(),
+        elapsed_ms,
+    })
+}
+
 /// Prompt the agent once. Resumes its session if it has one, starts the
 /// conversation if not. On success the turn is recorded on the agent and
 /// returned.
@@ -480,4 +533,72 @@ pub async fn prompt<'a>(agent: &'a mut Agent, text: &str) -> Result<&'a Turn, Fl
         elapsed_ms: exchange.elapsed_ms,
     });
     Ok(agent.turns.last().expect("just pushed"))
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    /// Built through the wrapper's own classifier rather than by naming
+    /// the variant, which is `#[non_exhaustive]` and cannot be
+    /// constructed here anyway. The upside is that this drives the real
+    /// detection path from the bytes the CLI actually emits, so it also
+    /// fails if that classification ever changes shape.
+    fn capped_error(result_json: &str) -> claude_wrapper::Error {
+        claude_wrapper::Error::from_command_failure(
+            "claude -p ...".into(),
+            1,
+            result_json.into(),
+            String::new(),
+            None,
+        )
+    }
+
+    /// The bug this exists for: a run that worked for minutes and hit
+    /// its cap was recorded as costing nothing, which is invisible to
+    /// the spend limit.
+    #[test]
+    fn a_capped_run_keeps_its_spend_and_session() {
+        let e = capped_error(
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,
+                "total_cost_usd":1.25,"num_turns":60,"session_id":"sess-1",
+                "errors":["Reached maximum number of turns (60)"]}"#,
+        );
+        let x = capped(&e, 323_000).expect("a cap is an exchange, not a failure to run");
+        assert_eq!(x.cost_micro_usd, 1_250_000, "spend must survive the cap");
+        assert_eq!(
+            x.session, "sess-1",
+            "session must survive, so it can resume"
+        );
+        assert_eq!(
+            x.elapsed_ms, 323_000,
+            "wall clock is measured here regardless"
+        );
+        assert!(
+            x.error.is_some(),
+            "it still failed, and must read as failed"
+        );
+    }
+
+    /// Cost is reported only when the result event carried it. Absent
+    /// means zero, not a panic and not an invented number.
+    #[test]
+    fn a_capped_run_without_a_reported_cost_is_zero() {
+        let e = capped_error(
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,
+                "errors":["Reached maximum number of turns (60)"]}"#,
+        );
+        let x = capped(&e, 10).expect("still an exchange");
+        assert_eq!(x.cost_micro_usd, 0);
+        assert!(x.error.is_some());
+    }
+
+    /// Everything else is still a failure to run and must keep
+    /// propagating, or a real error would be quietly downgraded into an
+    /// empty exchange that looks like it merely errored.
+    #[test]
+    fn an_ordinary_failure_is_not_treated_as_an_exchange() {
+        let e = capped_error("command not found");
+        assert!(capped(&e, 10).is_none());
+    }
 }
