@@ -13,6 +13,9 @@ use crate::agent::{Agent, AgentDef, FlatError, Turn, prompt};
 #[derive(Clone, Default)]
 pub struct Registry {
     inner: Arc<Mutex<Inner>>,
+    /// The backends available to this registry's turns. Empty by
+    /// default, which fails a turn by name rather than silently.
+    providers: ciacola_agent::ProviderRegistry,
 }
 
 #[derive(Default)]
@@ -41,6 +44,12 @@ impl Drop for BusyGuard {
 impl Registry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach the backends turns run on.
+    pub fn with_providers(mut self, providers: ciacola_agent::ProviderRegistry) -> Self {
+        self.providers = providers;
+        self
     }
 
     /// Define an agent. It exists from here on, whether or not it ever
@@ -93,7 +102,7 @@ impl Registry {
             )
         };
 
-        let turn = prompt(&mut agent, text).await?.clone();
+        let turn = prompt(&self.providers, &mut agent, text).await?.clone();
 
         let mut inner = self.inner.lock().expect("registry lock");
         inner.agents.insert(id.to_string(), agent);

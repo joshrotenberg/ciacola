@@ -30,6 +30,8 @@ struct SpawnArgs {
     name: String,
     /// The agent's standing knowledge: who it is, what good looks like.
     system_prompt: String,
+    /// Backend key. Omit for Claude.
+    provider: Option<String>,
     /// Provider model, e.g. "haiku". Omit for the provider default.
     model: Option<String>,
     /// Tool names the agent may use. Omit for none.
@@ -143,6 +145,7 @@ fn agent_json(agent: &AgentRow) -> serde_json::Value {
     json!({
         "agent_id": agent.agent_id,
         "name": agent.name,
+        "provider": agent.def.provider,
         "model": agent.def.model,
         "effort": agent.def.effort,
         "state": agent.state,
@@ -162,8 +165,12 @@ fn turn_json(turn: &TurnRow) -> serde_json::Value {
         "reply": turn.reply,
         "error": turn.error,
         "cost_usd": turn.cost_micro_usd as f64 / 1e6,
+        "cost_state": turn.cost_state,
         "tokens_in": turn.tokens_in,
         "tokens_out": turn.tokens_out,
+        "tokens_cached": turn.tokens_cached,
+        "usage_state": turn.usage_state,
+        "provider_turns": turn.provider_turns,
         "elapsed_ms": turn.elapsed_ms,
     })
 }
@@ -246,6 +253,9 @@ fn spawn_tool(ledger: Ledger, max_depth: i64, operator_surface: bool) -> tower_m
                     };
 
                     let mut def = AgentDef::new(args.name, args.system_prompt);
+                    if let Some(provider) = args.provider {
+                        def = def.provider(provider);
+                    }
                     if let Some(model) = args.model {
                         def = def.model(model);
                     }
@@ -709,6 +719,7 @@ mod identity_tests {
                 serde_json::json!({
                     "name": "child",
                     "system_prompt": "s",
+                    "provider": "codex",
                     "spawned_by": parent
                 }),
             )
@@ -719,6 +730,7 @@ mod identity_tests {
             .to_string();
         let child = l.get_agent(&child_id).await.expect("get").expect("row");
         assert_eq!(child.spawned_by.as_deref(), Some(parent.as_str()));
+        assert_eq!(child.def.provider.as_str(), "codex");
     }
 
     /// The ceiling: a child's tools are at most its parent's, and what
@@ -795,6 +807,7 @@ mod identity_tests {
         let role = crate::roles::Role {
             name: "boss".into(),
             description: "d".into(),
+            provider: None,
             model: None,
             effort: None,
             hermetic: None,
@@ -839,6 +852,7 @@ mod identity_tests {
         let role = crate::roles::Role {
             name: "writer".into(),
             description: "d".into(),
+            provider: None,
             model: None,
             effort: None,
             hermetic: None,
@@ -878,6 +892,7 @@ mod identity_tests {
         let role = crate::roles::Role {
             name: "boss".into(),
             description: "d".into(),
+            provider: None,
             model: None,
             effort: None,
             hermetic: None,

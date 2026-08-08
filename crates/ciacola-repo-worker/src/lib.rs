@@ -391,6 +391,7 @@ impl Plugin for RepoWorkerPlugin {
                 description: "Dispatches issues to implementers, checks what comes back, and \
                           curates the implementer prompt from what it sees."
                     .into(),
+                provider: None,
                 model: None,
                 effort: Some("high".into()),
                 // Not hermetic: it edits this repository, and it is played
@@ -477,6 +478,7 @@ effect:
                 description: "Implements one GitHub issue in its own worktree, then opens a draft \
                           pull request for review."
                     .into(),
+                provider: None,
                 model: Some("sonnet".into()),
                 effort: Some("high".into()),
                 hermetic: Some("full".into()),

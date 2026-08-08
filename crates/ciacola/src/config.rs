@@ -61,6 +61,8 @@ impl Default for Config {
 #[serde(deny_unknown_fields)]
 pub struct ConfigAgent {
     pub name: String,
+    /// Backend key. Omit for Claude.
+    pub provider: Option<String>,
     /// Instantiate this role instead of spelling out a definition. The
     /// fields below still override what the role provides.
     pub role: Option<String>,
@@ -165,6 +167,9 @@ fn role_definition(
             AgentDef::new(&declared.name, &declared.system_prompt)
         }
     };
+    if let Some(provider) = &declared.provider {
+        def = def.provider(provider.as_str());
+    }
     if let Some(model) = &declared.model {
         def = def.model(model);
     }
@@ -294,6 +299,7 @@ mod tests {
                 [[agents]]
                 name = "repo-manager"
                 role = "manager"
+                provider = "codex"
                 arguments = { checkout = "/tmp/repo" }
             "#,
         )
@@ -316,6 +322,7 @@ mod tests {
         let def =
             role_definition(&config, &config.agents[0], &roles, "agent.json").expect("definition");
         assert_eq!(def.name, "repo-manager");
+        assert_eq!(def.provider.as_str(), "codex");
         assert_eq!(def.system_prompt, "Manage /tmp/repo");
         assert_eq!(
             def.working_dir.as_deref(),

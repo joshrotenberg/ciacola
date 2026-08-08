@@ -186,6 +186,8 @@ name = "ciacola"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "ciacola-agent",
+ "ciacola-agent-claude",
  "ciacola-board",
  "ciacola-core",
  "ciacola-findings",
@@ -205,6 +207,26 @@ dependencies = [
  "tower-mcp",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ciacola-agent"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "ciacola-agent-claude"
+version = "0.0.1"
+dependencies = [
+ "ciacola-agent",
+ "claude-wrapper",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -230,7 +252,7 @@ name = "ciacola-core"
 version = "0.0.1"
 dependencies = [
  "axum",
- "claude-wrapper",
+ "ciacola-agent",
  "schemars",
  "serde",
  "serde_json",
@@ -353,6 +375,7 @@ dependencies = [
 name = "ciacola-tuning"
 version = "0.0.1"
 dependencies = [
+ "ciacola-agent",
  "ciacola-core",
  "schemars",
  "serde",

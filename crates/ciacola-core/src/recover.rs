@@ -41,9 +41,19 @@ pub struct RecoveryReport {
 /// Find provider processes whose argv carries this turn's prompt and
 /// kill them. Substring match over `ps`, not a regex, so arbitrary
 /// prompt text cannot break it.
+///
+/// Which lines belong to a provider is the *backend's* question now.
+/// This used to look for the literal string `claude`, the last piece of
+/// Claude knowledge left in core, and it would have been wrong for the
+/// second backend on the day it arrived. The safety rules stay here,
+/// where they always were: the needle comes from the first line of the
+/// prompt only, anything too short to identify a process is refused
+/// rather than guessed at, and a scan that cannot be run is reported
+/// rather than assumed clean.
+///
 /// Returns (killed, searched): searched=false means the scan could not
 /// be attempted and the orphan's fate is unknown.
-fn kill_orphans(prompt: &str) -> (usize, bool) {
+fn kill_orphans(provider: &dyn ciacola_agent::Provider, prompt: &str) -> (usize, bool) {
     // ps renders a newline in argv as a line break, so only the first
     // line of the prompt can ever match; a needle crossing it would
     // silently match nothing (review finding).
@@ -66,7 +76,7 @@ fn kill_orphans(prompt: &str) -> (usize, bool) {
     };
     let mut killed = 0;
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if line.contains("claude") && line.contains(needle.as_str()) {
+        if provider.owns_process(line) && line.contains(needle.as_str()) {
             if let Some(pid) = line.split_whitespace().next() {
                 if std::process::Command::new("kill")
                     .args(["-9", pid])
@@ -91,19 +101,29 @@ pub async fn recover(
     let mut report = RecoveryReport::default();
 
     for turn in ledger.turns_in_state("running").await? {
-        let (killed, searched) = kill_orphans(&turn.prompt);
+        // One read, used for both questions: which backend owns this
+        // agent's processes, and whether its conversation survived.
+        let agent = ledger.get_agent(&turn.agent_id).await.ok().flatten();
+        // Assigned at creation, so this is normally true. It is false
+        // for agents that predate assignment and never completed a turn.
+        let resumable = agent.as_ref().is_some_and(|a| a.session.is_some());
+
+        // An agent whose backend this build does not have linked in
+        // cannot have its processes identified, so its orphan is
+        // reported unverified rather than assumed dead. Guessing with
+        // another backend's predicate is how a restart kills something
+        // it does not own.
+        let provider = agent
+            .as_ref()
+            .and_then(|a| ledger.providers().get(&a.def.provider).ok());
+        let (killed, searched) = match &provider {
+            Some(provider) => kill_orphans(provider.as_ref(), &turn.prompt),
+            None => (0, false),
+        };
         report.orphans_killed += killed;
         if !searched {
             report.orphans_unverified += 1;
         }
-        // Assigned at creation, so this is normally true. It is false
-        // for agents that predate assignment and never completed a turn.
-        let resumable = ledger
-            .get_agent(&turn.agent_id)
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|a| a.session.is_some());
         ledger
             .fail_turn(
                 &turn.agent_id,

@@ -115,9 +115,11 @@ async fn collect(ledger: &Ledger) -> Result<Vec<Stat>, FlatError> {
         .filter_map(|(def_json, cost, elapsed_ms, state)| {
             let def = serde_json::from_str::<ciacola_core::agent::AgentDef>(&def_json).ok()?;
             Some((
-                // Only one provider so far; the field exists so the shape
-                // survives a second one.
-                "claude".to_string(),
+                // The backend each agent actually ran on, read from its
+                // own definition. Rows written before the field existed
+                // deserialize as claude, so history keeps its bucket
+                // rather than shifting when a second provider lands.
+                def.provider.to_string(),
                 def.model.clone().unwrap_or_else(|| "(default)".into()),
                 def.effort.clone().unwrap_or_else(|| "(default)".into()),
                 def.name.clone(),
@@ -315,12 +317,16 @@ mod tests {
             seq,
             &Exchange {
                 reply: "ok".into(),
-                session: "s".into(),
-                cost_micro_usd: cost_micro_usd as u64,
-                tokens_in: 1,
-                tokens_out: 1,
-                tokens_cached: 0,
-                num_turns: 1,
+                session: Some("s".into()),
+                cost: ciacola_agent::Cost::Reported {
+                    micro_usd: cost_micro_usd as u64,
+                },
+                usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage {
+                    input: 1,
+                    output: 1,
+                    cached_input: 0,
+                }),
+                provider_turns: Some(1),
                 elapsed_ms: elapsed_ms as u64,
                 error: None,
             },

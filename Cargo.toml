@@ -11,6 +11,14 @@ repository = "https://github.com/joshrotenberg/ciacola"
 authors = ["Josh Rotenberg <joshrotenberg@gmail.com>"]
 
 [workspace.dependencies]
+# The provider boundary, and everything that nothing works without.
+# `ciacola-agent` depends on no wrapper and on no other crate here,
+# which is the property that makes it a boundary rather than a layer.
+# `ciacola-agent-claude` is the first adapter against it, preserving
+# today's live Claude behavior; `ciacola-core` does not depend on it,
+# and never should -- the binary wires adapters to the registry.
+ciacola-agent = { path = "crates/ciacola-agent" }
+ciacola-agent-claude = { path = "crates/ciacola-agent-claude" }
 ciacola-core = { path = "crates/ciacola-core" }
 
 # Ours. Git revs rather than path deps, so this builds anywhere: in CI,

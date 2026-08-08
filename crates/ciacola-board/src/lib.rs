@@ -160,7 +160,7 @@ async fn overview_body(state: &BoardState) -> String {
     }
 
     body.push_str(
-        "<h2>agents</h2><table><tr><th>name</th><th>state</th>\
+        "<h2>agents</h2><table><tr><th>name</th><th>state</th><th>provider</th>\
         <th class=\"num\">turns</th><th class=\"num\">cost</th><th>last active</th>\
         <th>session</th></tr>",
     );
@@ -168,7 +168,7 @@ async fn overview_body(state: &BoardState) -> String {
     let row_html = |agent: &ciacola_core::ledger::AgentRow, child: bool| {
         format!(
             "<tr><td>{indent}<a href=\"/board/agent/{id}\">{name}</a> <span class=\"dim mono\">{short}</span></td>\
-             <td>{chip}</td><td class=\"num\">{turns}</td><td class=\"num\">{cost}</td>\
+             <td>{chip}</td><td class=\"dim\">{provider}</td><td class=\"num\">{turns}</td><td class=\"num\">{cost}</td>\
              <td class=\"dim\">{active}</td><td class=\"dim mono\">{session}</td></tr>",
             indent = if child {
                 "<span class=\"dim\">&nbsp;&nbsp;&#8627;&nbsp;</span>"
@@ -179,6 +179,7 @@ async fn overview_body(state: &BoardState) -> String {
             name = esc(&agent.name),
             short = esc(&agent.agent_id[agent.agent_id.len().saturating_sub(6)..]),
             chip = chip(&agent.state),
+            provider = esc(agent.def.provider.as_str()),
             turns = agent.turns,
             cost = usd(agent.cost_micro_usd),
             active = ago(agent.last_active_unix),

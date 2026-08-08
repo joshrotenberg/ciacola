@@ -36,6 +36,10 @@ const MIN_PRUNE_DAYS: i64 = 1;
 pub struct Health {
     pool: SqlitePool,
     db_path: String,
+    /// The backends this build was assembled with. Reported so an
+    /// operator can see what a `provider` key on an agent will actually
+    /// resolve to, rather than discovering it on the first failed turn.
+    providers: Vec<String>,
     /// Set after the host exists, so health can ask every plugin for
     /// its own slice instead of knowing their tables. Before this,
     /// prune deleted from `work_items` and `findings` directly.
@@ -47,12 +51,19 @@ impl Health {
         Self {
             pool,
             db_path: db_path.into(),
+            providers: Vec::new(),
             host: None,
         }
     }
 
     pub fn with_host(mut self, host: Arc<PluginHost>) -> Self {
         self.host = Some(host);
+        self
+    }
+
+    /// Report which backends are registered.
+    pub fn with_providers(mut self, providers: &ciacola_agent::ProviderRegistry) -> Self {
+        self.providers = providers.keys();
         self
     }
 
@@ -108,6 +119,7 @@ impl Health {
         };
         json!({
             "db_bytes": self.db_bytes(),
+            "providers": self.providers,
             "plugins": plugins,
             "agents_active": self.count("SELECT COUNT(*) FROM agents WHERE retired = 0").await,
             "agents_retired": self.count("SELECT COUNT(*) FROM agents WHERE retired = 1").await,
