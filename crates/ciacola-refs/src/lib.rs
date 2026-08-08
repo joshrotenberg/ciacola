@@ -284,3 +284,181 @@ impl Plugin for RefsPlugin {
     // Deliberately no prune: a reference is a pointer someone chose to
     // keep, and age is not evidence it stopped mattering.
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::SqlitePool;
+
+    /// `plugin_kv` is core's table, applied by `PluginHost::setup`
+    /// before any plugin runs. Duplicated here rather than dragged in
+    /// through a full `PluginContext`, the same shortcut `Memory::setup`
+    /// and `Findings::setup` take for their own tables in their tests.
+    async fn kv_pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.expect("pool");
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS plugin_kv (
+                 plugin TEXT NOT NULL,
+                 key TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 updated_unix INTEGER NOT NULL,
+                 PRIMARY KEY (plugin, key));",
+        )
+        .execute(&pool)
+        .await
+        .expect("create plugin_kv");
+        pool
+    }
+
+    fn refs_plugin(pool: SqlitePool) -> RefsPlugin {
+        RefsPlugin {
+            store: Some(Store::new(pool, "refs")),
+        }
+    }
+
+    fn find<'a>(tools: &'a [Tool], name: &str) -> &'a Tool {
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("tool '{name}' registered"))
+    }
+
+    fn some_reference() -> Reference {
+        Reference {
+            name: "spec".into(),
+            url: "https://elsewhere.example/spec".into(),
+            note: None,
+            tags: vec![],
+            author: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_saved_ref_is_invisible_to_another_plugins_store() {
+        let pool = kv_pool().await;
+        let refs = refs_plugin(pool.clone());
+        let tools = refs.tools(Surface::Operator);
+        let save = find(&tools, "save_ref");
+
+        let result = save
+            .call(json!({"name": "spec", "url": "https://example.com/spec"}))
+            .await;
+        assert!(!result.is_error, "{result:?}");
+
+        // Same table, a different plugin's namespace: the key format is
+        // shared, so only the plugin scope keeps it from leaking.
+        let other = Store::new(pool, "other-plugin");
+        assert!(
+            other
+                .list::<Reference>(Some(KEY_PREFIX))
+                .await
+                .expect("list")
+                .is_empty(),
+            "a ref saved by 'refs' must not be visible under another plugin's Store"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_written_by_another_plugin_does_not_surface_as_a_ref() {
+        let pool = kv_pool().await;
+        let other = Store::new(pool.clone(), "other-plugin");
+        other
+            .put(&format!("{KEY_PREFIX}spec"), &some_reference())
+            .await
+            .expect("put");
+
+        let refs = refs_plugin(pool);
+        let tools = refs.tools(Surface::Operator);
+        let list = find(&tools, "refs");
+
+        let result = list.call(json!({})).await;
+        assert!(!result.is_error, "{result:?}");
+        let value = result.as_json().expect("json").expect("valid json");
+        assert_eq!(
+            value["refs"],
+            json!([]),
+            "a key under the same name but a different plugin's Store must not appear"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_ref_round_trips_the_tags_array_and_replaces_on_resave() {
+        let pool = kv_pool().await;
+        let refs = refs_plugin(pool);
+        let tools = refs.tools(Surface::Operator);
+        let save = find(&tools, "save_ref");
+        let list = find(&tools, "refs");
+
+        let saved = save
+            .call(json!({
+                "name": "spec",
+                "url": "https://example.com/spec",
+                "tags": ["a", "b", "c"],
+            }))
+            .await;
+        assert!(!saved.is_error, "{saved:?}");
+
+        let got = list.call(json!({})).await;
+        let value = got.as_json().expect("json").expect("valid json");
+        assert_eq!(
+            value["refs"][0]["tags"],
+            json!(["a", "b", "c"]),
+            "the tags array's order and contents must survive the round trip"
+        );
+
+        // Save again under the same name, with a different tag list.
+        let resaved = save
+            .call(json!({
+                "name": "spec",
+                "url": "https://example.com/spec-v2",
+                "tags": ["z"],
+            }))
+            .await;
+        assert!(!resaved.is_error, "{resaved:?}");
+
+        let got = list.call(json!({})).await;
+        let value = got.as_json().expect("json").expect("valid json");
+        let all = value["refs"].as_array().expect("array");
+        assert_eq!(
+            all.len(),
+            1,
+            "save_ref under a name that already exists must replace it, not add a second entry"
+        );
+        assert_eq!(
+            all[0]["tags"],
+            json!(["z"]),
+            "the second save replaces the tag list outright; it does not merge with the first"
+        );
+        assert_eq!(all[0]["url"], "https://example.com/spec-v2");
+    }
+
+    #[tokio::test]
+    async fn forget_ref_distinguishes_absent_from_removed() {
+        let pool = kv_pool().await;
+        let refs = refs_plugin(pool);
+        let tools = refs.tools(Surface::Operator);
+        let save = find(&tools, "save_ref");
+        let forget = find(&tools, "forget_ref");
+
+        let missing = forget.call(json!({"name": "spec"})).await;
+        assert!(
+            missing.is_error,
+            "forgetting a name that was never saved must be an error"
+        );
+
+        save.call(json!({"name": "spec", "url": "https://example.com/spec"}))
+            .await;
+
+        let removed = forget.call(json!({"name": "spec"})).await;
+        assert!(
+            !removed.is_error,
+            "forgetting a name that exists must succeed"
+        );
+
+        let removed_again = forget.call(json!({"name": "spec"})).await;
+        assert!(
+            removed_again.is_error,
+            "forgetting an already-removed name must again be distinguishable as absent"
+        );
+    }
+}
