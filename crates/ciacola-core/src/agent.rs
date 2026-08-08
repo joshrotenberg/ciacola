@@ -335,7 +335,7 @@ pub fn compose_system_prompt(def: &AgentDef) -> String {
         agent = %def.name,
         model = def.model.as_deref().unwrap_or("default"),
         effort = def.effort.as_deref().unwrap_or("default"),
-        resumed = session.is_some(),
+        resumed = started && session.is_some(),
         cost_micro_usd = tracing::field::Empty,
         tokens_out = tracing::field::Empty,
     )
@@ -367,19 +367,7 @@ pub async fn run_exchange(
     }
     let claude = builder.build()?;
 
-    let mut command = match (session, started) {
-        // The session carries the system prompt and everything said so
-        // far; the resumed prompt is just the next thing we say.
-        (Some(session), true) => QueryCommand::new(text).resume(session),
-        // Assigned but not yet opened: name it, and send the system
-        // prompt that the session will carry from here on.
-        (Some(session), false) => QueryCommand::new(text)
-            .session_id(session)
-            .system_prompt(compose_system_prompt(def)),
-        // Agents created before ids were assigned have none. They keep
-        // the old behaviour and pick one up from the provider.
-        (None, _) => QueryCommand::new(text).system_prompt(compose_system_prompt(def)),
-    };
+    let mut command = query_for_session(def, session, started, text);
     if let Some(model) = &def.model {
         command = command.model(model);
     }
@@ -418,7 +406,7 @@ pub async fn run_exchange(
     let started = std::time::Instant::now();
     let result = match command.execute_json(&claude).await {
         Ok(result) => result,
-        Err(e) => match capped(&e, started.elapsed().as_millis() as u64) {
+        Err(e) => match capped(&e, started.elapsed().as_millis() as u64, session) {
             Some(exchange) => return Ok(exchange),
             None => return Err(e.into()),
         },
@@ -463,6 +451,30 @@ pub async fn run_exchange(
     })
 }
 
+/// Apply the one session-state choice before adding the rest of an
+/// agent's provider options. Kept separate so the ledger-to-provider
+/// resume invariant can be tested without spawning the CLI.
+pub(crate) fn query_for_session(
+    def: &AgentDef,
+    session: Option<&str>,
+    started: bool,
+    text: &str,
+) -> QueryCommand {
+    match (session, started) {
+        // The session carries the system prompt and everything said so
+        // far; the resumed prompt is just the next thing we say.
+        (Some(session), true) => QueryCommand::new(text).resume(session),
+        // Assigned but not yet opened: name it, and send the system
+        // prompt that the session will carry from here on.
+        (Some(session), false) => QueryCommand::new(text)
+            .session_id(session)
+            .system_prompt(compose_system_prompt(def)),
+        // Agents created before ids were assigned have none. They keep
+        // the old behaviour and pick one up from the provider.
+        (None, _) => QueryCommand::new(text).system_prompt(compose_system_prompt(def)),
+    }
+}
+
 /// A run that hit a ceiling we set, rendered as the exchange it was.
 ///
 /// The provider ran, at length, and stopped at a cap. That is not the
@@ -476,7 +488,11 @@ pub async fn run_exchange(
 /// that already records spend for a run that errored, rather than
 /// adding a second one. Both variants are `#[non_exhaustive]`, hence
 /// the `..`.
-fn capped(e: &claude_wrapper::Error, elapsed_ms: u64) -> Option<Exchange> {
+fn capped(
+    e: &claude_wrapper::Error,
+    elapsed_ms: u64,
+    assigned_session: Option<&str>,
+) -> Option<Exchange> {
     let (cost_usd, num_turns, session_id) = match e {
         claude_wrapper::Error::MaxTurnsExceeded {
             cost_usd,
@@ -495,7 +511,12 @@ fn capped(e: &claude_wrapper::Error, elapsed_ms: u64) -> Option<Exchange> {
     Some(Exchange {
         error: Some(e.to_string()),
         reply: String::new(),
-        session: session_id.unwrap_or_default(),
+        // A cap is a terminal provider result, so it proves that the
+        // assigned session was opened even if this CLI version omitted
+        // the id from its error payload.
+        session: session_id
+            .or_else(|| assigned_session.map(str::to_string))
+            .unwrap_or_default(),
         cost_micro_usd: cost_usd
             .map(|u| (u * 1_000_000.0) as u64)
             .unwrap_or_default(),
@@ -564,7 +585,7 @@ mod cap_tests {
                 "total_cost_usd":1.25,"num_turns":60,"session_id":"sess-1",
                 "errors":["Reached maximum number of turns (60)"]}"#,
         );
-        let x = capped(&e, 323_000).expect("a cap is an exchange, not a failure to run");
+        let x = capped(&e, 323_000, None).expect("a cap is an exchange, not a failure to run");
         assert_eq!(x.cost_micro_usd, 1_250_000, "spend must survive the cap");
         assert_eq!(
             x.session, "sess-1",
@@ -588,8 +609,12 @@ mod cap_tests {
             r#"{"type":"result","subtype":"error_max_turns","is_error":true,
                 "errors":["Reached maximum number of turns (60)"]}"#,
         );
-        let x = capped(&e, 10).expect("still an exchange");
+        let x = capped(&e, 10, Some("assigned-1")).expect("still an exchange");
         assert_eq!(x.cost_micro_usd, 0);
+        assert_eq!(
+            x.session, "assigned-1",
+            "the cap itself proves the preassigned session opened"
+        );
         assert!(x.error.is_some());
     }
 
@@ -599,6 +624,6 @@ mod cap_tests {
     #[test]
     fn an_ordinary_failure_is_not_treated_as_an_exchange() {
         let e = capped_error("command not found");
-        assert!(capped(&e, 10).is_none());
+        assert!(capped(&e, 10, Some("unopened")).is_none());
     }
 }
