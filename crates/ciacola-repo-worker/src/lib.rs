@@ -124,13 +124,29 @@ impl Repos {
         let bare = self.bare(repo);
         let _guard = self.cloning.lock().await;
         if bare.exists() {
-            // Cheap refresh so a worktree starts from current origin.
-            let _ = bare_repo(&bare)
-                .fetch()
+            // The refspec is not optional, and its absence is silent.
+            // `git clone --bare` writes no `remote.origin.fetch`, so a
+            // plain `git fetch origin` against a bare repository updates
+            // FETCH_HEAD and leaves `refs/heads/*` exactly where they
+            // were. The clone's `main` then never moves after the day it
+            // was made, and every worktree is cut from that frozen
+            // commit while looking perfectly healthy.
+            //
+            // This shipped. Four agents worked issues against a `main`
+            // three merges behind, and it surfaced only because one of
+            // them reasoned about a file that had changed since.
+            let mut fetch = bare_repo(&bare).fetch();
+            fetch
                 .remote("origin")
-                .prune()
+                .refspec("+refs/heads/*:refs/heads/*")
+                .prune();
+            // Nor is the result optional. A discarded error here reads
+            // exactly like a refresh that worked, which is the other
+            // half of why the above went unnoticed.
+            fetch
                 .execute()
-                .await;
+                .await
+                .map_err(|e| -> FlatError { format!("fetch {repo}: {e}").into() })?;
             return Ok(bare);
         }
         std::fs::create_dir_all(&self.root)?;
@@ -797,5 +813,94 @@ to do, on purpose."
                 "worktrees": self.repos.as_ref().map(|r| r.worktrees().len()).unwrap_or(0),
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn git(dir: &Path, args: &[&str]) {
+        let out = tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .await
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A bare clone made by `git clone --bare` has no
+    /// `remote.origin.fetch`, so `git fetch origin` moves FETCH_HEAD and
+    /// nothing else. Without an explicit refspec the clone's `main` is
+    /// frozen at the moment it was made, and every worktree cut from it
+    /// is silently working against stale code.
+    ///
+    /// Uses a `file://` origin so it needs no network, per CONTRIBUTING.
+    #[tokio::test]
+    async fn ensure_clone_advances_main_after_the_origin_moves() {
+        let tmp = std::env::temp_dir().join(format!("ciacola-fetch-{}", ulid::Ulid::new()));
+        let origin = tmp.join("origin");
+        std::fs::create_dir_all(&origin).expect("mkdir");
+
+        git(&origin, &["init", "-q", "-b", "main"]).await;
+        git(&origin, &["config", "user.email", "t@example.com"]).await;
+        git(&origin, &["config", "user.name", "t"]).await;
+        std::fs::write(origin.join("a"), "one").expect("write");
+        git(&origin, &["add", "."]).await;
+        git(&origin, &["commit", "-qm", "one"]).await;
+
+        let repos = Repos {
+            root: tmp.join("root"),
+            allowed: Arc::new(vec!["local/repo".into()]),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        std::fs::create_dir_all(&repos.root).expect("mkdir root");
+        let bare = repos.bare("local/repo");
+        CloneCommand::new(format!("file://{}", origin.display()))
+            .bare()
+            .directory(&bare)
+            .execute()
+            .await
+            .expect("clone");
+
+        // The origin moves after the clone exists, which is the whole
+        // scenario: a long-lived clone and a repository that keeps
+        // merging.
+        std::fs::write(origin.join("a"), "two").expect("write");
+        git(&origin, &["add", "."]).await;
+        git(&origin, &["commit", "-qm", "two"]).await;
+        let want = String::from_utf8_lossy(
+            &tokio::process::Command::new("git")
+                .args(["rev-parse", "main"])
+                .current_dir(&origin)
+                .output()
+                .await
+                .expect("rev-parse")
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        repos.ensure_clone("local/repo").await.expect("refresh");
+
+        let got = String::from_utf8_lossy(
+            &tokio::process::Command::new("git")
+                .args(["rev-parse", "main"])
+                .current_dir(&bare)
+                .output()
+                .await
+                .expect("rev-parse")
+                .stdout,
+        )
+        .trim()
+        .to_string();
+
+        std::fs::remove_dir_all(&tmp).ok();
+        assert_eq!(got, want, "the clone's main did not follow origin's");
     }
 }
