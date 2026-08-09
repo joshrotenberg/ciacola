@@ -10,7 +10,7 @@
 //! state is derived from its turns, never stored, so it cannot drift.
 
 use serde::Serialize;
-use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
+use sqlx::{Executor, Row, Sqlite, SqliteConnection, SqlitePool, sqlite::SqliteRow};
 
 use crate::agent::{AgentDef, Exchange, FlatError};
 use crate::plugin::Migration;
@@ -673,11 +673,15 @@ impl Ledger {
         def
     }
 
-    pub async fn create_agent(
+    async fn insert_agent<'e, E>(
         &self,
+        executor: E,
         def: &AgentDef,
         spawned_by: Option<&str>,
-    ) -> Result<String, FlatError> {
+    ) -> Result<String, FlatError>
+    where
+        E: Executor<'e, Database = Sqlite>,
+    {
         let agent_id = ulid::Ulid::new().to_string();
         // A definition that does not say otherwise inherits the
         // server's isolation and rules. Explicit values win, so a role
@@ -693,9 +697,33 @@ impl Ledger {
         .bind(spawned_by)
         .bind(new_session_id())
         .bind(new_token())
-        .execute(&self.pool)
+        .execute(executor)
         .await?;
         Ok(agent_id)
+    }
+
+    pub async fn create_agent(
+        &self,
+        def: &AgentDef,
+        spawned_by: Option<&str>,
+    ) -> Result<String, FlatError> {
+        self.insert_agent(&self.pool, def, spawned_by).await
+    }
+
+    /// Insert an agent on a caller-owned SQLite connection.
+    ///
+    /// This is the transactional form of [`Self::create_agent`]: it applies
+    /// the same runtime defaults and creates the same identity, session, and
+    /// token, but never begins, commits, or rolls back a transaction. A plugin
+    /// can therefore make agent creation atomic with its own durable state by
+    /// passing a mutable transaction and deciding whether to commit.
+    pub async fn create_agent_in(
+        &self,
+        connection: &mut SqliteConnection,
+        def: &AgentDef,
+        spawned_by: Option<&str>,
+    ) -> Result<String, FlatError> {
+        self.insert_agent(connection, def, spawned_by).await
     }
 
     /// Replace an agent's definition, keeping its identity, session,
@@ -1798,6 +1826,84 @@ mod session_tests {
         assert_eq!(
             a.session_started_seq, 0,
             "a pre-provider failure is not proof that the assigned session opened"
+        );
+    }
+
+    /// A plugin may couple an agent to its own row. Rolling that outer
+    /// transaction back must leave neither half committed.
+    #[tokio::test]
+    async fn transactional_agent_creation_rolls_back_with_its_caller() {
+        let l = ledger().await;
+        let mut tx = l.pool.begin().await.expect("transaction");
+        let id = l
+            .create_agent_in(&mut tx, &AgentDef::new("rolled back", "s"), None)
+            .await
+            .expect("insert agent");
+
+        tx.rollback().await.expect("rollback");
+
+        assert!(
+            l.get_agent(&id).await.expect("get").is_none(),
+            "create_agent_in must not commit its caller's transaction"
+        );
+    }
+
+    /// The transaction-aware seam is an alternate executor, not an alternate
+    /// creation policy: defaults, lineage, session, and token all match the
+    /// ordinary path once the caller commits.
+    #[tokio::test]
+    async fn transactional_agent_creation_commits_with_create_agent_parity() {
+        let l = ledger().await;
+        let parent = l
+            .create_agent(&AgentDef::new("parent", "s"), None)
+            .await
+            .expect("parent");
+        let def = AgentDef::new("worker", "system")
+            .allowed_tools(["Read", "Edit"])
+            .sandbox("workspace-write")
+            .working_dir("/tmp/ciacola-transaction-test")
+            .max_turns(7);
+        let direct_id = l
+            .create_agent(&def, Some(&parent))
+            .await
+            .expect("direct agent");
+
+        let mut tx = l.pool.begin().await.expect("transaction");
+        let transactional_id = l
+            .create_agent_in(&mut tx, &def, Some(&parent))
+            .await
+            .expect("transactional agent");
+        tx.commit().await.expect("commit");
+
+        let direct = l
+            .get_agent(&direct_id)
+            .await
+            .expect("get direct")
+            .expect("direct row");
+        let transactional = l
+            .get_agent(&transactional_id)
+            .await
+            .expect("get transactional")
+            .expect("transactional row");
+        assert_eq!(
+            serde_json::to_value(&direct.def).expect("serialize direct definition"),
+            serde_json::to_value(&transactional.def).expect("serialize transactional definition")
+        );
+        assert_eq!(direct.spawned_by.as_deref(), Some(parent.as_str()));
+        assert_eq!(transactional.spawned_by.as_deref(), Some(parent.as_str()));
+        assert!(direct.session.is_some());
+        assert!(transactional.session.is_some());
+        assert!(
+            l.token_of(&direct_id)
+                .await
+                .expect("direct token")
+                .is_some()
+        );
+        assert!(
+            l.token_of(&transactional_id)
+                .await
+                .expect("transactional token")
+                .is_some()
         );
     }
 
