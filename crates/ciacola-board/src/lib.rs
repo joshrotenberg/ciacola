@@ -395,11 +395,30 @@ async fn overview_body(state: &BoardState) -> String {
         Ok(agents) => agents,
         Err(e) => return format!("<p>ledger error: {}</p>", esc(&e.to_string())),
     };
+    let mut latest_turns = Vec::with_capacity(agents.len());
+    for agent in &agents {
+        let latest = if agent.turns > 0 {
+            match state.ledger.get_turn(&agent.agent_id, agent.turns).await {
+                Ok(turn) => turn,
+                Err(error) => {
+                    return format!(
+                        "<p class=\"msg err\">latest-turn query failed for {}: {}</p>",
+                        esc(&agent.name),
+                        esc(&error.to_string())
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        latest_turns.push(latest);
+    }
     let retired = state.ledger.retired_count().await.unwrap_or_default();
 
     // Totals include the retired: retirement hides agents, never money.
     let (total_cost, total_turns) = state.ledger.totals().await.unwrap_or_default();
     let running = agents.iter().filter(|a| a.state == "running").count();
+    let queued = agents.iter().filter(|a| a.state == "queued").count();
     let day_cost = state
         .ledger
         .spend_since(ciacola_core::time::now_unix() - 86_400)
@@ -408,9 +427,13 @@ async fn overview_body(state: &BoardState) -> String {
     let tokens = state.ledger.token_totals().await.unwrap_or_default();
 
     let mut body = format!(
-        "<h1>ciacola</h1>\
-         <div><span class=\"stat\"><b>{}</b><span>agents</span></span>\
+        "<header class=\"board-header\"><div><p class=\"eyebrow\">local agent supervision</p>\
+         <h1>ciacola</h1><p class=\"dim\">Durable work, attention, and repository journeys.</p></div>\
+         <div class=\"live-status\" role=\"status\" aria-live=\"polite\">\
+         <span class=\"live-dot\" aria-hidden=\"true\"></span><span data-live-label>connecting</span></div></header>\
+         <div class=\"stat-grid\"><span class=\"stat\"><b>{}</b><span>agents</span></span>\
          <span class=\"stat\"><b>{}</b><span>running</span></span>\
+         <span class=\"stat\"><b>{}</b><span>queued</span></span>\
          <span class=\"stat\"><b>{}</b><span>turns</span></span>\
          <span class=\"stat\"><b>{}</b><span>reported spend</span></span>\
          <span class=\"stat\"><b>{}</b><span>reported last 24h{}</span></span>\
@@ -418,6 +441,7 @@ async fn overview_body(state: &BoardState) -> String {
          <span class=\"stat\"><b>{}</b><span>retired</span></span></div>",
         agents.len(),
         running,
+        queued,
         total_turns,
         usd(total_cost),
         usd(day_cost),
@@ -437,54 +461,127 @@ async fn overview_body(state: &BoardState) -> String {
         retired,
     );
 
-    body.push_str(&admission_section(
-        state.ledger.admission_report(&state.limits).await,
-    ));
-
-    // Whatever the plugins contribute, in registration order.
-    for section in state.host.board_sections().await {
-        body.push_str(&format!("<h2>{}</h2>{}", esc(&section.title), section.html));
-    }
-
-    // Attention first: agents whose latest turn went wrong. The
-    // proto-needs-you list; gates will feed this for real.
+    // Attention is the first operational section. A failed terminal reply is
+    // not buried below aggregate accounting or the complete agent catalog.
     let mut attention = String::new();
-    for agent in &agents {
-        if let Ok(Some(turn)) = state.ledger.get_turn(&agent.agent_id, agent.turns).await {
-            if turn.state == "failed" || turn.state == "killed" {
-                attention.push_str(&format!(
-                    "<tr><td><a href=\"/board/agent/{id}\">{name}</a></td><td>{chip}</td>\
-                     <td class=\"dim\">{err}</td></tr>",
-                    id = esc(&agent.agent_id),
-                    name = esc(&agent.name),
-                    chip = turn_state_chip(&turn),
-                    err = esc(turn.error.as_deref().unwrap_or("")),
-                ));
-            }
+    let mut attention_count = 0usize;
+    for (agent, latest) in agents.iter().zip(&latest_turns) {
+        let Some(turn) = latest else { continue };
+        if turn.state == "failed" || turn.state == "killed" {
+            attention_count += 1;
+            attention.push_str(&format!(
+                "<tr><td data-label=\"agent\"><a href=\"/board/agent/{id}\">{name}</a><br>\
+                 <span class=\"dim\">{role}</span></td><td data-label=\"state\">{chip}</td>\
+                 <td data-label=\"turn\" class=\"dim\">turn {seq}</td>\
+                 <td data-label=\"why\">{err}</td></tr>",
+                id = esc(&agent.agent_id),
+                name = esc(&agent.name),
+                role = esc(agent.def.catalog_role().unwrap_or("unassigned role")),
+                chip = turn_state_chip(turn),
+                seq = turn.seq,
+                err = esc(turn
+                    .error
+                    .as_deref()
+                    .unwrap_or("no failure detail reported")),
+            ));
         }
     }
-    if !attention.is_empty() {
+    body.push_str(&format!(
+        "<section class=\"panel attention\"><div class=\"panel-heading\"><h2>needs attention</h2>\
+         <span class=\"count\">{attention_count}</span></div>{}</section>",
+        if attention.is_empty() {
+            "<p class=\"empty\">No failed or killed latest turns.</p>".to_string()
+        } else {
+            format!(
+                "<div class=\"table-wrap\"><table class=\"responsive-table\"><caption class=\"sr-only\">Agents needing attention</caption>\
+                 <tr><th scope=\"col\">agent</th><th scope=\"col\">state</th>\
+                 <th scope=\"col\">turn</th><th scope=\"col\">why</th></tr>{attention}</table></div>"
+            )
+        }
+    ));
+
+    let mut active = String::new();
+    let mut active_count = 0usize;
+    for (agent, latest) in agents.iter().zip(&latest_turns) {
+        if agent.state != "queued" && agent.state != "running" {
+            continue;
+        }
+        active_count += 1;
+        let turn = latest.as_ref();
+        let activity = turn
+            .and_then(|turn| turn.claimed_unix_ms)
+            .map(|claimed| format!("started {}", ago(claimed / 1_000)))
+            .unwrap_or_else(|| {
+                if agent.state == "queued" {
+                    "waiting to start".into()
+                } else {
+                    "start time unavailable".into()
+                }
+            });
+        let model = agent.def.model.as_deref().unwrap_or("default model");
+        let effort = agent.def.effort.as_deref().unwrap_or("default effort");
+        active.push_str(&format!(
+            "<tr><td data-label=\"agent\"><a href=\"/board/agent/{id}\">{name}</a><br>\
+             <span class=\"dim\">{role}</span></td><td data-label=\"state\">{state}</td>\
+             <td data-label=\"current turn\">turn {seq}<br><span class=\"dim\">{activity}</span></td>\
+             <td data-label=\"execution\">{provider}<br><span class=\"dim\">{model} &middot; {effort}</span></td></tr>",
+            id = esc(&agent.agent_id),
+            name = esc(&agent.name),
+            role = esc(agent.def.catalog_role().unwrap_or("unassigned role")),
+            state = chip(&agent.state),
+            seq = turn.map(|turn| turn.seq).unwrap_or(agent.turns),
+            activity = esc(&activity),
+            provider = esc(agent.def.provider.as_str()),
+            model = esc(model),
+            effort = esc(effort),
+        ));
+    }
+    body.push_str(&format!(
+        "<section class=\"panel active\"><div class=\"panel-heading\"><h2>active now</h2>\
+         <span class=\"count\">{active_count}</span></div>{}</section>",
+        if active.is_empty() {
+            "<p class=\"empty\">No turns are queued or running.</p>".to_string()
+        } else {
+            format!(
+                "<div class=\"table-wrap\"><table class=\"responsive-table\"><caption class=\"sr-only\">Queued and running work</caption>\
+                 <tr><th scope=\"col\">agent</th><th scope=\"col\">state</th>\
+                 <th scope=\"col\">current turn</th><th scope=\"col\">execution</th></tr>{active}</table></div>"
+            )
+        }
+    ));
+
+    // Plugin-owned state stays plugin-owned. The overview gives every
+    // contribution the same panel shell without parsing or re-modeling it.
+    for section in state.host.board_sections().await {
         body.push_str(&format!(
-            "<h2>needs a look</h2><table><tr><th>agent</th><th>last turn</th><th>why</th></tr>{attention}</table>"
+            "<section class=\"panel\"><h2>{}</h2><div class=\"section-body\">{}</div></section>",
+            esc(&section.title),
+            section.html
         ));
     }
 
-    body.push_str(
-        "<h2>agents</h2><table><tr><th>name</th><th>role</th><th>state</th><th>provider</th>\
-        <th class=\"num\">turns</th><th class=\"num\">reported cost</th><th>last active</th>\
-        <th>session</th></tr>",
-    );
-    // Families together: roots first, each followed by its children.
-    let row_html = |agent: &ciacola_core::ledger::AgentRow, child: bool| {
-        format!(
-            "<tr><td>{indent}<a href=\"/board/agent/{id}\">{name}</a> <span class=\"dim mono\">{short}</span></td>\
-             <td class=\"dim\">{role}</td><td>{chip}</td><td class=\"dim\">{provider}</td><td class=\"num\">{turns}</td><td class=\"num\">{cost}</td>\
-             <td class=\"dim\">{active}</td><td class=\"dim mono\">{session}</td></tr>",
-            indent = if child {
-                "<span class=\"dim\">&nbsp;&nbsp;&#8627;&nbsp;</span>"
-            } else {
-                ""
-            },
+    body.push_str(&format!(
+        "<section class=\"panel\"><details><summary>limits, usage, and automatic admission</summary>\
+         {}</details></section>",
+        admission_section(state.ledger.admission_report(&state.limits).await)
+    ));
+
+    let mut all_agents = String::new();
+    for agent in &agents {
+        let parent = agent
+            .spawned_by
+            .as_deref()
+            .map(|parent| &parent[parent.len().saturating_sub(6)..])
+            .unwrap_or("root");
+        all_agents.push_str(&format!(
+            "<tr><td data-label=\"name\"><a href=\"/board/agent/{id}\">{name}</a> <span class=\"dim mono\">{short}</span></td>\
+             <td data-label=\"role\" class=\"dim\">{role}</td><td data-label=\"state\">{chip}</td>\
+             <td data-label=\"provider\" class=\"dim\">{provider}</td>\
+             <td data-label=\"turns\" class=\"num\">{turns}</td>\
+             <td data-label=\"reported cost\" class=\"num\">{cost}</td>\
+             <td data-label=\"last active\" class=\"dim\">{active}</td>\
+             <td data-label=\"session\" class=\"dim mono\">{session}</td>\
+             <td data-label=\"parent\" class=\"dim mono\">{parent}</td></tr>",
             id = esc(&agent.agent_id),
             name = esc(&agent.name),
             short = esc(&agent.agent_id[agent.agent_id.len().saturating_sub(6)..]),
@@ -497,26 +594,20 @@ async fn overview_body(state: &BoardState) -> String {
             session = esc(agent
                 .session
                 .as_deref()
-                .map(|s| &s[..s.len().min(8)])
+                .map(|session| &session[..session.len().min(8)])
                 .unwrap_or("-")),
-        )
-    };
-    let is_root = |a: &&ciacola_core::ledger::AgentRow| {
-        a.spawned_by.is_none()
-            || !agents
-                .iter()
-                .any(|p| Some(&p.agent_id) == a.spawned_by.as_ref())
-    };
-    for root in agents.iter().filter(is_root) {
-        body.push_str(&row_html(root, false));
-        for child in agents
-            .iter()
-            .filter(|a| a.spawned_by.as_ref() == Some(&root.agent_id))
-        {
-            body.push_str(&row_html(child, true));
-        }
+            parent = esc(parent),
+        ));
     }
-    body.push_str("</table>");
+    body.push_str(&format!(
+        "<section class=\"panel\"><details><summary>all active agents ({})</summary>\
+         <div class=\"table-wrap\"><table class=\"responsive-table\"><caption class=\"sr-only\">All non-retired agents</caption>\
+         <tr><th scope=\"col\">name</th><th scope=\"col\">role</th><th scope=\"col\">state</th>\
+         <th scope=\"col\">provider</th><th scope=\"col\" class=\"num\">turns</th>\
+         <th scope=\"col\" class=\"num\">reported cost</th><th scope=\"col\">last active</th>\
+         <th scope=\"col\">session</th><th scope=\"col\">parent</th></tr>{all_agents}</table></div></details></section>",
+        agents.len()
+    ));
 
     body
 }
@@ -981,6 +1072,92 @@ mod tests {
         let detail = agent_page(State(state), Path(agent_id)).await.0;
         assert!(detail.contains("impl-owner-repo-74"), "{detail}");
         assert!(detail.contains("issue-implementer"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn empty_overview_leads_with_operational_sections() {
+        let state = state().await;
+        let html = overview_body(&state).await;
+
+        assert!(html.contains("local agent supervision"), "{html}");
+        assert!(html.contains("data-live-label>connecting"), "{html}");
+        assert!(html.contains("No failed or killed latest turns."), "{html}");
+        assert!(html.contains("No turns are queued or running."), "{html}");
+        assert!(html.contains("all active agents (0)"), "{html}");
+        assert!(
+            html.find("needs attention") < html.find("active now"),
+            "{html}"
+        );
+        assert!(
+            html.find("active now") < html.find("limits, usage, and automatic admission"),
+            "{html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_and_running_work_are_visible_before_the_agent_catalog() {
+        let state = state().await;
+        let agent_id = role_agent(&state).await;
+        let seq = state
+            .ledger
+            .enqueue_turn(&agent_id, "implement the issue")
+            .await
+            .expect("queue turn");
+
+        let queued = overview_body(&state).await;
+        assert!(queued.contains("active now"), "{queued}");
+        assert!(queued.contains("waiting to start"), "{queued}");
+        assert!(queued.contains("issue-implementer"), "{queued}");
+        assert!(
+            queued.find("active now") < queued.find("all active agents"),
+            "{queued}"
+        );
+
+        assert!(
+            state
+                .ledger
+                .claim_turn(&agent_id, seq)
+                .await
+                .expect("claim")
+        );
+        let running = overview_body(&state).await;
+        assert!(running.contains("started "), "{running}");
+        assert!(running.contains(">running</span>"), "{running}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_latest_turn_is_an_attention_item_with_its_reason() {
+        let state = state().await;
+        let agent_id = role_agent(&state).await;
+        let seq = state
+            .ledger
+            .enqueue_turn(&agent_id, "implement the issue")
+            .await
+            .expect("queue turn");
+        assert!(
+            state
+                .ledger
+                .claim_turn(&agent_id, seq)
+                .await
+                .expect("claim")
+        );
+        assert!(
+            state
+                .ledger
+                .abort_claimed_turn(&agent_id, seq, "provider could not launch")
+                .await
+                .expect("abort")
+        );
+
+        let html = overview_body(&state).await;
+        assert!(html.contains("needs attention"), "{html}");
+        assert!(html.contains("provider could not launch"), "{html}");
+        assert!(html.contains("turn 1"), "{html}");
+        assert!(
+            !html.contains("No failed or killed latest turns."),
+            "{html}"
+        );
+        assert!(html.contains("No turns are queued or running."), "{html}");
     }
 
     #[test]
