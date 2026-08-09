@@ -266,7 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         declared.runtime.clone(),
     )
     .with_operator_mcp_config(operator_mcp_config_path.display().to_string());
-    plugins.push(Box::new(RolesPlugin::new(merged_roles)));
+    plugins.push(Box::new(RolesPlugin::new()));
 
     let ctx = PluginContext {
         pool: pool.clone(),
