@@ -603,6 +603,14 @@ to do, on purpose."
                         let Some(role) = roles.get(ROLE).cloned() else {
                             return Ok(CallToolResult::error("role missing".to_string()));
                         };
+                        if role.surface.as_deref() == Some("operator")
+                            && (caller.is_some() || !operator_surface)
+                        {
+                            return Ok(CallToolResult::error(format!(
+                                "role '{}' carries the operator surface, and agents may not start it; ask the operator",
+                                role.name
+                            )));
+                        }
                         if role.inherit_provider_tools && (caller.is_some() || !operator_surface) {
                             return Ok(CallToolResult::error(format!(
                                 "role '{}' inherits its provider's native tool policy, which an agent cannot bound; ask the operator to start the issue",
@@ -1000,29 +1008,33 @@ mod tests {
             .with_operator_mcp_config("operator.json")
     }
 
+    fn native_implementer_role() -> Role {
+        Role {
+            name: ROLE.into(),
+            description: "Codex implementation role".into(),
+            provider: Some("codex".into()),
+            model: None,
+            effort: Some("high".into()),
+            hermetic: Some("none".into()),
+            working_dir: Some("{{worktree}}".into()),
+            allowed_tools: Vec::new(),
+            inherit_provider_tools: true,
+            sandbox: Some("workspace-write".into()),
+            max_turns: Some(60),
+            rotate_after_turns: None,
+            loopback: false,
+            surface: None,
+            arguments: vec!["repo".into(), "issue".into(), "worktree".into()],
+            system_prompt: "Implement {{repo}}#{{issue}} in {{worktree}}".into(),
+        }
+    }
+
+    fn roles_with_implementer(role: Role) -> Roles {
+        Roles::new(vec![role], "agent.json").with_operator_mcp_config("operator.json")
+    }
+
     fn native_implementer_roles() -> Roles {
-        Roles::new(
-            vec![Role {
-                name: ROLE.into(),
-                description: "Codex implementation role".into(),
-                provider: Some("codex".into()),
-                model: None,
-                effort: Some("high".into()),
-                hermetic: Some("none".into()),
-                working_dir: Some("{{worktree}}".into()),
-                allowed_tools: Vec::new(),
-                inherit_provider_tools: true,
-                sandbox: Some("workspace-write".into()),
-                max_turns: Some(60),
-                rotate_after_turns: None,
-                loopback: false,
-                surface: None,
-                arguments: vec!["repo".into(), "issue".into(), "worktree".into()],
-                system_prompt: "Implement {{repo}}#{{issue}} in {{worktree}}".into(),
-            }],
-            "agent.json",
-        )
-        .with_operator_mcp_config("operator.json")
+        roles_with_implementer(native_implementer_role())
     }
 
     fn context(pool: sqlx::SqlitePool, ledger: Ledger) -> PluginContext {
@@ -1685,6 +1697,61 @@ mod tests {
         let rendered = serde_json::to_string(&out).expect("render");
         assert!(
             rendered.contains("inherits its provider's native tool policy"),
+            "must refuse: {rendered}"
+        );
+        assert!(
+            !root.exists(),
+            "refusal must happen before clone or worktree"
+        );
+        assert_eq!(ledger.list_agents().await.expect("list").len(), 1);
+    }
+
+    /// Configured roles can also select the operator loopback mount. Honor the
+    /// override, but keep the same anti-escalation boundary as spawn_role.
+    #[tokio::test]
+    async fn start_issue_refuses_an_operator_role_from_an_agent() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        let parent = ledger
+            .create_agent(&ciacola_core::AgentDef::new("parent", "s"), None)
+            .await
+            .expect("parent");
+        let root =
+            std::env::temp_dir().join(format!("ciacola-operator-role-{}", ulid::Ulid::new()));
+        let mut operator_role = native_implementer_role();
+        operator_role.inherit_provider_tools = false;
+        operator_role.surface = Some("operator".into());
+        operator_role.loopback = true;
+        let mut ctx = context(pool, ledger.clone());
+        ctx.roles = roles_with_implementer(operator_role);
+        ctx.plugin_config = toml::from_str(&format!(
+            "[repo-worker]\nroot = {:?}\nrepos = [\"local/repo\"]",
+            root.display().to_string()
+        ))
+        .expect("config");
+
+        let mut plugin = RepoWorkerPlugin::default();
+        plugin.setup(&ctx).await.expect("setup");
+        let start = plugin
+            .tools(Surface::Agent)
+            .into_iter()
+            .find(|tool| tool.definition().name == "start_issue")
+            .expect("start_issue");
+        let mut extensions = Extensions::new();
+        extensions.insert(ciacola_core::AgentIdentity(parent));
+        let request =
+            RequestContext::new(RequestId::Number(71)).with_extensions(Arc::new(extensions));
+        let out = start
+            .call_with_context(
+                request,
+                json!({"repo": "local/repo", "issue": 70, "base": "main"}),
+            )
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+        assert!(
+            rendered.contains("carries the operator surface"),
             "must refuse: {rendered}"
         );
         assert!(
