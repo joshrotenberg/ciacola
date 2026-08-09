@@ -73,18 +73,23 @@ that needs it.
 - Conventional-commit prefixes on commits and pull request titles.
 - No em dashes.
 - Comments explain why, not what. The doc comments in `ciacola-core`
-  are the design record and are meant to be read; `HANDOFF.md` is the
-  orientation and the known-broken list.
+  are part of the design record and are meant to be read. Start with
+  `docs/architecture.md`; `HANDOFF.md` is retained as historical evidence,
+  not as the current operating manual.
 - New behaviour comes with a test. The workspace is thin on them and
   the direction is one way.
 - **A fix updates the records that track it.** If what you fixed is
-  listed in `HANDOFF.md`'s known-broken section, remove it in the same
-  change. A fix that leaves its own bug documented as open is not
-  finished.
+  listed in a product document, issue, or historical known-broken section,
+  update that record in the same change. A fix that leaves its own bug
+  documented as open is not finished.
 
   This rule was written into the dispatched-agent prompt first and
   broken four times running by the person who wrote it, because it
   lived somewhere only agents read. Hence its being here.
+
+- Behavior-changing pull requests update the relevant README, configuration,
+  operations, security, or architecture text in the same change. Documentation
+  examples are user interfaces and should be tested accordingly.
 
 ## Tests
 
@@ -95,6 +100,6 @@ manual smoke test and does not belong in the suite.
 ## Where the line falls
 
 `PluginContext` is the definition of core. If something needs a field
-that is not on it, either it belongs in core or it is reaching. Nine
-plugins ship in-tree and they register through the same trait a third
-party would, which is the only thing that keeps that trait honest.
+that is not on it, either it belongs in core or it is reaching. In-tree
+plugins register through the same trait a third party would, which is the
+only thing that keeps that trait honest.
