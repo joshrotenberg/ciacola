@@ -230,6 +230,10 @@ backend:
   token total is reported input + output, with cached input already included
   in input. USD and token stops are independent, and Ciacola carries no
   provider price table.
+  Reported spend observed before a failed turn stopped is still added to the
+  rolling total, but is labeled partial rather than complete. While such a
+  lower bound remains in the window, a configured USD stop is unobservable
+  and automatic submissions fail closed.
 - `[limits.providers.<provider>].per_turn_ceiling` bounds each admitted
   provider execution in the provider's declared unit. The effective value,
   meter, cache treatment, and enforcement granularity are copied onto the

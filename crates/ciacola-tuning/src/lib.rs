@@ -449,6 +449,7 @@ mod tests {
                 cost: ciacola_agent::Cost::Reported {
                     micro_usd: cost_micro_usd as u64,
                 },
+                cost_complete: true,
                 usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage {
                     input: 1,
                     output: 1,

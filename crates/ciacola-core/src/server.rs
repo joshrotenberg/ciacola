@@ -238,6 +238,7 @@ fn turn_json(turn: &TurnRow) -> serde_json::Value {
         "error": turn.error,
         "cost_usd": cost_usd,
         "cost_state": turn.cost_state,
+        "cost_complete": turn.cost_complete,
         "tokens_in": tokens.map(|tokens| tokens.0),
         "tokens_out": tokens.map(|tokens| tokens.1),
         "tokens_cached": tokens.map(|tokens| tokens.2),
@@ -864,6 +865,7 @@ mod telemetry_serialization_tests {
             error: Some("stopped".into()),
             cost_micro_usd: 0,
             cost_state: cost_state.into(),
+            cost_complete: cost_state == "reported",
             elapsed_ms: 1_000,
             elapsed_state: "measured".into(),
             claimed_unix_ms: Some(1),
@@ -900,9 +902,21 @@ mod telemetry_serialization_tests {
     fn a_reported_zero_serializes_as_zero() {
         let value = turn_json(&turn("reported", "reported"));
         assert_eq!(value["cost_usd"], 0.0);
+        assert_eq!(value["cost_complete"], true);
         assert_eq!(value["tokens_in"], 0);
         assert_eq!(value["tokens_out"], 0);
         assert_eq!(value["elapsed_state"], "measured");
+    }
+
+    #[test]
+    fn a_partial_reported_cost_serializes_the_amount_and_the_gap() {
+        let mut partial = turn("reported", "unreported");
+        partial.cost_micro_usd = 125_000;
+        partial.cost_complete = false;
+        let value = turn_json(&partial);
+        assert_eq!(value["cost_usd"], 0.125);
+        assert_eq!(value["cost_state"], "reported");
+        assert_eq!(value["cost_complete"], false);
     }
 
     #[test]

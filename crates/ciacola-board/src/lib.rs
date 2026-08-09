@@ -198,6 +198,12 @@ fn telemetry_gaps(status: &ProviderAdmissionStatus) -> String {
             human_u64_count(accounting.cost_unreported_turns)
         ));
     }
+    if accounting.cost_incomplete_turns > 0 {
+        gaps.push(format!(
+            "cost partial {}",
+            human_u64_count(accounting.cost_incomplete_turns)
+        ));
+    }
     if accounting.cost_not_priced_turns > 0 && accounting.reports_cost {
         gaps.push(format!(
             "cost not priced {}",
@@ -569,7 +575,8 @@ async fn events(
 
 fn turn_cost(turn: &TurnRow) -> String {
     match turn.reported_cost_micro_usd() {
-        Some(cost) => usd(cost),
+        Some(cost) if turn.cost_complete => usd(cost),
+        Some(cost) => format!("{} (partial)", usd(cost)),
         None => match turn.cost_state.as_str() {
             "not_priced" => "unpriced".into(),
             "unreported" => "cost unreported".into(),
@@ -906,6 +913,7 @@ mod tests {
             error: Some("stopped".into()),
             cost_micro_usd: 0,
             cost_state: cost_state.into(),
+            cost_complete: cost_state == "reported",
             elapsed_ms: 1_000,
             elapsed_state: "measured".into(),
             claimed_unix_ms: Some(1),
@@ -950,6 +958,15 @@ mod tests {
         let measured = turn_html(&turn("reported", "reported"));
         assert!(measured.contains("$0.0000"), "{measured}");
         assert!(measured.contains("0 in / 0 out"), "{measured}");
+    }
+
+    #[test]
+    fn turn_rendering_marks_reported_partial_cost_without_discarding_it() {
+        let mut partial = turn("reported", "unreported");
+        partial.cost_micro_usd = 125_000;
+        partial.cost_complete = false;
+        let rendered = turn_html(&partial);
+        assert!(rendered.contains("$0.1250 (partial)"), "{rendered}");
     }
 
     #[tokio::test]
@@ -1121,6 +1138,7 @@ mod tests {
         blocked.accounting.tokens_cached = 0;
         blocked.accounting.usage_unreported_turns = 1;
         blocked.accounting.usage_not_tracked_turns = 2;
+        blocked.accounting.cost_incomplete_turns = 3;
         blocked.detail = Some("token accounting is incomplete".into());
 
         let html = admission_section(Ok(admission_report(vec![warning, blocked])));
@@ -1128,6 +1146,7 @@ mod tests {
         assert!(html.contains("AUTO BLOCKED"), "{html}");
         assert!(html.contains("tokens unreported 1"), "{html}");
         assert!(html.contains("tokens not tracked 2"), "{html}");
+        assert!(html.contains("cost partial 3"), "{html}");
         assert!(
             html.contains(
                 "<td>codex</td><td class=\"num\">1</td><td class=\"num\">0</td><td class=\"num\">0</td>"
