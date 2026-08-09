@@ -78,7 +78,7 @@ ciacola             config, the plugin list, main
 ```
 
 `PluginContext` is the precise statement of what core is: pool, ledger,
-executor, notifier, db path, loopback MCP config, limits, runtime. If a
+executor, notifier, db path, loopback MCP config, limits, runtime, roles. If a
 plugin needs something not on that struct, either it belongs in core or
 the plugin is reaching.
 

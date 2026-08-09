@@ -309,7 +309,6 @@ struct FinishArgs {
 pub struct RepoWorkerPlugin {
     repos: Option<Repos>,
     ctx: Option<PluginContext>,
-    roles: Option<Roles>,
 }
 
 /// Per-agent state, keyed by agent id in the plugin's key-value slice.
@@ -367,10 +366,6 @@ impl Plugin for RepoWorkerPlugin {
                 allowed: Arc::new(config.repos),
                 cloning: Arc::new(tokio::sync::Mutex::new(())),
             });
-            // Use the same merged catalog that powers roles, spawn_role, and
-            // persistent role agents. Rebuilding from self.roles() here made
-            // configured overrides visible everywhere except start_issue.
-            self.roles = Some(ctx.roles.clone());
             self.ctx = Some(ctx.clone());
             Ok(())
         })
@@ -563,11 +558,12 @@ to do, on purpose."
 
     fn tools(&self, surface: Surface) -> Vec<Tool> {
         let operator_surface = surface == Surface::Operator;
-        let (Some(repos), Some(ctx), Some(roles)) =
-            (self.repos.clone(), self.ctx.clone(), self.roles.clone())
-        else {
+        let (Some(repos), Some(ctx)) = (self.repos.clone(), self.ctx.clone()) else {
             return Vec::new();
         };
+        // Higher-level plugin wiring consumes the same configured catalog as
+        // roles, spawn_role, completion, and persistent role agents.
+        let roles = ctx.roles.clone();
 
         let start = {
             let (repos, ctx, roles) = (repos.clone(), ctx.clone(), roles.clone());
@@ -1060,7 +1056,6 @@ mod tests {
         RepoWorkerPlugin {
             repos: Some(repos),
             ctx: Some(ctx),
-            roles: Some(Roles::new(Vec::new(), "agent.json")),
         }
     }
 
@@ -1829,7 +1824,7 @@ mod tests {
 
         // The manager's authority comes from the shipped role, not a
         // stand-in typed into this test.
-        let roles = plugin.roles.clone().expect("roles");
+        let roles = ctx.roles.clone();
         let manager_role = roles.get(MANAGER).cloned().expect("manager role bundled");
         let manager_args =
             std::collections::HashMap::from([("checkout".to_string(), root.display().to_string())]);
