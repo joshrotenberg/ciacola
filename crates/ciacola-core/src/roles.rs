@@ -73,22 +73,12 @@ pub struct Role {
     /// Hand this role the server's own tools over loopback.
     #[serde(default)]
     pub loopback: bool,
-    /// Which loopback surface, when `loopback` is set. `agent` is the
-    /// default and is what almost everything should have. `operator`
-    /// additionally grants the tools that act on the world: `kill`,
-    /// `open_pr`, `prune`, `resolve_finding`.
-    ///
-    /// This is capability by endpoint. The two surfaces are separate
-    /// mounts, and an agent is handed the URL of exactly one of them in
-    /// an MCP config applied strictly, so it cannot add the other. That
-    /// holds only while a role's tools cannot make arbitrary HTTP
-    /// requests: granting `Bash(curl:*)` alongside `agent` would hand it
-    /// the operator surface too, since the URL is the whole grant.
-    ///
-    /// Reserve it for roles that supervise rather than implement. The
-    /// point of an implementer not having `open_pr` is that something
-    /// looks at the work before it reaches the world; a manager with
-    /// this is that something, not a bypass of it.
+    /// Which loopback surface, when `loopback` is set. `agent` is the only
+    /// provider-backed surface currently supported. `operator` is retained
+    /// in the config shape for migration clarity, but provisioning it is
+    /// refused: the HTTP operator mount requires a human root bearer, and a
+    /// bearer placed in one provider process can be copied by another process
+    /// under the same OS user.
     #[serde(default)]
     pub surface: Option<String>,
     /// Placeholder names substituted into `system_prompt` as
@@ -317,13 +307,13 @@ impl Roles {
         if role.loopback {
             let config = match role.surface.as_deref() {
                 Some("operator") => self.operator_mcp_config.as_str(),
+                Some("agent") | None => self.loopback_mcp_config.as_str(),
                 Some(other) => {
                     // A typo grants less rather than more, which is the
                     // right failure, but silently is not: say so.
                     eprintln!("[roles] unknown surface '{other}', using the agent surface");
                     self.loopback_mcp_config.as_str()
                 }
-                None => self.loopback_mcp_config.as_str(),
             };
             def = def.mcp_config(config);
         }
@@ -433,17 +423,14 @@ pub fn tools_with_depth(
                             args.role
                         )));
                     };
-                    // An agent never mints a supervisor. The operator
-                    // surface is granted by a person at the terminal;
-                    // letting any authenticated caller instantiate a
-                    // role that carries it would make every agent one
-                    // spawn away from kill and open_pr.
-                    if role.surface.as_deref() == Some("operator")
-                        && (caller.is_some() || !operator_surface)
-                    {
+                    // The HTTP operator mount is human-bearer-only. Even a
+                    // human spawning this role would have to copy that root
+                    // bearer into a provider process, where another worker
+                    // under the same OS user could steal it.
+                    if role.surface.as_deref() == Some("operator") {
                         return Ok(CallToolResult::error(format!(
-                            "role '{}' carries the operator surface, and agents may \
-                             not spawn it; ask the operator",
+                            "role '{}' carries the operator surface, which provider-backed \
+                             agents cannot hold; use stdio or authenticated human HTTP",
                             role.name
                         )));
                     }
@@ -692,6 +679,11 @@ mod surface_tests {
     fn default_surface_gets_the_agent_config() {
         let roles =
             Roles::new(vec![role(None)], "agent.json").with_operator_mcp_config("operator.json");
+        let def = roles.to_def(roles.get("r").unwrap(), &HashMap::new());
+        assert_eq!(def.mcp_config.as_deref(), Some("agent.json"));
+
+        let roles = Roles::new(vec![role(Some("agent"))], "agent.json")
+            .with_operator_mcp_config("operator.json");
         let def = roles.to_def(roles.get("r").unwrap(), &HashMap::new());
         assert_eq!(def.mcp_config.as_deref(), Some("agent.json"));
     }

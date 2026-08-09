@@ -379,14 +379,14 @@ impl Plugin for RepoWorkerPlugin {
             Role {
                 name: MANAGER.into(),
                 description: "Dispatches issues to implementers, checks what comes back, and \
-                          curates the implementer prompt from what it sees."
+                          prepares reviewed work for a human to publish."
                     .into(),
                 provider: None,
                 model: None,
                 effort: Some("high".into()),
-                // Not hermetic: it edits this repository, and it is played
-                // by an interactive session today, which already has the
-                // operator's config and should keep it.
+                // Not hermetic: it edits this repository while curating the
+                // implementer prompt. Publication remains a human operator
+                // action rather than ambient provider authority.
                 hermetic: Some("none".into()),
                 working_dir: Some("{{checkout}}".into()),
                 allowed_tools: vec![
@@ -395,7 +395,12 @@ impl Plugin for RepoWorkerPlugin {
                     "Grep".into(),
                     "Edit".into(),
                     "Write".into(),
-                    "Bash(git:*)".into(),
+                    "Bash(git add:*)".into(),
+                    "Bash(git commit:*)".into(),
+                    "Bash(git status:*)".into(),
+                    "Bash(git diff:*)".into(),
+                    "Bash(git log:*)".into(),
+                    "Bash(git show:*)".into(),
                     "Bash(cargo:*)".into(),
                     "Bash(just:*)".into(),
                     // The implementer role below holds this too, for
@@ -407,11 +412,10 @@ impl Plugin for RepoWorkerPlugin {
                     // check, so a bundled parent missing one of its own
                     // child's tools is refused before any work happens.
                     "Bash(make:*)".into(),
-                    "Bash(gh:*)".into(),
-                    // The whole ciacola server, by server name: without
-                    // this a *spawned* manager could see its operator
-                    // surface and not call it. An interactive session
-                    // playing the role is unaffected.
+                    "Bash(gh issue view:*)".into(),
+                    // The ordinary ciacola surface is enough to dispatch and
+                    // inspect work. open_pr is deliberately absent: only a
+                    // human stdio/root-bearer session may publish.
                     "mcp__ciacola".into(),
                 ],
                 inherit_provider_tools: false,
@@ -419,11 +423,7 @@ impl Plugin for RepoWorkerPlugin {
                 max_turns: None,
                 rotate_after_turns: None,
                 loopback: true,
-                // The supervising half of the pair, and the only role
-                // here that may act on the world. An implementer without
-                // `open_pr` only means something if someone looks at the
-                // work before it lands; this is that someone.
-                surface: Some("operator".into()),
+                surface: None,
                 arguments: vec!["checkout".into()],
                 system_prompt: "\
 You dispatch issues to implementers and you own the prompt they run on.
@@ -435,8 +435,10 @@ Working in {{checkout}}, which is ciacola's own repository.
 Dispatching:
 - start_issue, then send, then wait. Pass timeout_secs; the default is
   120 and real work runs longer, and a turn cut short loses its session.
-- Read the diff yourself before open_pr. The reply is the worker's
-  account of what it did, which is not the same thing.
+- Read the diff yourself. The reply is the worker's account of what it did,
+  which is not the same thing. When it is ready, report the exact assignment
+  and evidence to the human operator; do not claim to open or merge a pull
+  request yourself.
 - Verify its verification. It reports running the gate; run the gate.
   The gap between what a role grants and what its agents actually use
   is only visible if someone looks.
@@ -467,8 +469,8 @@ effect:
             },
             Role {
                 name: ROLE.into(),
-                description: "Implements one GitHub issue in its own worktree, then opens a draft \
-                          pull request for review."
+                description: "Implements one GitHub issue in its own worktree and prepares the \
+                          committed result for human review."
                     .into(),
                 provider: None,
                 model: Some("sonnet".into()),
@@ -599,11 +601,9 @@ to do, on purpose."
                         let Some(role) = roles.get(ROLE).cloned() else {
                             return Ok(CallToolResult::error("role missing".to_string()));
                         };
-                        if role.surface.as_deref() == Some("operator")
-                            && (caller.is_some() || !operator_surface)
-                        {
+                        if role.surface.as_deref() == Some("operator") {
                             return Ok(CallToolResult::error(format!(
-                                "role '{}' carries the operator surface, and agents may not start it; ask the operator",
+                                "role '{}' carries the operator surface, which provider-backed agents cannot hold; use stdio or authenticated human HTTP",
                                 role.name
                             )));
                         }
@@ -1701,18 +1701,14 @@ mod tests {
         assert_eq!(ledger.list_agents().await.expect("list").len(), 1);
     }
 
-    /// Configured roles can also select the operator loopback mount. Honor the
-    /// override, but keep the same anti-escalation boundary as spawn_role.
+    /// A configured implementer cannot receive the human-only HTTP operator
+    /// surface, even when a human calls start_issue.
     #[tokio::test]
-    async fn start_issue_refuses_an_operator_role_from_an_agent() {
+    async fn start_issue_refuses_an_operator_role_before_side_effects() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:")
             .await
             .expect("pool");
         let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
-        let parent = ledger
-            .create_agent(&ciacola_core::AgentDef::new("parent", "s"), None)
-            .await
-            .expect("parent");
         let root =
             std::env::temp_dir().join(format!("ciacola-operator-role-{}", ulid::Ulid::new()));
         let mut operator_role = native_implementer_role();
@@ -1730,14 +1726,11 @@ mod tests {
         let mut plugin = RepoWorkerPlugin::default();
         plugin.setup(&ctx).await.expect("setup");
         let start = plugin
-            .tools(Surface::Agent)
+            .tools(Surface::Operator)
             .into_iter()
             .find(|tool| tool.definition().name == "start_issue")
             .expect("start_issue");
-        let mut extensions = Extensions::new();
-        extensions.insert(ciacola_core::AgentIdentity(parent));
-        let request =
-            RequestContext::new(RequestId::Number(71)).with_extensions(Arc::new(extensions));
+        let request = RequestContext::new(RequestId::Number(71));
         let out = start
             .call_with_context(
                 request,
@@ -1746,14 +1739,14 @@ mod tests {
             .await;
         let rendered = serde_json::to_string(&out).expect("render");
         assert!(
-            rendered.contains("carries the operator surface"),
+            rendered.contains("provider-backed agents cannot hold"),
             "must refuse: {rendered}"
         );
         assert!(
             !root.exists(),
             "refusal must happen before clone or worktree"
         );
-        assert_eq!(ledger.list_agents().await.expect("list").len(), 1);
+        assert!(ledger.list_agents().await.expect("list").is_empty());
     }
 
     /// Issue #60: the first live manager-driven run could not use
@@ -1826,6 +1819,14 @@ mod tests {
         // stand-in typed into this test.
         let roles = ctx.roles.clone();
         let manager_role = roles.get(MANAGER).cloned().expect("manager role bundled");
+        assert_eq!(manager_role.surface, None, "manager uses the agent mount");
+        assert!(
+            !manager_role
+                .allowed_tools
+                .iter()
+                .any(|tool| matches!(tool.as_str(), "Bash(gh:*)" | "Bash(git:*)")),
+            "provider manager must not inherit broad publication commands"
+        );
         let manager_args =
             std::collections::HashMap::from([("checkout".to_string(), root.display().to_string())]);
         let manager_def = roles.to_def(&manager_role, &manager_args);

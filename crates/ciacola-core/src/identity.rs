@@ -9,12 +9,13 @@
 //!
 //! What its presence means, precisely:
 //!
-//! - **Present**: the caller is the named agent, because it proved it
-//!   with a secret only its own config file holds. `spawned_by` is
-//!   derived from this and any claimed value is ignored, which is what
-//!   closes the honour-system hole: lineage drives the cost rollup and
-//!   the depth cap, and both were previously built on whatever the
-//!   caller said.
+//! - **Present**: at the protocol boundary, the caller holds the named
+//!   agent's scoped bearer. `spawned_by` is derived from this and any claimed
+//!   value is ignored, which closes the honour-system hole: lineage drives
+//!   the cost rollup and depth cap, and both were previously built on whatever
+//!   the caller said. This is identity inside the shared OS-user trust
+//!   boundary, not proof that another same-user process could not copy the
+//!   bearer.
 //! - **Absent on stdio**: the operator's own terminal. There is no
 //!   HTTP request, so there is nothing to authenticate, and claimed
 //!   attribution is accepted; that a person at the terminal is trusted

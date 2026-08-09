@@ -246,10 +246,10 @@ fn rotation_preamble(name: &str, turns: i64) -> String {
 
 /// The agent's MCP endpoints, with its token on ciacola's own entry.
 ///
-/// The base file names the surface (agent or operator mount) and is
-/// shared; the token is per agent and secret. This reads the shared file
-/// and returns *intent*: a list of endpoints the backend materialises
-/// however its own CLI wants them.
+/// The base file names the endpoints granted to this agent and is shared;
+/// the token is per agent and secret. Ciacola's internal file names only the
+/// ordinary agent mount. This reads the shared file and returns *intent*: a
+/// list of endpoints the backend materialises however its own CLI wants them.
 ///
 /// That is the fix for a real weakness, not a refactor. Core used to
 /// write the merged config itself, to the predictable path

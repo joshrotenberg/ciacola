@@ -5,8 +5,20 @@
 #   mkdir -p "$HOME/.local/share/ciacola"
 #   CIACOLA_DB="$HOME/.local/share/ciacola/ciacola.db" cargo run -p ciacola
 #
-# Without CIACOLA_DB the server uses a temporary database. Always set it
-# before unattended work or a restart will not find the conversations.
+# Without CIACOLA_DB the server uses $XDG_DATA_HOME/ciacola/ciacola.db, or
+# $HOME/.local/share/ciacola/ciacola.db when XDG_DATA_HOME is unset. A
+# temporary fallback is used only when no user data directory can be found.
+#
+# Human HTTP access to /mcp-operator uses a root bearer supplied through an
+# inherited descriptor, never TOML or argv:
+#
+#   cargo build --locked -p ciacola
+#   operator_token="$(openssl rand -hex 32)"  # store it in a credential manager
+#   CIACOLA_OPERATOR_TOKEN_FD=3 ./target/debug/ciacola \
+#     3< <(printf '%s' "$operator_token")
+#
+# Omit it when using stdio only. Every provider-backed agent credential is
+# refused on /mcp-operator; the root bearer is for a human client only.
 
 [runtime]
 # Backend used when a role or agent does not select one. Omit for Claude.
@@ -26,7 +38,7 @@ hermetic = "full"
 
 # Isolation removes the operator's standing rules along with everything
 # else, so put them back deliberately. Inline, or a file, or both.
-house_rules_file = "~/.claude/CLAUDE.md"
+# house_rules_file = "~/.claude/CLAUDE.md"
 
 # Provider config and session directory. Pointing this at the server's
 # own directory keeps transcripts with the run that produced them,
@@ -39,7 +51,8 @@ house_rules_file = "~/.claude/CLAUDE.md"
 # token_env = "CIACOLA_CLAUDE_TOKEN"
 
 # Codex keeps its own auth and sessions here. `codex_token_env` names a source
-# variable whose value is passed only to Codex's child environment.
+# variable that Ciacola maps to `CODEX_API_KEY` for a Codex turn. Treat the
+# server and provider processes as one OS-user trust boundary.
 # codex_home = "~/.local/share/ciacola/codex"
 # codex_token_env = "CIACOLA_CODEX_TOKEN"
 
@@ -65,9 +78,11 @@ max_spawn_depth = 3
 # daily_warn_tokens = 2_000_000
 # daily_stop_tokens = 4_000_000
 
-# Dollar and token stops are independent: reaching either refuses new work,
-# while turns already running finish. Ciacola uses the measurements each
-# backend reports and deliberately carries no provider price table.
+# Dollar and token stops are independent admission breakers: reaching either
+# refuses new work, while admitted and running turns finish. They are not
+# reservations, so one turn can cross the threshold and concurrent turns can
+# multiply the overshoot. Ciacola uses the measurements each backend reports
+# and deliberately carries no provider price table.
 
 # Plugins read their own sections; the server never sees these fields.
 [plugins.repo-worker]
@@ -80,12 +95,9 @@ repos = ["joshrotenberg/mdbook-lint"]
 # Reusable agent definitions, exposed as MCP prompts and to spawn_role.
 # Plugins ship their own; these win on a name collision.
 #
-# `surface` picks which loopback mount a role with `loopback = true` is
-# handed: "agent" (the default; spawn, send, wait and friends) or
-# "operator", which adds the tools that act on the world (kill, open_pr,
-# prune). Reserve "operator" for roles that supervise rather than
-# implement; the shipped repo-manager has it, the issue-implementer
-# never should.
+# Provider-backed roles may use only `surface = "agent"` (the default; spawn,
+# send, wait and friends). `surface = "operator"` is rejected at startup and
+# by every role-spawn path because the root HTTP bearer is human-only.
 # [[roles]]
 # name = "summarizer"
 # description = "Summarizes one PR in five bullets."
