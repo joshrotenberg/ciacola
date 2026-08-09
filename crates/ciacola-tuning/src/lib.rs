@@ -16,6 +16,11 @@
 //! Stateless, like `git`: no tables, no migrations, no store. Every
 //! answer is a query over turns and agent definitions.
 //!
+//! Catalog-role provenance survives instance renaming. Provider, model,
+//! and effort still come from the agent's current persisted definition,
+//! however, so redefining a persistent agent can reclassify its historical
+//! turns. Per-turn provisioning snapshots are a separate future concern.
+//!
 //! Keyed on provider from the start even though there is only one
 //! today. The cross-provider question ("why would Claude hand this to
 //! Codex?") is the one worth being able to answer eventually, and a
@@ -185,7 +190,7 @@ async fn collect(ledger: &Ledger) -> Result<Vec<Stat>, FlatError> {
                     provider: def.provider.to_string(),
                     model: def.model.clone().unwrap_or_else(|| "(default)".into()),
                     effort: def.effort.clone().unwrap_or_else(|| "(default)".into()),
-                    role: def.name.clone(),
+                    role: def.catalog_role().unwrap_or(&def.name).to_string(),
                     cost: measured_cost,
                     cost_state,
                     elapsed_state,
@@ -423,6 +428,7 @@ impl Plugin for TuningPlugin {
 mod tests {
     use super::*;
     use ciacola_core::agent::{AgentDef, Exchange};
+    use ciacola_core::roles::{Role, Roles};
 
     async fn ledger() -> Ledger {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:")
@@ -479,6 +485,54 @@ mod tests {
         )
         .await
         .expect("fail");
+    }
+
+    #[tokio::test]
+    async fn renamed_role_instance_is_filtered_by_its_catalog_role() {
+        let l = ledger().await;
+        let role: Role = serde_json::from_value(json!({
+            "name": "issue-implementer",
+            "description": "implements one issue",
+            "system_prompt": "implement it"
+        }))
+        .expect("role");
+        let roles = Roles::new(vec![role], "agent.json");
+        let mut def = roles.to_def(
+            roles.get("issue-implementer").expect("catalog role"),
+            &std::collections::HashMap::new(),
+        );
+        def.name = "impl-owner-repo-74".into();
+        let agent_id = l.create_agent(&def, None).await.expect("agent");
+        run_ok_turn(&l, &agent_id, 100, 1_000).await;
+
+        let plugin = TuningPlugin {
+            ledger: Some(l.clone()),
+        };
+        let tool = plugin
+            .tools(Surface::Operator)
+            .into_iter()
+            .find(|tool| tool.definition().name == "model_stats")
+            .expect("model_stats");
+        let result = tool.call(json!({"role": "issue-implementer"})).await;
+        let rendered = serde_json::to_string(&result).expect("result");
+
+        assert!(rendered.contains("issue-implementer"), "{rendered}");
+        assert!(rendered.contains("\"runs\":1"), "{rendered}");
+        assert!(!rendered.contains("impl-owner-repo-74"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn direct_and_legacy_definitions_still_group_by_instance_name() {
+        let l = ledger().await;
+        let agent_id = l
+            .create_agent(&AgentDef::new("direct-worker", "sys"), None)
+            .await
+            .expect("agent");
+        run_ok_turn(&l, &agent_id, 100, 1_000).await;
+
+        let stats = collect(&l).await.expect("stats");
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].role, "direct-worker");
     }
 
     /// The point of the whole module: two models must keep their own

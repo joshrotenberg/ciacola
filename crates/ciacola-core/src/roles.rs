@@ -284,7 +284,8 @@ impl Roles {
 
     /// A role plus arguments becomes a definition ready to create.
     pub fn to_def(&self, role: &Role, args: &HashMap<String, String>) -> AgentDef {
-        let mut def = AgentDef::new(&role.name, self.render(role, args));
+        let mut def =
+            AgentDef::new(&role.name, self.render(role, args)).with_catalog_role(role.name.clone());
         if let Some(provider) = &role.provider {
             def = def.provider(provider.as_str());
         }
@@ -818,6 +819,7 @@ mod surface_tests {
         let roles = Roles::new(vec![role(Some("operator"))], "agent.json")
             .with_operator_mcp_config("operator.json");
         let def = roles.to_def(roles.get("r").unwrap(), &HashMap::new());
+        assert_eq!(def.catalog_role(), Some("r"));
         assert_eq!(def.mcp_config.as_deref(), Some("operator.json"));
     }
 
@@ -921,6 +923,7 @@ mod surface_tests {
         let out = spawn
             .call(json!({
                 "role": "r",
+                "name": "named-instance",
                 "arguments": {},
                 "spawned_by": claimed,
             }))
@@ -933,9 +936,10 @@ mod surface_tests {
             .await
             .expect("agents")
             .into_iter()
-            .find(|agent| agent.name == "r")
+            .find(|agent| agent.name == "named-instance")
             .expect("created role agent");
         assert_eq!(created.spawned_by, None);
+        assert_eq!(created.def.catalog_role(), Some("r"));
     }
 
     #[tokio::test]

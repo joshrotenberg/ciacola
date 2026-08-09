@@ -197,6 +197,7 @@ fn agent_json(agent: &AgentRow) -> serde_json::Value {
     json!({
         "agent_id": agent.agent_id,
         "name": agent.name,
+        "role": agent.def.catalog_role(),
         "provider": agent.def.provider,
         "model": agent.def.model,
         "effort": agent.def.effort,
@@ -825,6 +826,34 @@ fn router_with_admission_profile(
 mod telemetry_serialization_tests {
     use super::*;
 
+    fn role_agent() -> AgentRow {
+        let role: crate::roles::Role = serde_json::from_value(json!({
+            "name": "issue-implementer",
+            "description": "implements one issue",
+            "system_prompt": "implement it"
+        }))
+        .expect("role");
+        let roles = crate::roles::Roles::new(vec![role], "agent.json");
+        let mut def = roles.to_def(
+            roles.get("issue-implementer").expect("catalog role"),
+            &std::collections::HashMap::new(),
+        );
+        def.name = "impl-owner-repo-74".into();
+        AgentRow {
+            agent_id: "agent".into(),
+            name: def.name.clone(),
+            def,
+            session: None,
+            cost_micro_usd: 0,
+            state: "idle".into(),
+            turns: 0,
+            spawned_by: None,
+            retired: false,
+            last_active_unix: 0,
+            session_started_seq: 0,
+        }
+    }
+
     fn turn(cost_state: &str, usage_state: &str) -> TurnRow {
         TurnRow {
             agent_id: "agent".into(),
@@ -874,6 +903,13 @@ mod telemetry_serialization_tests {
         assert_eq!(value["tokens_in"], 0);
         assert_eq!(value["tokens_out"], 0);
         assert_eq!(value["elapsed_state"], "measured");
+    }
+
+    #[test]
+    fn agent_json_exposes_instance_name_and_catalog_role() {
+        let value = agent_json(&role_agent());
+        assert_eq!(value["name"], "impl-owner-repo-74");
+        assert_eq!(value["role"], "issue-implementer");
     }
 }
 

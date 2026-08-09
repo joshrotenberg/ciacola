@@ -790,6 +790,7 @@ mod tests {
         let def =
             role_definition(&config, &config.agents[0], &roles, "agent.json").expect("definition");
         assert_eq!(def.name, "repo-manager");
+        assert_eq!(def.catalog_role(), Some("manager"));
         assert_eq!(def.provider.as_str(), "codex");
         assert_eq!(def.system_prompt, "Manage /tmp/repo");
         assert_eq!(

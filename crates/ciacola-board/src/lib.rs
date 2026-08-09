@@ -464,7 +464,7 @@ async fn overview_body(state: &BoardState) -> String {
     }
 
     body.push_str(
-        "<h2>agents</h2><table><tr><th>name</th><th>state</th><th>provider</th>\
+        "<h2>agents</h2><table><tr><th>name</th><th>role</th><th>state</th><th>provider</th>\
         <th class=\"num\">turns</th><th class=\"num\">reported cost</th><th>last active</th>\
         <th>session</th></tr>",
     );
@@ -472,7 +472,7 @@ async fn overview_body(state: &BoardState) -> String {
     let row_html = |agent: &ciacola_core::ledger::AgentRow, child: bool| {
         format!(
             "<tr><td>{indent}<a href=\"/board/agent/{id}\">{name}</a> <span class=\"dim mono\">{short}</span></td>\
-             <td>{chip}</td><td class=\"dim\">{provider}</td><td class=\"num\">{turns}</td><td class=\"num\">{cost}</td>\
+             <td class=\"dim\">{role}</td><td>{chip}</td><td class=\"dim\">{provider}</td><td class=\"num\">{turns}</td><td class=\"num\">{cost}</td>\
              <td class=\"dim\">{active}</td><td class=\"dim mono\">{session}</td></tr>",
             indent = if child {
                 "<span class=\"dim\">&nbsp;&nbsp;&#8627;&nbsp;</span>"
@@ -482,6 +482,7 @@ async fn overview_body(state: &BoardState) -> String {
             id = esc(&agent.agent_id),
             name = esc(&agent.name),
             short = esc(&agent.agent_id[agent.agent_id.len().saturating_sub(6)..]),
+            role = esc(agent.def.catalog_role().unwrap_or("-")),
             chip = chip(&agent.state),
             provider = esc(agent.def.provider.as_str()),
             turns = agent.turns,
@@ -756,11 +757,12 @@ async fn agent_page(State(state): State<BoardState>, Path(agent_id): Path<String
     );
     body.push_str(&format!(
         "<h2>provisioning</h2><table>\
-         <tr><th>model</th><th>effort</th><th>max turns</th><th>rotates</th>\
+         <tr><th>role</th><th>model</th><th>effort</th><th>max turns</th><th>rotates</th>\
          <th>working dir</th></tr>\
-         <tr><td>{model}</td><td>{effort}</td><td>{max_turns}</td><td>{rotate}</td>\
+         <tr><td>{role}</td><td>{model}</td><td>{effort}</td><td>{max_turns}</td><td>{rotate}</td>\
          <td class=\"mono dim\">{dir}</td></tr></table>\
          <p class=\"dim\">tools: {tools}</p>",
+        role = esc(agent.def.catalog_role().unwrap_or("-")),
         model = esc(agent.def.model.as_deref().unwrap_or("(default)")),
         effort = esc(agent.def.effort.as_deref().unwrap_or("(default)")),
         max_turns = agent
@@ -878,6 +880,22 @@ mod tests {
         }
     }
 
+    async fn role_agent(state: &BoardState) -> String {
+        let role: ciacola_core::roles::Role = serde_json::from_value(serde_json::json!({
+            "name": "issue-implementer",
+            "description": "implements one issue",
+            "system_prompt": "implement it"
+        }))
+        .expect("role");
+        let roles = ciacola_core::roles::Roles::new(vec![role], "agent.json");
+        let mut def = roles.to_def(
+            roles.get("issue-implementer").expect("catalog role"),
+            &std::collections::HashMap::new(),
+        );
+        def.name = "impl-owner-repo-74".into();
+        state.ledger.create_agent(&def, None).await.expect("agent")
+    }
+
     fn turn(cost_state: &str, usage_state: &str) -> TurnRow {
         TurnRow {
             agent_id: "agent".into(),
@@ -932,6 +950,20 @@ mod tests {
         let measured = turn_html(&turn("reported", "reported"));
         assert!(measured.contains("$0.0000"), "{measured}");
         assert!(measured.contains("0 in / 0 out"), "{measured}");
+    }
+
+    #[tokio::test]
+    async fn board_list_and_detail_show_instance_name_and_catalog_role() {
+        let state = state().await;
+        let agent_id = role_agent(&state).await;
+
+        let overview = overview_body(&state).await;
+        assert!(overview.contains("impl-owner-repo-74"), "{overview}");
+        assert!(overview.contains("issue-implementer"), "{overview}");
+
+        let detail = agent_page(State(state), Path(agent_id)).await.0;
+        assert!(detail.contains("impl-owner-repo-74"), "{detail}");
+        assert!(detail.contains("issue-implementer"), "{detail}");
     }
 
     #[test]
