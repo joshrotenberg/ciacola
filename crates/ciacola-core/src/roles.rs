@@ -111,11 +111,21 @@ pub struct Runtime {
     /// A file to read them from instead, typically the operator's own
     /// `CLAUDE.md`. Appended after any inline rules.
     pub house_rules_file: Option<String>,
-    /// Environment variable holding a long-lived provider token, for
-    /// use with an isolated `claude_home`. Mint one with
-    /// `claude setup-token`. The name, never the value.
+    /// Additional ambient environment variables copied by exact name into
+    /// the provider-child snapshot at startup.
+    ///
+    /// The provider-neutral baseline already covers path, home/user identity,
+    /// temp directories, and locale. SSH agents, Git overrides, proxies,
+    /// GitHub tokens, client bearers, Ciacola variables, and unrelated secrets
+    /// are absent unless named here. Each adapter still removes its own auth,
+    /// routing, and config selectors before applying the intended credential.
+    #[serde(default)]
+    pub provider_env_passthrough: Vec<String>,
+    /// Deprecated startup-environment credential source retained only so old
+    /// config receives a precise migration error instead of an unknown field.
     pub token_env: Option<String>,
-    /// Environment variable holding a Codex API key for isolated runs.
+    /// Deprecated Codex startup-environment credential source retained only
+    /// for migration diagnostics.
     pub codex_token_env: Option<String>,
 }
 
@@ -124,17 +134,20 @@ impl Runtime {
     /// login, rather than letting the first turn fail on it. The check
     /// is a heuristic (the CLI may keep credentials in a keychain), so
     /// it warns and continues.
-    pub fn check_provider_homes(&self) {
+    pub fn check_provider_homes(
+        &self,
+        claude_descriptor_credential: bool,
+        codex_descriptor_credential: bool,
+    ) {
         if let Some(home) = &self.claude_home {
             let expanded = expand_home_path(home);
             let dir = std::path::Path::new(&expanded);
-            if self.token_env.is_none() && !dir.join(".credentials.json").exists() {
+            if !claude_descriptor_credential && !dir.join(".credentials.json").exists() {
                 eprintln!(
                     "[runtime] warning: claude_home {home} has no .credentials.json. \
                      CLAUDE_CONFIG_DIR isolates the login as well as the session data, \
-                     so agents may fail with \"Not logged in\". Either mint a token \
-                     with `claude setup-token` and point [runtime] token_env at the \
-                     variable holding it, or unset claude_home."
+                     so agents need a separately authenticated home or, on Unix, a \
+                     CIACOLA_CLAUDE_TOKEN_FD startup credential."
                 );
             }
         }
@@ -142,12 +155,11 @@ impl Runtime {
         if let Some(home) = &self.codex_home {
             let expanded = expand_home_path(home);
             let dir = std::path::Path::new(&expanded);
-            if self.codex_token_env.is_none() && !dir.join("auth.json").exists() {
+            if !codex_descriptor_credential && !dir.join("auth.json").exists() {
                 eprintln!(
-                    "[runtime] warning: codex_home {home} has no auth.json and no \
-                     codex_token_env. CODEX_HOME isolates login state, so Codex agents \
-                     may fail to authenticate. Log that home in separately, configure \
-                     codex_token_env, or unset codex_home."
+                    "[runtime] warning: codex_home {home} has no auth.json. CODEX_HOME \
+                     isolates login state, so agents need a separately authenticated \
+                     home or, on Unix, a CIACOLA_CODEX_TOKEN_FD startup credential."
                 );
             }
         }
@@ -328,16 +340,13 @@ impl Roles {
             .as_deref()
             .or(self.runtime.default_provider.as_deref())
             .unwrap_or(ciacola_agent::ProviderKey::CLAUDE);
-        let (home, token_env) = if provider == "codex" {
-            (&self.runtime.codex_home, &self.runtime.codex_token_env)
+        let home = if provider == "codex" {
+            &self.runtime.codex_home
         } else {
-            (&self.runtime.claude_home, &self.runtime.token_env)
+            &self.runtime.claude_home
         };
         if let Some(home) = home {
             def = def.config_home(home);
-        }
-        if let Some(token_env) = token_env {
-            def = def.token_env(token_env);
         }
         if let Some(rules) = self.house_rules.as_ref() {
             def = def.house_rules(rules.as_str());

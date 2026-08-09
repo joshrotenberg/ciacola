@@ -148,6 +148,21 @@ fn parse(text: &str) -> Result<Config, FlatError> {
 fn validate(config: &Config) -> Result<(), FlatError> {
     config.limits.validate()?;
     validate_sandbox("runtime", config.runtime.sandbox.as_deref())?;
+    ciacola_agent::ProviderChildEnvironment::validate_passthrough(
+        &config.runtime.provider_env_passthrough,
+    )?;
+    if config.runtime.token_env.is_some() {
+        return Err(
+            "runtime.token_env is retired because startup environment secrets may remain visible to same-user process inspection; pass the token through CIACOLA_CLAUDE_TOKEN_FD or authenticate claude_home separately"
+                .into(),
+        );
+    }
+    if config.runtime.codex_token_env.is_some() {
+        return Err(
+            "runtime.codex_token_env is retired because startup environment secrets may remain visible to same-user process inspection; pass the token through CIACOLA_CODEX_TOKEN_FD or authenticate codex_home separately"
+                .into(),
+        );
+    }
     for role in &config.roles {
         if role.inherit_provider_tools && !role.allowed_tools.is_empty() {
             return Err(format!(
@@ -324,16 +339,13 @@ fn role_definition(
         })
         .or(config.runtime.default_provider.as_deref())
         .unwrap_or(ciacola_agent::ProviderKey::CLAUDE);
-    let (home, token_env) = if provider == "codex" {
-        (&config.runtime.codex_home, &config.runtime.codex_token_env)
+    let home = if provider == "codex" {
+        &config.runtime.codex_home
     } else {
-        (&config.runtime.claude_home, &config.runtime.token_env)
+        &config.runtime.claude_home
     };
     if let Some(home) = home {
         def = def.config_home(home);
-    }
-    if let Some(token_env) = token_env {
-        def = def.token_env(token_env);
     }
     Ok(def)
 }
@@ -434,7 +446,7 @@ mod tests {
                 default_provider = "codex"
                 sandbox = "workspace-write-no-network"
                 codex_home = "~/.local/share/ciacola/codex"
-                codex_token_env = "CIACOLA_CODEX_TOKEN"
+                provider_env_passthrough = ["SSH_AUTH_SOCK", "HTTPS_PROXY", "CIACOLA_SENTINEL"]
 
                 [[roles]]
                 name = "implementer"
@@ -458,7 +470,75 @@ mod tests {
             def.config_home.as_deref(),
             Some("~/.local/share/ciacola/codex")
         );
-        assert_eq!(def.token_env.as_deref(), Some("CIACOLA_CODEX_TOKEN"));
+        assert!(def.token_env.is_none());
+        assert_eq!(
+            config.runtime.provider_env_passthrough,
+            ["SSH_AUTH_SOCK", "HTTPS_PROXY", "CIACOLA_SENTINEL"]
+        );
+    }
+
+    #[test]
+    fn legacy_token_environment_settings_fail_with_descriptor_migration() {
+        let claude = parse(
+            r#"
+                [runtime]
+                token_env = "CIACOLA_CLAUDE_TOKEN"
+            "#,
+        )
+        .expect_err("startup environment secrets are retired");
+        assert!(claude.to_string().contains("runtime.token_env"), "{claude}");
+        assert!(
+            claude.to_string().contains("CIACOLA_CLAUDE_TOKEN_FD"),
+            "{claude}"
+        );
+        assert!(claude.to_string().contains("claude_home"), "{claude}");
+
+        let codex = parse(
+            r#"
+                [runtime]
+                codex_token_env = "CIACOLA_CODEX_TOKEN"
+            "#,
+        )
+        .expect_err("startup environment secrets are retired");
+        assert!(
+            codex.to_string().contains("runtime.codex_token_env"),
+            "{codex}"
+        );
+        assert!(
+            codex.to_string().contains("CIACOLA_CODEX_TOKEN_FD"),
+            "{codex}"
+        );
+        assert!(codex.to_string().contains("codex_home"), "{codex}");
+    }
+
+    #[test]
+    fn provider_environment_passthrough_is_exact_and_legacy_configs_default_empty() {
+        let legacy = parse("").expect("a pre-field config remains valid");
+        assert!(legacy.runtime.provider_env_passthrough.is_empty());
+
+        let sensitive = parse(
+            r#"
+                [runtime]
+                provider_env_passthrough = [
+                    "MCP_BEARER",
+                    "CIACOLA_SENTINEL",
+                    "ANTHROPIC_API_KEY",
+                    "CODEX_API_KEY",
+                ]
+            "#,
+        )
+        .expect("sensitive values may be deliberately allowlisted by exact name");
+        assert_eq!(sensitive.runtime.provider_env_passthrough.len(), 4);
+
+        let malformed = parse(
+            r#"
+                [runtime]
+                provider_env_passthrough = ["HAS-DASH"]
+            "#,
+        )
+        .expect_err("non-portable names must fail at config validation");
+        assert!(malformed.to_string().contains("HAS-DASH"), "{malformed}");
+        assert!(malformed.to_string().contains("portable"), "{malformed}");
     }
 
     #[test]

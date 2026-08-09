@@ -50,6 +50,7 @@ use sqlx::SqlitePool;
 
 mod config;
 mod operator_auth;
+mod provider_auth;
 use tower_mcp::context::notification_channel;
 use tower_mcp::transport::{GenericStdioTransport, HttpTransport};
 
@@ -186,18 +187,59 @@ fn provider_protection_summary(
     }
 }
 
+fn without_credential_descriptor_metadata(
+    environment: ciacola_agent::ProviderChildEnvironment,
+) -> ciacola_agent::ProviderChildEnvironment {
+    environment.excluding(
+        &[
+            operator_auth::OPERATOR_TOKEN_FD_ENV,
+            provider_auth::CLAUDE_TOKEN_FD_ENV,
+            provider_auth::CODEX_TOKEN_FD_ENV,
+        ],
+        &[],
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Configuration and the provider-child environment snapshot are resolved
+    // before Tokio exists. Exact passthrough may deliberately include a value
+    // (including MCP_BEARER); the ambient copy is removed below before any
+    // provider child can exist.
+    let config_path = std::env::var("CIACOLA_CONFIG").ok();
+    let declared = config::load_startup(config_path.as_deref())?;
+    let child_environment =
+        without_credential_descriptor_metadata(ciacola_agent::ProviderChildEnvironment::capture(
+            &declared.runtime.provider_env_passthrough,
+        )?);
+
+    provider_auth::validate_distinct_descriptors()?;
     // Consume the human HTTP credential before Tokio creates worker threads
     // and before any provider child can inherit the server environment.
-    let operator_token = operator_auth::take_from_environment()?;
+    let allow_client_bearer = declared
+        .runtime
+        .provider_env_passthrough
+        .iter()
+        .any(|name| name == "MCP_BEARER");
+    let operator_token = operator_auth::take_from_environment(allow_client_bearer)?;
+    let provider_credentials = provider_auth::take_from_environment()?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run(operator_token))
+        .block_on(run(
+            operator_token,
+            provider_credentials,
+            child_environment,
+            config_path,
+            declared,
+        ))
 }
 
 async fn run(
     operator_token: Option<operator_auth::HumanOperatorToken>,
+    provider_credentials: provider_auth::ProviderCredentials,
+    child_environment: ciacola_agent::ProviderChildEnvironment,
+    config_path: Option<String>,
+    declared_early: config::Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Seeded now so the split into real crates inherits instrumentation
     // rather than needing it retrofitted. Off unless RUST_LOG asks, and
@@ -238,7 +280,6 @@ async fn run(
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(4823);
-    let config_path = std::env::var("CIACOLA_CONFIG").ok();
     eprintln!(
         "[ciacola] operator HTTP: {}",
         if operator_token.is_some() {
@@ -250,7 +291,6 @@ async fn run(
 
     let pool =
         SqlitePool::connect(&format!("sqlite://{}?mode=rwc", database.path.display())).await?;
-    let declared_early = config::load_startup(config_path.as_deref())?;
     eprintln!(
         "[ciacola] config: {}",
         config_path.as_deref().unwrap_or(config::DEFAULT_PATH)
@@ -260,7 +300,19 @@ async fn run(
     // this registry and never learns what is behind it. A second
     // adapter is one more line here plus one more dependency, which is
     // the whole point of the seam.
-    let mut codex_provider = ciacola_agent_codex::CodexProvider::new();
+    let has_claude_credential = provider_credentials.claude.is_some();
+    let has_codex_credential = provider_credentials.codex.is_some();
+    let claude_provider = ciacola_agent_claude::ClaudeProvider::new(
+        child_environment.clone(),
+        provider_credentials
+            .claude
+            .map(provider_auth::ProviderToken::into_string),
+    );
+    let mut codex_provider =
+        ciacola_agent_codex::CodexProvider::new().with_child_environment(child_environment);
+    if let Some(credential) = provider_credentials.codex {
+        codex_provider = codex_provider.with_credential(credential.into_string());
+    }
     match codex_provider.detect_cli_capabilities().await {
         Ok((version, status)) => eprintln!("[ciacola] codex CLI {version}: {status:?}"),
         Err(error) => eprintln!(
@@ -269,7 +321,7 @@ async fn run(
         ),
     }
     let providers = ciacola_agent::ProviderRegistry::new()
-        .with(std::sync::Arc::new(ciacola_agent_claude::ClaudeProvider))
+        .with(std::sync::Arc::new(claude_provider))
         .and_then(|providers| providers.with(std::sync::Arc::new(codex_provider)))
         .map_err(|e| -> ciacola_core::FlatError { e.to_string().into() })?;
     declared_early.limits.validate_providers(&providers)?;
@@ -330,7 +382,9 @@ async fn run(
     let drain_exec = exec.clone();
 
     let declared = declared_early;
-    declared.runtime.check_provider_homes();
+    declared
+        .runtime
+        .check_provider_homes(has_claude_credential, has_codex_credential);
     eprintln!("[ciacola] limits: {}", declared.limits.summary());
 
     // The whole registration surface. Order is contribution order:
@@ -685,6 +739,36 @@ mod tests {
             database.path,
             Path::new("/home/example/.local/share/ciacola/ciacola.db")
         );
+    }
+
+    #[test]
+    fn provider_snapshot_never_grants_startup_credential_descriptor_metadata() {
+        let environment = ciacola_agent::ProviderChildEnvironment::from_values([
+            (operator_auth::OPERATOR_TOKEN_FD_ENV, "3"),
+            (provider_auth::CLAUDE_TOKEN_FD_ENV, "4"),
+            (provider_auth::CODEX_TOKEN_FD_ENV, "5"),
+            ("MCP_BEARER", "deliberately-allowed-client-value"),
+            (
+                "CIACOLA_WORKFLOW_SENTINEL",
+                "deliberately-allowed-workflow-value",
+            ),
+        ])
+        .expect("portable environment names");
+
+        let stripped = without_credential_descriptor_metadata(environment);
+
+        for name in [
+            operator_auth::OPERATOR_TOKEN_FD_ENV,
+            provider_auth::CLAUDE_TOKEN_FD_ENV,
+            provider_auth::CODEX_TOKEN_FD_ENV,
+        ] {
+            assert!(
+                stripped.get(name).is_none(),
+                "descriptor metadata {name} survived"
+            );
+        }
+        assert!(stripped.get("MCP_BEARER").is_some());
+        assert!(stripped.get("CIACOLA_WORKFLOW_SENTINEL").is_some());
     }
 
     fn protection_capability(

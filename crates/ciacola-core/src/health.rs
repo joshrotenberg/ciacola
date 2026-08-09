@@ -131,13 +131,22 @@ impl Health {
                 .ok()
                 .and_then(|(v,)| v);
 
-        // Agents whose current session is long. This is the number that
-        // predicts a hard failure rather than a slow one: an unrotated
-        // session eventually exceeds the provider's context.
+        // Agents whose current session is long. Count literal terminal
+        // provider attempts from the recorded session origin: sequence
+        // arithmetic is intentionally zero-based for rotation, but is not a
+        // turn count. An origin of zero is an assigned session that has not
+        // opened yet, regardless of how much history the agent has. Queued,
+        // running, and explicit pre-provider failures are not completed
+        // attempts.
         let sessions = sqlx::query_as::<_, (String, String, i64)>(
             "SELECT a.agent_id, a.name,
-                    (SELECT COALESCE(MAX(seq), 0) FROM turns t WHERE t.agent_id = a.agent_id)
-                        - a.session_started_seq
+                    CASE WHEN a.session_started_seq = 0 THEN 0 ELSE
+                        (SELECT COUNT(*) FROM turns t
+                          WHERE t.agent_id = a.agent_id
+                            AND t.seq >= a.session_started_seq
+                            AND t.state IN ('ok', 'failed', 'killed')
+                            AND t.elapsed_state <> 'not_attempted')
+                    END
              FROM agents a WHERE a.retired = 0
              ORDER BY 3 DESC LIMIT 5",
         )
@@ -366,6 +375,180 @@ mod tests {
     use super::*;
     use crate::agent::{AgentDef, Exchange};
     use crate::ledger::Ledger;
+
+    fn completed_exchange(session: &str) -> Exchange {
+        Exchange {
+            reply: "done".into(),
+            session: Some(session.into()),
+            cost: ciacola_agent::Cost::Reported { micro_usd: 0 },
+            usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage::default()),
+            usage_complete: true,
+            provider_turns: Some(1),
+            elapsed_ms: 1,
+            error: None,
+            failure_kind: None,
+        }
+    }
+
+    async fn enqueue(ledger: &Ledger, agent_id: &str, prompt: &str) -> i64 {
+        ledger
+            .enqueue_turn(agent_id, prompt)
+            .await
+            .unwrap_or_else(|error| panic!("enqueue '{prompt}': {error}"))
+    }
+
+    async fn claim(ledger: &Ledger, agent_id: &str, seq: i64) {
+        assert!(ledger.claim_turn(agent_id, seq).await.expect("claim turn"));
+    }
+
+    async fn complete(ledger: &Ledger, agent_id: &str, seq: i64, session: &str) {
+        assert!(
+            ledger
+                .complete_turn(agent_id, seq, &completed_exchange(session))
+                .await
+                .expect("complete turn")
+        );
+    }
+
+    async fn abort_before_provider(ledger: &Ledger, agent_id: &str, seq: i64) {
+        assert!(
+            ledger
+                .abort_claimed_turn(agent_id, seq, "provider not launched")
+                .await
+                .expect("abort before provider")
+        );
+    }
+
+    async fn fail_after_provider(ledger: &Ledger, agent_id: &str, seq: i64) {
+        let failure = Exchange {
+            reply: String::new(),
+            session: None,
+            cost: ciacola_agent::Cost::Unreported,
+            usage: ciacola_agent::Usage::Unreported,
+            usage_complete: false,
+            provider_turns: None,
+            elapsed_ms: 1,
+            error: Some("provider failed".into()),
+            failure_kind: Some(ciacola_agent::FailureKind::Reported),
+        };
+        assert!(
+            ledger
+                .fail_exchange(agent_id, seq, "failed", "provider failed", &failure)
+                .await
+                .expect("settle attempted failure")
+        );
+    }
+
+    async fn turns_in_session(health: &Health, agent_id: &str) -> i64 {
+        health.report().await["longest_sessions"]
+            .as_array()
+            .expect("longest_sessions array")
+            .iter()
+            .find(|session| session["agent_id"] == agent_id)
+            .expect("active agent in health report")["turns_in_session"]
+            .as_i64()
+            .expect("literal turn count")
+    }
+
+    #[tokio::test]
+    async fn health_reports_literal_attempted_turns_in_the_current_session() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool).await.expect("ledger");
+        let agent_id = ledger
+            .create_agent(&AgentDef::new("session-count", "s"), None)
+            .await
+            .expect("agent");
+        let opening_session = ledger
+            .get_agent(&agent_id)
+            .await
+            .expect("agent query")
+            .expect("agent row")
+            .session
+            .expect("assigned session");
+        let health = Health::new(ledger.clone(), "");
+
+        assert_eq!(turns_in_session(&health, &agent_id).await, 0);
+
+        let opening = enqueue(&ledger, &agent_id, "opening").await;
+        assert_eq!(
+            turns_in_session(&health, &agent_id).await,
+            0,
+            "a queued opening is not a provider attempt"
+        );
+        claim(&ledger, &agent_id, opening).await;
+        complete(&ledger, &agent_id, opening, &opening_session).await;
+        assert_eq!(turns_in_session(&health, &agent_id).await, 1);
+
+        let second = enqueue(&ledger, &agent_id, "second").await;
+        claim(&ledger, &agent_id, second).await;
+        assert_eq!(
+            turns_in_session(&health, &agent_id).await,
+            1,
+            "a claimed but unfinished turn is not yet a completed attempt"
+        );
+        complete(&ledger, &agent_id, second, &opening_session).await;
+        assert_eq!(turns_in_session(&health, &agent_id).await, 2);
+
+        let queued = enqueue(&ledger, &agent_id, "queued third").await;
+        assert_eq!(
+            turns_in_session(&health, &agent_id).await,
+            2,
+            "a later queued row must not advance the count"
+        );
+        assert!(
+            ledger
+                .interrupt_turn(&agent_id, queued, "killed", "stopped before claim")
+                .await
+                .expect("settle queued turn")
+        );
+        assert_eq!(
+            turns_in_session(&health, &agent_id).await,
+            2,
+            "an explicit non-attempt must not advance the count"
+        );
+
+        let rotated_session = "rotated-session";
+        ledger
+            .assign_session(&agent_id, rotated_session)
+            .await
+            .expect("rotate session");
+        assert_eq!(
+            turns_in_session(&health, &agent_id).await,
+            0,
+            "an assigned-but-unopened session must not inherit history"
+        );
+
+        let failed_before_provider = enqueue(&ledger, &agent_id, "pre-provider failure").await;
+        claim(&ledger, &agent_id, failed_before_provider).await;
+        abort_before_provider(&ledger, &agent_id, failed_before_provider).await;
+        assert_eq!(turns_in_session(&health, &agent_id).await, 0);
+
+        let rotated_opening = enqueue(&ledger, &agent_id, "rotated opening").await;
+        claim(&ledger, &agent_id, rotated_opening).await;
+        complete(&ledger, &agent_id, rotated_opening, rotated_session).await;
+        assert_eq!(turns_in_session(&health, &agent_id).await, 1);
+
+        let later_non_attempt = enqueue(&ledger, &agent_id, "later pre-provider failure").await;
+        claim(&ledger, &agent_id, later_non_attempt).await;
+        abort_before_provider(&ledger, &agent_id, later_non_attempt).await;
+        assert_eq!(turns_in_session(&health, &agent_id).await, 1);
+
+        let attempted_failure = enqueue(&ledger, &agent_id, "provider failure").await;
+        claim(&ledger, &agent_id, attempted_failure).await;
+        assert_eq!(
+            turns_in_session(&health, &agent_id).await,
+            1,
+            "running work is not counted before it reaches a terminal state"
+        );
+        fail_after_provider(&ledger, &agent_id, attempted_failure).await;
+        assert_eq!(
+            turns_in_session(&health, &agent_id).await,
+            2,
+            "a terminal provider-attempted failure is a literal turn"
+        );
+    }
 
     #[tokio::test]
     async fn health_counts_reported_zero_separately_from_unreported() {

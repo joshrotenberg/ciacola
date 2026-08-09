@@ -124,6 +124,23 @@ demonstrates the expected boundary overshoot—one complete short response was
 already available when enforcement stopped further work—but no numeric
 overshoot is claimed because 0.145.0 omitted terminal usage on both turns.
 
+A separate paid #80 proof on Codex 0.145.0 ran the new clean-child contract
+with conflicting ambient OpenAI, Anthropic, and Ciacola sentinel credentials.
+The opening replied `OPEN_ENV_CLEAN` in 10.538 seconds (32,099 input / 411
+output / 22,016 cached), and the resume replied `RESUME_ENV_CLEAN` in 9.191
+seconds (65,113 input / 697 output / 54,272 cached). Both retained provider
+session `019fe739-1c14-7af2-8014-8e74f52088ad`, and the model-launched shell
+observed the baseline `HOME`/`PATH` but none of the conflicting names.
+
+The equivalent paid Claude 2.1.220 proof is also green. With conflicting
+ambient Anthropic, Claude, OpenAI, Ciacola, and unrelated sentinel credentials,
+the opening replied `OPEN_ENV_CLEAN` and the resume replied
+`RESUME_ENV_CLEAN`. Both retained the same nonempty provider session; the
+model-launched shell saw `HOME`/`PATH` and none of the conflicting names.
+Deterministic fake opening/resume and the whole-binary Codex descriptor path
+remain covered in-tree. Credential values and run-specific accounting are not
+retained in this public handoff.
+
 ## Layout, and where the line falls
 
 ```
@@ -218,9 +235,14 @@ trust boundary.
 
 ## Known broken, in the order it will annoy you
 
-1. **`CLAUDE_CONFIG_DIR` isolates the login.** A fresh `claude_home`
-   authenticates as nobody. `claude setup-token` plus `token_env` is
-   the route through, and the server warns at boot.
+1. **A provider home selects its own login.** A fresh `claude_home` or
+   `codex_home` authenticates as nobody. Log that home in separately, or on
+   Unix pass a credential through `CIACOLA_CLAUDE_TOKEN_FD` /
+   `CIACOLA_CODEX_TOKEN_FD` when launching the built binary; Windows uses the
+   logged-in home. The retired runtime `token_env` settings fail at config load
+   with migration guidance. Config-managed agents are then redefined safely;
+   another persisted agent carrying the legacy marker must be replaced or
+   retired and recreated, because a new descriptor alone cannot erase it.
 2. **`wait` is shadowed in mcp-repl.** `wait` is one of the six verbs
    and also an mcp-repl built-in (wait for a background task), and the
    built-in wins: typing `wait` gets "no tasks in this session to wait
@@ -232,14 +254,14 @@ trust boundary.
    and nothing here changes.
 ## What to do next, roughly in order
 
-**Real use, on more than one repository.** The system has taken exactly
-one issue to a merged pull request. That went well (it moved code
-*down* a crate rather than adding a dependency edge, and audited a test
-before deleting it), but one is not a sample. Try a second repo, and
-try something that is not software: roles assume a system prompt plus a
-thin template, the kanban assumes discrete items, `git` simply goes
-quiet. Whether the primitive holds outside code is the interesting
-unknown.
+**Land provider child isolation (#80), then choose the delegated-supervision
+backend (#81).** The deterministic environment, FD-ingress, opening, resume,
+and whole-binary paths are covered, and both paid provider proofs above are
+green. Merge #91 and close #80. The #81 ADR and fail-closed policy seam are in
+draft #92; do not restore any provider-backed operator role until a human picks
+an isolation backend and adversarial dogfood proves process provenance,
+attenuation, revocation, and sibling-steal resistance rather than another
+bearer in the shared OS-user boundary.
 
 **Continue dogfooding the Codex provider.** The adapter is now a separate crate behind
 the same registry as Claude. It preserves Codex thread ids as soon as the

@@ -14,6 +14,7 @@
 
 #![warn(missing_docs)]
 
+use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -21,7 +22,8 @@ use std::time::{Duration, Instant};
 
 use ciacola_agent::{
     AgentError, BoxFut, CacheTreatment, Capabilities, CeilingCapability, EnforcementGranularity,
-    MeterId, Provider, ProviderKey, ResumeId, TurnEvents, TurnIntent, TurnOutcome,
+    MeterId, Provider, ProviderChildEnvironment, ProviderKey, ResumeId, TurnEvents, TurnIntent,
+    TurnOutcome,
 };
 use codex_wrapper::{
     CliVersion, CliVersionStatus, Codex, JsonLineEvent, TESTED_CLI_VERSION_MAX,
@@ -42,18 +44,58 @@ pub const PROVIDER_ROLLOUT_METER: &str =
     "codex.rollout_budget.provider_units_or_weighted_fallback.v1";
 
 /// The Codex backend.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct CodexProvider {
     binary: Option<PathBuf>,
     binary_args: Vec<String>,
     timeout: Option<Duration>,
     turn_ceiling: Option<CeilingCapability>,
+    child_environment: ProviderChildEnvironment,
+    credential: Option<Arc<str>>,
+}
+
+impl fmt::Debug for CodexProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexProvider")
+            .field("binary", &self.binary)
+            .field("binary_args", &self.binary_args)
+            .field("timeout", &self.timeout)
+            .field("turn_ceiling", &self.turn_ceiling)
+            .field("child_environment", &self.child_environment)
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl CodexProvider {
     /// Use the Codex binary discovered on `PATH`.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Use the startup-captured environment explicitly granted to provider
+    /// children.
+    ///
+    /// Values remain in memory on this provider object and are never copied
+    /// into an agent definition, turn, command line, or ledger row.
+    #[must_use]
+    pub fn with_child_environment(mut self, environment: ProviderChildEnvironment) -> Self {
+        self.child_environment = environment;
+        self
+    }
+
+    /// Select one Codex API credential held only in adapter memory.
+    ///
+    /// The direct child receives it under the canonical `CODEX_API_KEY`
+    /// selector after every ambient Codex/OpenAI selector has been removed.
+    #[must_use]
+    pub fn with_credential(mut self, credential: String) -> Self {
+        self.credential = Some(Arc::from(credential));
+        self
     }
 
     /// Detect the installed CLI version once and freeze the matching ceiling
@@ -97,7 +139,21 @@ impl CodexProvider {
         intent: Option<&TurnIntent>,
         env: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Codex, AgentError> {
-        let mut builder = Codex::builder();
+        if intent.is_some_and(|intent| intent.token_env.is_some()) {
+            return Err(AgentError::Io {
+                detail: "legacy AgentDef.token_env blocks launch; reapply a config-managed definition or retire and recreate this agent, then use CIACOLA_CODEX_TOKEN_FD at startup or a separately authenticated codex_home"
+                    .into(),
+            });
+        }
+
+        // The wrapper's opt-in clear is the load-bearing direct-child
+        // boundary. Apply the neutral startup snapshot after removing every
+        // selector Codex itself owns; intended home/credential and child-only
+        // MCP header variables are layered after it below.
+        let child_environment = self
+            .child_environment
+            .excluding(&[], &["CODEX_", "OPENAI_", "AZURE_OPENAI_"]);
+        let mut builder = Codex::builder().clear_env().envs(child_environment.iter());
         if let Some(binary) = &self.binary {
             builder = builder.binary(binary);
         }
@@ -117,21 +173,8 @@ impl CodexProvider {
                 })?;
                 builder = builder.env("CODEX_HOME", home);
             }
-            if intent.config_home.is_some() || intent.token_env.is_some() {
-                for variable in codex_wrapper::auth::AUTH_ENV_VARS {
-                    builder = builder.env(variable, "");
-                }
-            }
-            if let Some(variable) = &intent.token_env {
-                match std::env::var(variable) {
-                    Ok(token) if !token.is_empty() => {
-                        builder = builder.env("CODEX_API_KEY", token);
-                    }
-                    _ => tracing::warn!(
-                        variable,
-                        "token_env is set but the variable is empty or unset"
-                    ),
-                }
+            if let Some(credential) = &self.credential {
+                builder = builder.env("CODEX_API_KEY", credential.as_ref());
             }
         }
         builder = builder.envs(env);
@@ -300,6 +343,8 @@ mod tests {
         Constraint, Cost, Isolation, McpEndpoint, McpScope, NoEvents, Sandbox, TokenUsage, Usage,
     };
 
+    const ENV_WORKER_ROOT: &str = "CIACOLA_CODEX_ENV_WORKER_ROOT";
+
     fn fixture(name: &str, args: impl IntoIterator<Item = String>) -> CodexProvider {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -311,7 +356,33 @@ mod tests {
                 .collect(),
             timeout: Some(Duration::from_secs(3)),
             turn_ceiling: None,
+            ..Default::default()
         }
+    }
+
+    fn captured_environment(path: &Path) -> std::collections::BTreeMap<String, String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+            .lines()
+            .filter_map(|line| {
+                line.split_once('=')
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
+    fn environment_keys(environment: &std::collections::BTreeMap<String, String>) -> Vec<&str> {
+        environment.keys().map(String::as_str).collect()
+    }
+
+    fn environment_fixture(
+        capture: &Path,
+        environment: ProviderChildEnvironment,
+        credential: &str,
+    ) -> CodexProvider {
+        fixture("fake-codex-environment.sh", [capture.display().to_string()])
+            .with_child_environment(environment)
+            .with_credential(credential.to_string())
     }
 
     fn intent(prompt: &str) -> TurnIntent {
@@ -337,6 +408,7 @@ mod tests {
             binary_args: vec!["-c".into(), format!("printf '%s\\n' 'codex-cli {version}'")],
             timeout: Some(Duration::from_secs(3)),
             turn_ceiling: None,
+            ..Default::default()
         }
     }
 
@@ -485,7 +557,6 @@ mod tests {
         intent.allowed_tools = None;
         intent.isolation = Isolation::Full;
         intent.config_home = Some("/tmp/codex-home".into());
-        intent.token_env = Some("CIACOLA_CODEX_TOKEN".into());
         intent.sandbox = Sandbox::WorkspaceWriteNoNetwork;
         intent.mcp = Some(McpScope {
             endpoints: vec![McpEndpoint {
@@ -497,6 +568,210 @@ mod tests {
         });
         let validation = CodexProvider::new().capabilities().validate(&intent);
         assert!(validation.blocking().is_none(), "{validation:?}");
+    }
+
+    /// Runs the complete environment assertion in a nested test process so
+    /// ambient conflicts are deterministic without mutating the parent test
+    /// runner's process-global environment.
+    #[test]
+    fn clean_child_environment_and_credential_are_identical_on_open_and_resume() {
+        let root = temp_path("child-environment");
+        std::fs::create_dir_all(&root).expect("worker directory");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "tests::provider_child_environment_worker",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(ENV_WORKER_ROOT, &root)
+            .env("PATH", "/provider/bin")
+            .env("HOME", root.join("baseline-home"))
+            .env("LANG", "C.UTF-8")
+            .env("OPENAI_API_KEY", "ambient-openai-key")
+            .env("OPENAI_BASE_URL", "https://ambient-openai.invalid")
+            .env("CODEX_API_KEY", "ambient-codex-key")
+            .env("CODEX_ACCESS_TOKEN", "ambient-codex-token")
+            .env("CODEX_HOME", root.join("ambient-codex-home"))
+            .env("ANTHROPIC_API_KEY", "ambient-opposite-provider-key")
+            .env("MCP_BEARER", "ambient-client-bearer")
+            .env("CIACOLA_SENTINEL", "ambient-ciacola-value")
+            .env("UNRELATED_SECRET", "ambient-unrelated-value")
+            .output()
+            .expect("spawn isolated environment worker");
+
+        if !output.status.success() {
+            panic!(
+                "environment worker failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            root.join("worker-complete").exists(),
+            "exact worker test did not run"
+        );
+        std::fs::remove_dir_all(root).expect("remove worker directory");
+    }
+
+    #[tokio::test]
+    async fn provider_child_environment_worker() {
+        let Some(root) = std::env::var_os(ENV_WORKER_ROOT).map(PathBuf::from) else {
+            // The outer test launches this exact test again with controlled
+            // ambient values. Its ordinary suite invocation is a no-op.
+            return;
+        };
+        let open_capture = root.join("open.env");
+        let resume_capture = root.join("resume.env");
+        let codex_home = root.join("codex-home");
+        let credential = "codex-intended-credential-value";
+        let environment = ProviderChildEnvironment::capture(&[]).expect("environment policy");
+
+        let mut open = intent("opening");
+        open.config_home = Some(codex_home.display().to_string());
+        open.mcp = Some(McpScope {
+            endpoints: vec![McpEndpoint {
+                name: "ciacola".into(),
+                url: "http://127.0.0.1:4823/mcp".into(),
+                headers: std::collections::BTreeMap::from([(
+                    "x-ciacola-agent".into(),
+                    "scoped-agent-identity".into(),
+                )]),
+            }],
+            strict: true,
+        });
+        environment_fixture(&open_capture, environment.clone(), credential)
+            .run(&open, &NoEvents)
+            .await
+            .expect("opening turn");
+
+        let mut resume = open.clone();
+        resume.prompt = "resume".into();
+        resume.resume = Some(ResumeId::ProviderAssigned("thread-environment".into()));
+        environment_fixture(&resume_capture, environment, credential)
+            .run(&resume, &NoEvents)
+            .await
+            .expect("resumed turn");
+
+        let open_env = captured_environment(&open_capture);
+        let resume_env = captured_environment(&resume_capture);
+        for captured in [&open_env, &resume_env] {
+            assert_eq!(
+                captured.get("PATH").map(String::as_str),
+                Some("/provider/bin")
+            );
+            assert_eq!(captured.get("LANG").map(String::as_str), Some("C.UTF-8"));
+            assert_eq!(
+                captured.get("HOME").map(String::as_str),
+                Some(root.join("baseline-home").to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                captured.get("CODEX_HOME").map(String::as_str),
+                Some(codex_home.to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                captured.get("CODEX_API_KEY").map(String::as_str),
+                Some(credential)
+            );
+            for absent in [
+                "OPENAI_API_KEY",
+                "CODEX_ACCESS_TOKEN",
+                "ANTHROPIC_API_KEY",
+                "MCP_BEARER",
+                "CIACOLA_SENTINEL",
+                "UNRELATED_SECRET",
+                ENV_WORKER_ROOT,
+            ] {
+                assert!(
+                    !captured.contains_key(absent),
+                    "unexpected child key {absent}; exported keys: {:?}",
+                    environment_keys(captured)
+                );
+            }
+            let generated: Vec<_> = captured
+                .iter()
+                .filter(|(name, _)| name.starts_with("CIACOLA_MCP_"))
+                .collect();
+            assert_eq!(generated.len(), 1, "one scoped MCP header variable");
+            assert_eq!(generated[0].1, "scoped-agent-identity");
+        }
+        assert_eq!(
+            environment_keys(&open_env),
+            environment_keys(&resume_env),
+            "opening and resume exported different environment names"
+        );
+        std::fs::write(root.join("worker-complete"), b"ok").expect("worker completion marker");
+    }
+
+    #[tokio::test]
+    async fn own_selectors_are_replaced_but_deliberate_other_passthrough_survives() {
+        let directory = tempfile::tempdir().expect("temporary environment fixture");
+        let capture = directory.path().join("filtered.env");
+        let intended = "intended-codex-credential";
+        let environment = ProviderChildEnvironment::from_values([
+            ("CODEX_API_KEY", "wrong-codex-key"),
+            ("CODEX_HOME", "/wrong/codex/home"),
+            ("OPENAI_API_KEY", "wrong-openai-key"),
+            ("OPENAI_BASE_URL", "https://wrong.invalid"),
+            ("ANTHROPIC_API_KEY", "deliberate-opposite-provider"),
+            ("MCP_BEARER", "deliberate-client-bearer"),
+            ("CIACOLA_SENTINEL", "deliberate-ciacola-value"),
+            ("UNRELATED_SECRET", "deliberate-unrelated-value"),
+        ])
+        .expect("explicit environment policy");
+
+        let mut turn = intent("filter");
+        turn.config_home = Some(directory.path().join("right-home").display().to_string());
+        let provider = environment_fixture(&capture, environment, intended);
+        assert!(!format!("{provider:?}").contains(intended));
+        provider.run(&turn, &NoEvents).await.expect("filtered turn");
+
+        let captured = captured_environment(&capture);
+        assert_eq!(
+            captured.get("CODEX_API_KEY").map(String::as_str),
+            Some(intended)
+        );
+        assert_eq!(
+            captured.get("CODEX_HOME").map(String::as_str),
+            turn.config_home.as_deref()
+        );
+        assert!(!captured.contains_key("OPENAI_API_KEY"));
+        assert!(!captured.contains_key("OPENAI_BASE_URL"));
+        assert_eq!(
+            captured.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("deliberate-opposite-provider")
+        );
+        assert_eq!(
+            captured.get("MCP_BEARER").map(String::as_str),
+            Some("deliberate-client-bearer")
+        );
+        assert_eq!(
+            captured.get("CIACOLA_SENTINEL").map(String::as_str),
+            Some("deliberate-ciacola-value")
+        );
+        assert_eq!(
+            captured.get("UNRELATED_SECRET").map(String::as_str),
+            Some("deliberate-unrelated-value")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_persisted_legacy_token_source_fails_before_child_spawn() {
+        let capture = temp_path("legacy-env-marker");
+        let provider = environment_fixture(
+            &capture,
+            ProviderChildEnvironment::default(),
+            "unused-credential",
+        );
+        let mut legacy = intent("legacy");
+        legacy.token_env = Some("CIACOLA_OLD_CODEX_TOKEN".into());
+
+        let error = provider
+            .run(&legacy, &NoEvents)
+            .await
+            .expect_err("legacy credential source must fail closed");
+        assert!(error.to_string().contains("CIACOLA_CODEX_TOKEN_FD"));
+        assert!(!capture.exists(), "provider child must not have started");
     }
 
     #[test]

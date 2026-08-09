@@ -231,7 +231,6 @@ dependencies = [
  "claude-wrapper",
  "serde_json",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -241,6 +240,7 @@ dependencies = [
  "ciacola-agent",
  "codex-wrapper",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
@@ -423,8 +423,8 @@ dependencies = [
 
 [[package]]
 name = "claude-wrapper"
-version = "0.13.5"
-source = "git+https://github.com/joshrotenberg/claude-wrapper?rev=22484531ecbec0789c16ee10f8abaa95d5501596#22484531ecbec0789c16ee10f8abaa95d5501596"
+version = "0.14.0"
+source = "git+https://github.com/joshrotenberg/claude-wrapper?rev=abaddd72184ca1ceebf21233922ce018274cd36d#abaddd72184ca1ceebf21233922ce018274cd36d"
 dependencies = [
  "libc",
  "serde",
@@ -439,7 +439,7 @@ dependencies = [
 [[package]]
 name = "codex-wrapper"
 version = "0.3.1"
-source = "git+https://github.com/joshrotenberg/codex-wrapper?rev=f250f0efcaaf4c3f93ad82ebabc534a853dde68b#f250f0efcaaf4c3f93ad82ebabc534a853dde68b"
+source = "git+https://github.com/joshrotenberg/codex-wrapper?rev=2dc1d36d25d0b0da8515ca347da578d9c9dffb46#2dc1d36d25d0b0da8515ca347da578d9c9dffb46"
 dependencies = [
  "libc",
  "serde",
