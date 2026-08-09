@@ -407,17 +407,25 @@ async fn load(
         .rotate_after_turns
         .is_some_and(|limit| started && in_session > limit as i64);
 
-    // Identity rides in the config, so the config becomes per agent
-    // the moment the agent has a token. Agents that predate tokens are
-    // backfilled at boot; a missing one here means only that the call
-    // will arrive anonymous, which is survivable, unlike failing the
-    // turn of an agent that worked yesterday.
-    let mut mcp = None;
-    if let Some(base) = agent.def.mcp_config.clone() {
-        if let Some(token) = ledger.token_of(agent_id).await? {
-            mcp = Some(token_scoped_mcp_scope(&token, &base)?);
+    // Identity rides in the config, so a loopback grant and its bearer are
+    // one indivisible capability. Setup backfills agents that predate tokens;
+    // finding no token here is corruption or an incomplete boot, never a
+    // reason to silently launch the provider with less authority than its
+    // persisted definition promises.
+    let mcp = match agent.def.mcp_config.clone() {
+        Some(base) => {
+            let token = ledger.token_of(agent_id).await?.ok_or_else(
+                || -> crate::agent::FlatError {
+                    format!(
+                        "agent '{agent_id}' has an MCP config but no loopback credential; restart ciacola to backfill identity before retrying"
+                    )
+                    .into()
+                },
+            )?;
+            Some(token_scoped_mcp_scope(&token, &base)?)
         }
-    }
+        None => None,
+    };
 
     if rotating {
         eprintln!("[exec] rotating {agent_id} after {in_session} turns in session");
@@ -1492,6 +1500,62 @@ mod config_injection_tests {
         assert!(
             out.is_err(),
             "a non-string header must not be dropped silently"
+        );
+    }
+
+    /// A loopback grant without its bearer must be a known non-attempt, not
+    /// an anonymous provider run. Setup normally backfills this state; the
+    /// direct mutation makes the corrupt boundary deterministic.
+    #[tokio::test]
+    async fn a_loopback_agent_without_a_token_never_launches_the_provider() {
+        let seen = Arc::new(Mutex::new(None));
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool)
+            .await
+            .expect("ledger")
+            .with_providers(fake_registry(seen.clone(), "fake_units_v1"));
+        let agent_id = ledger
+            .create_agent(
+                &crate::agent::AgentDef::new("a", "system")
+                    .provider("fake")
+                    .mcp_config("/unused/agent-mcp.json"),
+                None,
+            )
+            .await
+            .expect("agent");
+        sqlx::query("UPDATE agents SET token = NULL WHERE agent_id = ?1")
+            .bind(&agent_id)
+            .execute(ledger.pool())
+            .await
+            .expect("remove token");
+        let seq = ledger.enqueue_turn(&agent_id, "do it").await.expect("turn");
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+
+        run_turn(&ledger, &Notifier(tx), &agent_id, seq).await;
+
+        assert!(
+            seen.lock().expect("seen lock").is_none(),
+            "provider must not be polled"
+        );
+        let turn = ledger
+            .get_turn(&agent_id, seq)
+            .await
+            .expect("turn query")
+            .expect("turn");
+        assert_eq!(turn.state, "failed");
+        assert_eq!(turn.failure_kind, "not_attempted");
+        assert_eq!(turn.elapsed_state, "not_attempted");
+        assert_eq!(turn.reported_cost_micro_usd(), Some(0));
+        assert_eq!(turn.reported_tokens(), Some((0, 0, 0)));
+        assert_eq!(turn.provider_turns, Some(0));
+        assert!(
+            turn.error
+                .as_deref()
+                .is_some_and(|error| error.contains("no loopback credential")),
+            "unexpected error: {:?}",
+            turn.error
         );
     }
 

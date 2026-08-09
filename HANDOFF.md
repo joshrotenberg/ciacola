@@ -54,8 +54,10 @@ Four surfaces, one process:
 - **stdio MCP** for the operator: every verb including the destructive
   ones (`kill`, `prune`, `resolve_finding`, `open_pr`, the schedule
   tools).
-- **HTTP MCP at `/mcp`** for the agents themselves, which is what makes
-  recursion work. Same router, fewer tools.
+- **Authenticated HTTP MCP at `/mcp`** for the agents themselves, which is
+  what makes recursion work. Same router, fewer tools. Every request carries
+  the active agent's server-injected `x-ciacola-agent` credential; anonymous,
+  unknown, and retired callers are refused before MCP dispatch.
 - **Authenticated HTTP MCP at `/mcp-operator`** for a human holding the root
   bearer. Provider-backed agent credentials are refused.
 - **The board at `/board`**, plain HTML, auto-refreshing.
@@ -183,11 +185,17 @@ forbid. House rules are now an explicit layer of the system prompt.
 
 ## Security boundary
 
-`/mcp-operator` rejects anonymous requests. A human uses a distinct root
-bearer delivered to the server through an inherited descriptor. Agent
+Both HTTP MCP mounts fail closed before dispatch. `/mcp` requires the scoped
+credential of an active agent on initialization and every later session
+request, including its transport health route. That credential persists
+across server restarts and provider-session rotation and is revoked by agent
+retirement. There is no in-place credential rotation API; retire and recreate
+the agent to mint a replacement. `/mcp-operator` requires a distinct human
+root bearer delivered to the server through an inherited descriptor. Agent
 identity headers are refused rather than treated as delegated operator
-authority, and the two token types cannot substitute for one another. Stdio
-remains the simplest human operator path.
+authority, and the two token types cannot substitute for one another. Humans
+use stdio or `/mcp-operator`; anonymous `/mcp` clients are no longer supported.
+Stdio remains the simplest human operator path.
 
 For upgrade safety, the historical `/tmp/ciacola-mcp-operator.json` path is
 still materialized but now points to ordinary `/mcp`. Existing persisted
