@@ -20,6 +20,7 @@ use crate::exec::TurnExecutor;
 use crate::identity::{AgentIdentity, grant_child_tools};
 use crate::ledger::{AgentRow, Ledger, TurnRow};
 use crate::notify::Notifier;
+use crate::plugin::Surface;
 
 const MAX_WAIT_SECS: u64 = 600;
 
@@ -307,7 +308,7 @@ pub fn router_with(
 
 /// The spawn tool, on its own so the identity policy is testable
 /// without a transport: tests hand it a RequestContext directly.
-fn spawn_tool(ledger: Ledger, max_depth: i64, operator_surface: bool) -> tower_mcp::Tool {
+fn spawn_tool(ledger: Ledger, max_depth: i64, surface: Surface) -> tower_mcp::Tool {
     ToolBuilder::new("spawn")
             .description(
                 "Define an agent: a durable conversation with a system \
@@ -319,16 +320,26 @@ fn spawn_tool(ledger: Ledger, max_depth: i64, operator_surface: bool) -> tower_m
                 move |State(ledger): State<Ledger>,
                       ctx: Context,
                       Json(args): Json<SpawnArgs>| async move {
-                    // Derived beats claimed. An authenticated caller IS
-                    // the parent, whatever it says; an anonymous caller
-                    // on the agent surface can claim nothing; only the
-                    // operator's own terminal, where there is no HTTP
-                    // request to authenticate, is taken at its word.
+                    // Refuse before constructing a definition or touching the
+                    // ledger. Transport authentication is the primary guard,
+                    // but direct tool invocation must not turn a missing
+                    // identity into a new root either.
                     let caller = ctx.extension::<AgentIdentity>().map(|i| i.0.clone());
-                    let spawned_by = match (&caller, operator_surface) {
+                    if caller.is_none() && surface == Surface::Agent {
+                        return Ok(CallToolResult::error(
+                            "spawning on the agent HTTP surface requires an authenticated agent"
+                                .to_string(),
+                        ));
+                    }
+
+                    // Derived beats claimed. An authenticated caller IS the
+                    // parent, whatever it says; only the operator's own
+                    // terminal, where there is no HTTP request to authenticate,
+                    // is taken at its word.
+                    let spawned_by = match (&caller, surface) {
                         (Some(id), _) => Some(id.clone()),
-                        (None, true) => args.spawned_by.clone(),
-                        (None, false) => None,
+                        (None, Surface::Operator) => args.spawned_by.clone(),
+                        (None, Surface::Agent) => unreachable!("anonymous agent spawn refused"),
                     };
 
                     let mut def = AgentDef::new(args.name, args.system_prompt);
@@ -348,7 +359,9 @@ fn spawn_tool(ledger: Ledger, max_depth: i64, operator_surface: bool) -> tower_m
                             "unknown sandbox '{sandbox}'; expected read-only, workspace-write, workspace-write-no-network, or none"
                         )));
                     }
-                    if (args.inherit_provider_tools || args.sandbox.is_some()) && !operator_surface {
+                    if (args.inherit_provider_tools || args.sandbox.is_some())
+                        && surface != Surface::Operator
+                    {
                         return Ok(CallToolResult::error(
                             "provider-native tool and sandbox policy can only be selected on the operator surface; use a server-configured role for agent-spawned children"
                                 .to_string(),
@@ -460,10 +473,15 @@ fn router_with_admission_profile(
     interactive: bool,
 ) -> McpRouter {
     let max_depth = limits.max_spawn_depth;
-    // The operator surface is the one carrying kill; the same flag says
-    // whose word to take about parentage when a call arrives without an
-    // identity, so it is threaded into spawn under its real meaning.
-    let spawn = spawn_tool(ledger.clone(), max_depth, include_kill);
+    // The operator surface is the one carrying kill. Thread that authority
+    // into raw spawn explicitly so a direct Agent-surface invocation cannot
+    // silently become an anonymous root.
+    let surface = if include_kill {
+        Surface::Operator
+    } else {
+        Surface::Agent
+    };
+    let spawn = spawn_tool(ledger.clone(), max_depth, surface);
 
     let send = {
         let ledger = ledger.clone();
@@ -946,7 +964,7 @@ mod identity_tests {
             .create_agent(&AgentDef::new("real-parent", "s"), None)
             .await
             .expect("parent");
-        let spawn = spawn_tool(l.clone(), 3, false);
+        let spawn = spawn_tool(l.clone(), 3, Surface::Agent);
         let out = spawn
             .call_with_context(
                 ctx_as(Some(&real)),
@@ -969,28 +987,33 @@ mod identity_tests {
         );
     }
 
-    /// Anonymous on the agent surface: the claim is discarded, and the
-    /// child is a visible orphan rather than a forged descendant.
+    /// Defense in depth for direct invocation: transport authentication is
+    /// not the only thing standing between a missing identity and a new root.
     #[tokio::test]
-    async fn an_anonymous_agent_surface_caller_gets_no_parentage() {
+    async fn an_anonymous_agent_surface_caller_cannot_spawn() {
         let l = ledger().await;
-        let spawn = spawn_tool(l.clone(), 3, false);
+        let spawn = spawn_tool(l.clone(), 3, Surface::Agent);
         let out = spawn
             .call_with_context(
                 ctx_as(None),
                 serde_json::json!({
                     "name": "child",
                     "system_prompt": "s",
+                    "allowed_tools": ["Bash(rm:*)"],
+                    "mcp_config": "/tmp/ciacola-mcp-operator.json",
                     "spawned_by": "invented"
                 }),
             )
             .await;
-        let child_id = structured(&out)["agent_id"]
-            .as_str()
-            .expect("agent_id")
-            .to_string();
-        let child = l.get_agent(&child_id).await.expect("get").expect("row");
-        assert_eq!(child.spawned_by, None, "anonymous callers claim nothing");
+        assert!(
+            rendered(&out).contains("requires an authenticated agent"),
+            "must refuse: {}",
+            rendered(&out)
+        );
+        assert!(
+            l.list_agents().await.expect("list").is_empty(),
+            "refusal must happen before ledger mutation"
+        );
     }
 
     /// The operator's terminal has no identity to check and stays
@@ -1002,7 +1025,7 @@ mod identity_tests {
             .create_agent(&AgentDef::new("p", "s"), None)
             .await
             .expect("parent");
-        let spawn = spawn_tool(l.clone(), 3, true);
+        let spawn = spawn_tool(l.clone(), 3, Surface::Operator);
         let out = spawn
             .call_with_context(
                 ctx_as(None),
@@ -1033,10 +1056,14 @@ mod identity_tests {
     #[tokio::test]
     async fn agent_surface_cannot_select_native_provider_policy() {
         let l = ledger().await;
-        let spawn = spawn_tool(l.clone(), 3, false);
+        let parent = l
+            .create_agent(&AgentDef::new("p", "s"), None)
+            .await
+            .expect("parent");
+        let spawn = spawn_tool(l.clone(), 3, Surface::Agent);
         let out = spawn
             .call_with_context(
-                ctx_as(None),
+                ctx_as(Some(&parent)),
                 serde_json::json!({
                     "name": "child",
                     "system_prompt": "s",
@@ -1047,13 +1074,13 @@ mod identity_tests {
             )
             .await;
         assert!(rendered(&out).contains("operator surface"));
-        assert!(l.list_agents().await.expect("list").is_empty());
+        assert_eq!(l.list_agents().await.expect("list").len(), 1);
     }
 
     #[tokio::test]
     async fn operator_spawn_rejects_an_unknown_sandbox() {
         let l = ledger().await;
-        let spawn = spawn_tool(l.clone(), 3, true);
+        let spawn = spawn_tool(l.clone(), 3, Surface::Operator);
         let out = spawn
             .call_with_context(
                 ctx_as(None),
@@ -1080,7 +1107,7 @@ mod identity_tests {
             )
             .await
             .expect("parent");
-        let spawn = spawn_tool(l.clone(), 3, false);
+        let spawn = spawn_tool(l.clone(), 3, Surface::Agent);
         let out = spawn
             .call_with_context(
                 ctx_as(Some(&parent)),
@@ -1112,7 +1139,7 @@ mod identity_tests {
             .create_agent(&AgentDef::new("p", "s"), None)
             .await
             .expect("parent");
-        let spawn = spawn_tool(l.clone(), 3, false);
+        let spawn = spawn_tool(l.clone(), 3, Surface::Agent);
         let out = spawn
             .call_with_context(
                 ctx_as(Some(&parent)),

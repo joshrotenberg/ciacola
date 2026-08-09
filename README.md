@@ -103,6 +103,17 @@ For interactive operator work, run the server through its stdio MCP surface:
 mcp-repl -- cargo run -p ciacola
 ```
 
+The ordinary HTTP MCP surface at `/mcp` is for agents, not anonymous clients.
+Ciacola injects each active agent's scoped `x-ciacola-agent` credential into
+every loopback MCP request. The complete mount, including `/mcp/health`,
+rejects missing, malformed, unknown, and retired credentials before MCP
+initialization or tool dispatch. The credential remains stable across server
+restarts and provider-session rotation, and is revoked when the agent retires;
+there is no in-place credential rotation API, so retire and recreate an agent
+to mint a replacement. Humans should use stdio or the separately authenticated
+operator surface below; there is deliberately no public liveness exception
+inside `/mcp`.
+
 The HTTP operator surface at `/mcp-operator` is bearer authenticated. Keep
 the root secret in a credential manager, pass it to the server through a
 dedicated inherited descriptor, and pass it to an HTTP client through an

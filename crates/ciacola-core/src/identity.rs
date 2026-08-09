@@ -20,9 +20,10 @@
 //!   HTTP request, so there is nothing to authenticate, and claimed
 //!   attribution is accepted; that a person at the terminal is trusted
 //!   is the definition of operator.
-//! - **Absent over HTTP**: an anonymous local caller (mcp-repl during
-//!   debugging, curl). Tolerated, but it can claim nothing: a spawn
-//!   without identity on the agent surface gets no parentage at all.
+//! - **Absent on the agent HTTP surface**: refused by the transport. Raw
+//!   creation tools repeat that check before touching the ledger, so direct
+//!   invocation cannot reinterpret a missing identity as a new root. Humans
+//!   use stdio or the separately authenticated operator HTTP mount.
 
 /// The authenticated agent id behind a loopback request.
 #[derive(Debug, Clone, PartialEq, Eq)]

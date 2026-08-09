@@ -485,16 +485,17 @@ async fn run(
     let shutdown = CancellationToken::new();
 
     // Authentication is scoped to each MCP mount, before tower-mcp can
-    // initialize a session or invoke a handler. The ordinary agent surface
-    // retains its least-authority anonymous behavior; the operator surface
-    // fails closed unless the human root bearer is valid. Agent identity
-    // headers are explicitly refused there.
+    // initialize a session or invoke a handler. The agent surface requires a
+    // token belonging to an active agent; the operator surface requires the
+    // human root bearer. Agent identity headers are explicitly refused there.
+    // This deliberately covers tower-mcp's built-in `/mcp/health` too: there
+    // was no public liveness contract to preserve on the loopback listener.
     let agent_http = HttpTransport::new(agent_router)
         .bridge_extension::<ciacola_core::AgentIdentity>()
         .into_router_at("/mcp")
         .layer(axum::middleware::from_fn_with_state(
             ledger.clone(),
-            operator_auth::attach_agent_identity,
+            operator_auth::require_agent,
         ));
     let operator_http = HttpTransport::new(operator_router)
         .into_router_at("/mcp-operator")

@@ -19,6 +19,9 @@
 #
 # Omit it when using stdio only. Every provider-backed agent credential is
 # refused on /mcp-operator; the root bearer is for a human client only.
+# The ordinary /mcp mount is agent-only: Ciacola injects each active agent's
+# scoped x-ciacola-agent credential on every request. Anonymous clients use
+# stdio or the human-authenticated /mcp-operator mount instead.
 
 [runtime]
 # Backend used when a role or agent does not select one. Omit for Claude.

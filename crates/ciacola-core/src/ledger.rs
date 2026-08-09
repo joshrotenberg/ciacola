@@ -526,9 +526,9 @@ impl Ledger {
     /// Agents that predate identity get a token at the next boot.
     ///
     /// Sqlite cannot mint one per row in the migration itself, and an
-    /// agent without a token cannot be recognised on the loopback: its
-    /// calls would arrive anonymous forever, which is the state this
-    /// whole mechanism exists to end.
+    /// agent without a token cannot authenticate on the loopback: the
+    /// fail-closed agent mount would reject every call. Backfill restores the
+    /// credential before any persisted agent is dispatched after startup.
     async fn backfill_tokens(&self) -> Result<(), FlatError> {
         let missing: Vec<(String,)> =
             sqlx::query_as("SELECT agent_id FROM agents WHERE token IS NULL")
@@ -2097,8 +2097,70 @@ mod session_tests {
         );
     }
 
+    /// Reopening a real database must preserve the exact bearer. Rotating it
+    /// implicitly would strand already-written per-agent MCP configs after a
+    /// normal restart.
+    #[tokio::test]
+    async fn tokens_survive_a_file_backed_restart_without_rotation() {
+        let path = std::env::temp_dir().join(format!(
+            "ciacola-token-restart-{}-{}.db",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let first_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .expect("file pool");
+        let first = Ledger::setup(first_pool.clone()).await.expect("ledger");
+        let agent_id = first
+            .create_agent(&AgentDef::new("persistent", "s"), None)
+            .await
+            .expect("agent");
+        let token = first
+            .token_of(&agent_id)
+            .await
+            .expect("token query")
+            .expect("token");
+        drop(first);
+        first_pool.close().await;
+
+        let reopened_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(false),
+            )
+            .await
+            .expect("reopened file pool");
+        let reopened = Ledger::setup(reopened_pool.clone())
+            .await
+            .expect("reopened ledger");
+        assert_eq!(
+            reopened.token_of(&agent_id).await.expect("token query"),
+            Some(token.clone()),
+            "setup must preserve rather than rotate an existing token"
+        );
+        assert_eq!(
+            reopened
+                .agent_id_by_token(&token)
+                .await
+                .expect("resolve token")
+                .as_deref(),
+            Some(agent_id.as_str())
+        );
+        drop(reopened);
+        reopened_pool.close().await;
+        std::fs::remove_file(&path).expect("remove test database");
+    }
+
     /// Agents that predate the token column get one at boot, because a
-    /// tokenless agent would be anonymous on the loopback forever.
+    /// tokenless agent cannot authenticate to the loopback mount.
     #[tokio::test]
     async fn setup_backfills_agents_that_predate_tokens() {
         let l = ledger().await;
