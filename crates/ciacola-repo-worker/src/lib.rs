@@ -33,8 +33,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::{Row, SqlitePool};
 use tower_mcp::extract::{Context, Json, State};
 use tower_mcp::{CallToolResult, Tool, ToolBuilder};
 
@@ -42,7 +43,7 @@ use git_spawn::{CloneCommand, GitCommand, Repository, WorktreeCommand};
 
 use ciacola_core::agent::FlatError;
 use ciacola_core::ledger::Ledger;
-use ciacola_core::plugin::{BoxFut, Plugin, PluginContext, Section, Surface};
+use ciacola_core::plugin::{BoxFut, Migration, Plugin, PluginContext, Section, Surface};
 use ciacola_core::roles::{Role, Roles};
 
 const ROLE: &str = "issue-implementer";
@@ -50,6 +51,38 @@ const ROLE: &str = "issue-implementer";
 /// notices what the implementer prompt got wrong, and that only turns
 /// into a better prompt if it is somebody's stated job.
 const MANAGER: &str = "repo-manager";
+
+const ASSIGNMENTS_TABLE: &str = "repo_worker_assignments";
+const MIGRATIONS: &[Migration] = &[Migration::new(
+    "0001_assignments",
+    "CREATE TABLE IF NOT EXISTS repo_worker_assignments (
+         assignment_id TEXT PRIMARY KEY,
+         repo TEXT NOT NULL COLLATE NOCASE,
+         issue_number INTEGER NOT NULL,
+         state TEXT NOT NULL CHECK (
+             state IN ('preparing', 'active', 'finishing', 'retained', 'completed', 'stale')),
+         phase TEXT NOT NULL,
+         base TEXT,
+         slug TEXT NOT NULL,
+         branch TEXT NOT NULL,
+         worktree TEXT NOT NULL,
+         bare_path TEXT NOT NULL,
+         agent_id TEXT UNIQUE,
+         related_agent_ids TEXT NOT NULL DEFAULT '[]',
+         spawned_by TEXT,
+         pr INTEGER,
+         last_error TEXT,
+         created_unix INTEGER NOT NULL,
+         updated_unix INTEGER NOT NULL,
+         terminal_unix INTEGER,
+         UNIQUE(repo, issue_number));
+     CREATE UNIQUE INDEX IF NOT EXISTS repo_worker_owned_worktree
+         ON repo_worker_assignments(worktree)
+         WHERE state IN ('preparing', 'active', 'finishing', 'retained');
+     CREATE UNIQUE INDEX IF NOT EXISTS repo_worker_owned_branch
+         ON repo_worker_assignments(repo, branch)
+         WHERE state IN ('preparing', 'active', 'finishing', 'retained');",
+)];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,6 +114,38 @@ fn expand(path: &str) -> PathBuf {
 /// upstream as joshrotenberg/git-spawn#157.
 fn bare_repo(path: &Path) -> Repository {
     Repository::new_unchecked(path)
+}
+
+fn repo_storage_key(repo: &str) -> String {
+    // Stable FNV-1a keeps the directory compact and collision-resistant while
+    // the readable prefix remains useful to an operator looking at the root.
+    // The hash is part of the on-disk contract; do not replace it with
+    // `DefaultHasher`, whose output is not stable across implementations.
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in repo.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let readable: String = repo
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect();
+    format!("{readable}-{hash:016x}")
+}
+
+fn github_origin_matches(repo: &str, origin: &str) -> bool {
+    let repo = repo.trim_end_matches(".git").to_ascii_lowercase();
+    let origin = origin.trim_end_matches(".git").to_ascii_lowercase();
+    origin == format!("https://github.com/{repo}")
+        || origin == format!("git@github.com:{repo}")
+        || origin == format!("ssh://git@github.com/{repo}")
 }
 
 /// Is this a conventional-commit title: `type(scope)!: subject`?
@@ -132,35 +197,81 @@ async fn gh(dir: Option<&Path>, args: &[&str]) -> Result<String, FlatError> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+async fn git_output(dir: &Path, args: &[&str]) -> Result<String, FlatError> {
+    let out = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 #[derive(Clone)]
 struct Repos {
     root: PathBuf,
     allowed: Arc<Vec<String>>,
-    /// Held across the clone, never merely around the check. Stage 7
-    /// shipped the released-too-early version of this lock and a second
-    /// run raced ahead to a bare repository that did not exist yet.
+    /// Held across every mutation of a bare repository: clone, fetch,
+    /// worktree add/remove, and local branch cleanup. Assignment ownership
+    /// is durable in SQLite; this lock prevents unrelated assignments from
+    /// making git contend with itself inside one server process.
     cloning: Arc<tokio::sync::Mutex<()>>,
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Repos {
     fn bare(&self, repo: &str) -> PathBuf {
-        self.root.join(format!("{}.git", repo.replace('/', "__")))
+        let preferred = self.root.join(format!("{}.git", repo_storage_key(repo)));
+        if preferred.exists() {
+            return preferred;
+        }
+        // Pre-#73 used an ambiguous `owner__repo.git` encoding. Reuse it
+        // only when its recorded origin proves it belongs to this exact
+        // GitHub repository; otherwise leave it untouched and create the
+        // collision-safe path. This is deliberately conservative because a
+        // false adoption would point work at another repository.
+        let legacy = self.root.join(format!("{}.git", repo.replace('/', "__")));
+        let expected = format!("https://github.com/{repo}.git");
+        if legacy.exists()
+            && std::fs::read_to_string(legacy.join("config"))
+                .ok()
+                .and_then(|config| {
+                    config.lines().find_map(|line| {
+                        line.trim()
+                            .strip_prefix("url =")
+                            .map(str::trim)
+                            .map(str::to_string)
+                    })
+                })
+                .as_deref()
+                == Some(expected.as_str())
+        {
+            return legacy;
+        }
+        preferred
     }
 
     fn allows(&self, repo: &str) -> bool {
         self.allowed.iter().any(|r| r == repo)
     }
 
+    /// Clone once into the plugin's own root, then refresh and reuse.
     #[cfg(test)]
-    async fn ensure_clone(&self, repo: &str) -> Result<PathBuf, FlatError> {
-        self.ensure_clone_from(repo, &format!("https://github.com/{repo}.git"))
-            .await
+    async fn ensure_clone_from(&self, repo: &str, url: &str) -> Result<PathBuf, FlatError> {
+        let _guard = self.cloning.lock().await;
+        self.ensure_clone_from_locked(repo, url).await
     }
 
-    /// Clone once into the plugin's own root, then refresh and reuse.
-    async fn ensure_clone_from(&self, repo: &str, url: &str) -> Result<PathBuf, FlatError> {
+    async fn ensure_clone_from_locked(&self, repo: &str, url: &str) -> Result<PathBuf, FlatError> {
         let bare = self.bare(repo);
-        let _guard = self.cloning.lock().await;
         if !bare.exists() {
             std::fs::create_dir_all(&self.root)?;
             eprintln!("[repo-worker] cloning {repo} (once)");
@@ -170,6 +281,43 @@ impl Repos {
                 .execute()
                 .await
                 .map_err(|e| -> FlatError { format!("clone {repo}: {e}").into() })?;
+        }
+        let is_bare = git_output(&bare, &["rev-parse", "--is-bare-repository"])
+            .await
+            .map_err(|e| -> FlatError {
+                format!(
+                    "existing clone path '{}' is not a usable bare repository: {e}",
+                    bare.display()
+                )
+                .into()
+            })?;
+        if is_bare != "true" {
+            return Err(format!("existing clone path '{}' is not bare", bare.display()).into());
+        }
+        let actual_origin = git_output(&bare, &["remote", "get-url", "origin"])
+            .await
+            .map_err(|e| -> FlatError {
+                format!(
+                    "cannot validate origin of bare repository '{}': {e}",
+                    bare.display()
+                )
+                .into()
+            })?;
+        #[cfg(test)]
+        let origin_matches = actual_origin == url
+            || git_output(&bare, &["config", "--get", "remote.origin.url"])
+                .await
+                .is_ok_and(|configured| configured == url);
+        #[cfg(not(test))]
+        let origin_matches = actual_origin == url;
+        if !origin_matches {
+            return Err(format!(
+                "bare repository '{}' has origin '{}', expected '{}'",
+                bare.display(),
+                actual_origin,
+                url
+            )
+            .into());
         }
 
         // The refspec is not optional, even immediately after cloning.
@@ -194,6 +342,58 @@ impl Repos {
         Ok(bare)
     }
 
+    async fn validate_worktree_at(
+        &self,
+        path: &Path,
+        branch: &str,
+        bare: &Path,
+    ) -> Result<(), FlatError> {
+        if !path.is_dir() {
+            return Err(format!("worktree '{}' is not a directory", path.display()).into());
+        }
+        let actual_branch = git_output(path, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .await
+            .map_err(|e| -> FlatError {
+                format!(
+                    "cannot validate existing worktree '{}': {e}",
+                    path.display()
+                )
+                .into()
+            })?;
+        if actual_branch != branch {
+            return Err(format!(
+                "existing worktree '{}' is on branch '{}', expected '{}'",
+                path.display(),
+                actual_branch,
+                branch
+            )
+            .into());
+        }
+        let common = git_output(
+            path,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .await?;
+        let expected = bare.canonicalize().map_err(|e| -> FlatError {
+            format!("cannot validate bare repository '{}': {e}", bare.display()).into()
+        })?;
+        let actual = PathBuf::from(common)
+            .canonicalize()
+            .map_err(|e| -> FlatError {
+                format!("cannot validate git common directory: {e}").into()
+            })?;
+        if actual != expected {
+            return Err(format!(
+                "existing worktree '{}' belongs to '{}', expected '{}'",
+                path.display(),
+                actual.display(),
+                expected.display()
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// A directory and a branch for one unit of work.
     async fn add_worktree(
         &self,
@@ -212,11 +412,17 @@ impl Repos {
         base: &str,
         url: &str,
     ) -> Result<(PathBuf, String), FlatError> {
-        let bare = self.ensure_clone_from(repo, url).await?;
+        let _guard = self.cloning.lock().await;
+        let bare = self.ensure_clone_from_locked(repo, url).await?;
         let path = self.root.join(format!("wt-{slug}"));
         let branch = format!("agent/{slug}");
         if path.exists() {
-            return Ok((path, branch));
+            self.validate_worktree_at(&path, &branch, &bare).await?;
+            return Err(format!(
+                "worktree '{}' already exists without an active durable assignment",
+                path.display()
+            )
+            .into());
         }
         // `origin/main` rather than `main`: the refresh writes
         // remote-tracking refs, so this is the one that moves. A local
@@ -232,42 +438,78 @@ impl Repos {
         Ok((path, branch))
     }
 
-    async fn remove_worktree(&self, repo: &str, slug: &str) -> Result<(), FlatError> {
-        let bare = self.bare(repo);
-        let path = self.root.join(format!("wt-{slug}"));
+    async fn remove_worktree_at(
+        &self,
+        slug: &str,
+        path: &Path,
+        bare: &Path,
+    ) -> Result<(), FlatError> {
+        let _guard = self.cloning.lock().await;
+        if !path.exists() && !bare.exists() {
+            return Ok(());
+        }
+        if !bare.exists() {
+            return Err(format!(
+                "cannot clean worktree '{}' because bare repository '{}' is missing",
+                path.display(),
+                bare.display()
+            )
+            .into());
+        }
         // Cleanup is retried after partial failures, so an already
         // absent worktree is success. The branch deletion below is
         // deliberately idempotent as well.
         if path.exists() {
-            let mut remove = WorktreeCommand::remove(&path);
+            let mut remove = WorktreeCommand::remove(path);
             remove.force();
-            bare_repo(&bare)
+            bare_repo(bare)
                 .worktree(remove)
                 .execute()
                 .await
                 .map_err(|e| -> FlatError { format!("worktree remove: {e}").into() })?;
         }
-        let _ = bare_repo(&bare)
-            .branch()
-            .delete(format!("agent/{slug}"))
-            .force_delete()
-            .execute()
-            .await;
+        let branch = format!("agent/{slug}");
+        let exists = tokio::process::Command::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .current_dir(bare)
+            .kill_on_drop(true)
+            .status()
+            .await?;
+        if exists.success() {
+            bare_repo(bare)
+                .branch()
+                .delete(&branch)
+                .force_delete()
+                .execute()
+                .await
+                .map_err(|e| -> FlatError { format!("branch delete {branch}: {e}").into() })?;
+        } else if exists.code() != Some(1) {
+            return Err(format!("cannot inspect branch '{branch}' in '{}'", bare.display()).into());
+        }
         Ok(())
     }
 
-    fn worktrees(&self) -> Vec<PathBuf> {
-        std::fs::read_dir(&self.root)
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("wt-"))
-            })
-            .collect()
+    fn worktrees(&self) -> Result<Vec<PathBuf>, FlatError> {
+        if !self.root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut worktrees = Vec::new();
+        for entry in std::fs::read_dir(&self.root)? {
+            let path = entry?.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("wt-"))
+            {
+                worktrees.push(path);
+            }
+        }
+        Ok(worktrees)
     }
 }
 
@@ -302,7 +544,10 @@ struct OpenPrArgs {
 #[serde(deny_unknown_fields)]
 struct FinishArgs {
     /// The agent to wind up.
-    agent_id: String,
+    agent_id: Option<String>,
+    /// A stale assignment may have failed before an agent existed. Operators
+    /// can identify that durable claim directly for explicit cleanup.
+    assignment_id: Option<String>,
     /// Keep the worktree for inspection instead of removing it.
     keep: Option<bool>,
 }
@@ -313,9 +558,66 @@ pub struct RepoWorkerPlugin {
     ctx: Option<PluginContext>,
 }
 
-/// Per-agent state, keyed by agent id in the plugin's key-value slice.
-#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AssignmentState {
+    Preparing,
+    Active,
+    Finishing,
+    Retained,
+    Completed,
+    Stale,
+}
+
+impl AssignmentState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Active => "active",
+            Self::Finishing => "finishing",
+            Self::Retained => "retained",
+            Self::Completed => "completed",
+            Self::Stale => "stale",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, FlatError> {
+        match value {
+            "preparing" => Ok(Self::Preparing),
+            "active" => Ok(Self::Active),
+            "finishing" => Ok(Self::Finishing),
+            "retained" => Ok(Self::Retained),
+            "completed" => Ok(Self::Completed),
+            "stale" => Ok(Self::Stale),
+            _ => Err(format!("invalid repo-worker assignment state '{value}'").into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct Assignment {
+    assignment_id: String,
+    repo: String,
+    issue: u64,
+    state: AssignmentState,
+    phase: String,
+    base: Option<String>,
+    slug: String,
+    branch: String,
+    worktree: String,
+    bare_path: String,
+    agent_id: Option<String>,
+    related_agent_ids: Vec<String>,
+    spawned_by: Option<String>,
+    pr: Option<u64>,
+    last_error: Option<String>,
+    created_unix: i64,
+    updated_unix: i64,
+    terminal_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyAssignment {
     repo: String,
     issue: u64,
     slug: String,
@@ -324,24 +626,852 @@ struct Assignment {
     pr: Option<u64>,
 }
 
-impl RepoWorkerPlugin {
-    fn store(&self) -> Option<ciacola_core::store::Store> {
-        Some(ciacola_core::store::Store::new(
-            self.ctx.as_ref()?.pool.clone(),
-            "repo-worker",
-        ))
+impl Assignment {
+    fn from_row(row: sqlx::sqlite::SqliteRow) -> Result<Self, FlatError> {
+        let issue: i64 = row.try_get("issue_number")?;
+        let pr: Option<i64> = row.try_get("pr")?;
+        let related: String = row.try_get("related_agent_ids")?;
+        Ok(Self {
+            assignment_id: row.try_get("assignment_id")?,
+            repo: row.try_get("repo")?,
+            issue: u64::try_from(issue).map_err(|_| "negative issue number in assignment")?,
+            state: AssignmentState::parse(row.try_get("state")?)?,
+            phase: row.try_get("phase")?,
+            base: row.try_get("base")?,
+            slug: row.try_get("slug")?,
+            branch: row.try_get("branch")?,
+            worktree: row.try_get("worktree")?,
+            bare_path: row.try_get("bare_path")?,
+            agent_id: row.try_get("agent_id")?,
+            related_agent_ids: serde_json::from_str(&related)?,
+            spawned_by: row.try_get("spawned_by")?,
+            pr: pr.map(u64::try_from).transpose()?,
+            last_error: row.try_get("last_error")?,
+            created_unix: row.try_get("created_unix")?,
+            updated_unix: row.try_get("updated_unix")?,
+            terminal_unix: row.try_get("terminal_unix")?,
+        })
     }
 
-    async fn assignments(&self) -> Vec<(String, Assignment)> {
-        match self.store() {
-            Some(store) => store
-                .list::<Assignment>(Some("agent/"))
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(k, v)| (k.trim_start_matches("agent/").to_string(), v))
-                .collect(),
-            None => Vec::new(),
+    fn response(&self, created: bool) -> serde_json::Value {
+        json!({
+            "assignment_id": self.assignment_id,
+            "agent_id": self.agent_id,
+            "repo": self.repo,
+            "issue": self.issue,
+            "state": self.state.as_str(),
+            "created": created,
+            "base": self.base,
+            "branch": self.branch,
+            "worktree": self.worktree,
+        })
+    }
+
+    fn conflict(&self, requested_base: Option<&str>) -> String {
+        if self.state == AssignmentState::Active
+            && requested_base.is_some()
+            && requested_base != self.base.as_deref()
+        {
+            return format!(
+                "assignment '{}' already uses base '{}', not requested base '{}'",
+                self.assignment_id,
+                self.base.as_deref().unwrap_or("<unknown>"),
+                requested_base.unwrap_or_default()
+            );
+        }
+        format!(
+            "assignment '{}' for {}#{} is {}; phase '{}'; {}",
+            self.assignment_id,
+            self.repo,
+            self.issue,
+            self.state.as_str(),
+            self.phase,
+            self.last_error.as_deref().unwrap_or("no additional detail")
+        )
+    }
+}
+
+fn assignment_slug(repo: &str, issue: u64, assignment_id: &str) -> String {
+    let readable: String = repo
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("{readable}-{issue}-{}", assignment_id.to_ascii_lowercase())
+}
+
+fn sqlite_u64(value: u64, label: &str) -> Result<i64, FlatError> {
+    i64::try_from(value)
+        .map_err(|_| format!("{label} {value} exceeds SQLite's integer range").into())
+}
+
+#[derive(Clone)]
+struct AssignmentDb {
+    pool: SqlitePool,
+}
+
+impl AssignmentDb {
+    fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    async fn get(&self, repo: &str, issue: u64) -> Result<Option<Assignment>, FlatError> {
+        let issue = sqlite_u64(issue, "issue")?;
+        let row = sqlx::query(
+            "SELECT * FROM repo_worker_assignments WHERE repo = ?1 AND issue_number = ?2",
+        )
+        .bind(repo)
+        .bind(issue)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Assignment::from_row).transpose()
+    }
+
+    async fn get_by_agent(&self, agent_id: &str) -> Result<Option<Assignment>, FlatError> {
+        let row = sqlx::query("SELECT * FROM repo_worker_assignments WHERE agent_id = ?1")
+            .bind(agent_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(Assignment::from_row).transpose()
+    }
+
+    async fn get_by_id(&self, assignment_id: &str) -> Result<Option<Assignment>, FlatError> {
+        let row = sqlx::query("SELECT * FROM repo_worker_assignments WHERE assignment_id = ?1")
+            .bind(assignment_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(Assignment::from_row).transpose()
+    }
+
+    async fn list(&self) -> Result<Vec<Assignment>, FlatError> {
+        let rows = sqlx::query(
+            "SELECT * FROM repo_worker_assignments ORDER BY updated_unix DESC, assignment_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Assignment::from_row).collect()
+    }
+
+    async fn conflicting_resources(
+        &self,
+        assignment: &Assignment,
+    ) -> Result<Vec<String>, FlatError> {
+        let rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT assignment_id, agent_id, related_agent_ids
+             FROM repo_worker_assignments
+             WHERE assignment_id <> ?1
+               AND (worktree = ?2 OR (repo = ?3 AND branch = ?4))
+             ORDER BY assignment_id",
+        )
+        .bind(&assignment.assignment_id)
+        .bind(&assignment.worktree)
+        .bind(&assignment.repo)
+        .bind(&assignment.branch)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(id, agent_id, related)| {
+                let mut agents: Vec<String> = serde_json::from_str(&related)?;
+                if let Some(agent_id) = agent_id {
+                    if !agents.contains(&agent_id) {
+                        agents.push(agent_id);
+                    }
+                }
+                Ok(if agents.is_empty() {
+                    id
+                } else {
+                    format!("{id} (agents: {})", agents.join(", "))
+                })
+            })
+            .collect()
+    }
+
+    async fn reserve(
+        &self,
+        repo: &str,
+        issue: u64,
+        requested_base: Option<&str>,
+        repos: &Repos,
+        spawned_by: Option<&str>,
+    ) -> Result<(Assignment, bool), FlatError> {
+        let issue_sql = sqlite_u64(issue, "issue")?;
+        if let Some(existing) = self.get(repo, issue).await? {
+            return Ok((existing, false));
+        }
+        let assignment_id = ulid::Ulid::new().to_string();
+        let slug = assignment_slug(repo, issue, &assignment_id);
+        let branch = format!("agent/{slug}");
+        let worktree = repos.root.join(format!("wt-{slug}")).display().to_string();
+        let bare_path = repos.bare(repo).display().to_string();
+        let now = ciacola_core::now_unix();
+        let done = sqlx::query(
+            "INSERT INTO repo_worker_assignments
+                 (assignment_id, repo, issue_number, state, phase, base, slug, branch,
+                  worktree, bare_path, spawned_by, created_unix, updated_unix)
+             VALUES (?1, ?2, ?3, 'preparing', 'reserved', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&assignment_id)
+        .bind(repo)
+        .bind(issue_sql)
+        .bind(requested_base)
+        .bind(&slug)
+        .bind(&branch)
+        .bind(&worktree)
+        .bind(&bare_path)
+        .bind(spawned_by)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        if done.rows_affected() == 1 {
+            return Ok((
+                self.get_by_id(&assignment_id)
+                    .await?
+                    .ok_or("reserved assignment disappeared")?,
+                true,
+            ));
+        }
+        if let Some(existing) = self.get(repo, issue).await? {
+            return Ok((existing, false));
+        }
+        let collision = sqlx::query(
+            "SELECT assignment_id, repo, issue_number FROM repo_worker_assignments
+             WHERE worktree = ?1 OR (repo = ?2 AND branch = ?3)",
+        )
+        .bind(&worktree)
+        .bind(repo)
+        .bind(&branch)
+        .fetch_optional(&self.pool)
+        .await?;
+        match collision {
+            Some(row) => Err(format!(
+                "assignment path/branch collides with '{}' for {}#{}",
+                row.try_get::<String, _>("assignment_id")?,
+                row.try_get::<String, _>("repo")?,
+                row.try_get::<i64, _>("issue_number")?
+            )
+            .into()),
+            None => Err("assignment reservation was refused by its database constraints".into()),
+        }
+    }
+
+    async fn set_base(&self, assignment_id: &str, base: &str) -> Result<(), FlatError> {
+        let done = sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET base = ?2, phase = 'base_resolved', updated_unix = ?3
+             WHERE assignment_id = ?1 AND state = 'preparing'",
+        )
+        .bind(assignment_id)
+        .bind(base)
+        .bind(ciacola_core::now_unix())
+        .execute(&self.pool)
+        .await?;
+        if done.rows_affected() != 1 {
+            return Err("assignment stopped preparing before base selection".into());
+        }
+        Ok(())
+    }
+
+    /// Release a reservation only while it is still provably pre-resource.
+    /// Once any durable phase advances, callers must retain the row as stale
+    /// because git or agent side effects may already exist.
+    async fn abandon_reservation(&self, assignment_id: &str) -> Result<bool, FlatError> {
+        let done = sqlx::query(
+            "DELETE FROM repo_worker_assignments
+             WHERE assignment_id = ?1 AND state = 'preparing'
+               AND phase = 'reserved' AND agent_id IS NULL",
+        )
+        .bind(assignment_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn record_pre_resource_failure(
+        &self,
+        assignment_id: &str,
+        phase: &str,
+        error: &str,
+    ) -> Result<(), FlatError> {
+        match self.abandon_reservation(assignment_id).await {
+            Ok(true) => Ok(()),
+            Ok(false) => self.stale(assignment_id, phase, error).await,
+            Err(delete_error) => match self.stale(assignment_id, phase, error).await {
+                Ok(()) => Err(format!(
+                    "could not release pre-resource reservation ({delete_error}); retained it as stale"
+                )
+                .into()),
+                Err(stale_error) => Err(format!(
+                    "could not release pre-resource reservation ({delete_error}) or mark it stale ({stale_error})"
+                )
+                .into()),
+            },
+        }
+    }
+
+    async fn set_phase(&self, assignment_id: &str, phase: &str) -> Result<(), FlatError> {
+        let done = sqlx::query(
+            "UPDATE repo_worker_assignments SET phase = ?2, updated_unix = ?3
+             WHERE assignment_id = ?1 AND state = 'preparing'",
+        )
+        .bind(assignment_id)
+        .bind(phase)
+        .bind(ciacola_core::now_unix())
+        .execute(&self.pool)
+        .await?;
+        if done.rows_affected() != 1 {
+            return Err("assignment stopped preparing during provisioning".into());
+        }
+        Ok(())
+    }
+
+    async fn stale(&self, assignment_id: &str, phase: &str, error: &str) -> Result<(), FlatError> {
+        let now = ciacola_core::now_unix();
+        let done = sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET state = 'stale', phase = ?2, last_error = ?3,
+                 updated_unix = ?4, terminal_unix = ?4
+             WHERE assignment_id = ?1 AND state IN ('preparing', 'active', 'finishing', 'retained')",
+        )
+        .bind(assignment_id)
+        .bind(phase)
+        .bind(error)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        if done.rows_affected() != 1 {
+            return Err("assignment could not be marked stale".into());
+        }
+        Ok(())
+    }
+
+    async fn terminal(
+        &self,
+        assignment_id: &str,
+        state: AssignmentState,
+        phase: &str,
+        error: Option<&str>,
+    ) -> Result<(), FlatError> {
+        let now = ciacola_core::now_unix();
+        let done = sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET state = ?2, phase = ?3, last_error = ?4,
+                 updated_unix = ?5, terminal_unix = ?5
+             WHERE assignment_id = ?1 AND state = 'finishing'",
+        )
+        .bind(assignment_id)
+        .bind(state.as_str())
+        .bind(phase)
+        .bind(error)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        if done.rows_affected() != 1 {
+            return Err("assignment state transition lost its durable row".into());
+        }
+        Ok(())
+    }
+
+    async fn begin_finish(&self, assignment: &Assignment, keep: bool) -> Result<bool, FlatError> {
+        let phase = if keep {
+            "finishing_keep"
+        } else if assignment.state == AssignmentState::Retained
+            || (assignment.state == AssignmentState::Stale
+                && matches!(
+                    assignment.phase.as_str(),
+                    "finishing_remove_retained" | "finish_terminal_remove_retained"
+                ))
+        {
+            "finishing_remove_retained"
+        } else if assignment.state == AssignmentState::Stale {
+            "finishing_remove_stale"
+        } else {
+            "finishing_remove"
+        };
+        if assignment.state == AssignmentState::Finishing {
+            return Ok(if keep {
+                assignment.phase == "finishing_keep"
+            } else {
+                matches!(
+                    assignment.phase.as_str(),
+                    "finishing_remove" | "finishing_remove_retained" | "finishing_remove_stale"
+                )
+            });
+        }
+        let allowed = if keep {
+            assignment.state == AssignmentState::Active
+                || (assignment.state == AssignmentState::Stale
+                    && matches!(
+                        assignment.phase.as_str(),
+                        "finishing_keep" | "finish_terminal_keep"
+                    ))
+        } else {
+            matches!(
+                assignment.state,
+                AssignmentState::Active | AssignmentState::Retained | AssignmentState::Stale
+            )
+        };
+        if !allowed {
+            return Ok(false);
+        }
+        let done = sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET state = 'finishing', phase = ?3, last_error = NULL, updated_unix = ?4
+             WHERE assignment_id = ?1 AND state = ?2",
+        )
+        .bind(&assignment.assignment_id)
+        .bind(assignment.state.as_str())
+        .bind(phase)
+        .bind(ciacola_core::now_unix())
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn restore_after_busy(&self, assignment: &Assignment) -> Result<(), FlatError> {
+        let done = sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET state = ?2, phase = ?3, last_error = ?4, updated_unix = ?5
+             WHERE assignment_id = ?1 AND state = 'finishing'",
+        )
+        .bind(&assignment.assignment_id)
+        .bind(assignment.state.as_str())
+        .bind(&assignment.phase)
+        .bind(&assignment.last_error)
+        .bind(ciacola_core::now_unix())
+        .execute(&self.pool)
+        .await?;
+        if done.rows_affected() != 1 {
+            return Err("finishing assignment changed before its busy rollback".into());
+        }
+        Ok(())
+    }
+
+    async fn update_pr(&self, assignment_id: &str, pr: u64) -> Result<(), FlatError> {
+        let pr = sqlite_u64(pr, "pull request")?;
+        let done = sqlx::query(
+            "UPDATE repo_worker_assignments SET pr = ?2, updated_unix = ?3
+             WHERE assignment_id = ?1 AND state = 'active'",
+        )
+        .bind(assignment_id)
+        .bind(pr)
+        .bind(ciacola_core::now_unix())
+        .execute(&self.pool)
+        .await?;
+        if done.rows_affected() != 1 {
+            return Err("assignment disappeared while recording pull request".into());
+        }
+        Ok(())
+    }
+
+    async fn import_legacy(&self, ledger: &Ledger, repos: &Repos) -> Result<(), FlatError> {
+        let has_store: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'plugin_kv'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if has_store.0 == 0 {
+            return Ok(());
+        }
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT key, value FROM plugin_kv
+             WHERE plugin = 'repo-worker' AND key LIKE 'agent/%' ORDER BY key",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        type LegacyGroups =
+            std::collections::BTreeMap<(String, u64), Vec<(String, String, LegacyAssignment)>>;
+        let mut groups = LegacyGroups::new();
+        for (key, value) in rows {
+            let legacy: LegacyAssignment =
+                serde_json::from_str(&value).map_err(|e| -> FlatError {
+                    format!("cannot import legacy repo-worker assignment '{key}': {e}").into()
+                })?;
+            let agent_id = key
+                .strip_prefix("agent/")
+                .ok_or("legacy assignment has an invalid key")?
+                .to_string();
+            groups
+                .entry((legacy.repo.clone(), legacy.issue))
+                .or_default()
+                .push((key, agent_id, legacy));
+        }
+
+        type LegacyResourceOwners =
+            std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
+        type LegacyBranchOwners =
+            std::collections::BTreeMap<(String, String), std::collections::BTreeSet<String>>;
+        let mut worktree_owners = LegacyResourceOwners::new();
+        let mut branch_owners = LegacyBranchOwners::new();
+        for group in groups.values() {
+            for (_, agent_id, legacy) in group {
+                worktree_owners
+                    .entry(legacy.worktree.clone())
+                    .or_default()
+                    .insert(agent_id.clone());
+                branch_owners
+                    .entry((legacy.repo.to_ascii_lowercase(), legacy.branch.clone()))
+                    .or_default()
+                    .insert(agent_id.clone());
+            }
+        }
+        type DurableResourceOwners = std::collections::BTreeMap<String, Vec<Assignment>>;
+        type DurableBranchOwners = std::collections::BTreeMap<(String, String), Vec<Assignment>>;
+        let mut durable_worktree_owners = DurableResourceOwners::new();
+        let mut durable_branch_owners = DurableBranchOwners::new();
+        for assignment in self.list().await? {
+            durable_worktree_owners
+                .entry(assignment.worktree.clone())
+                .or_default()
+                .push(assignment.clone());
+            durable_branch_owners
+                .entry((
+                    assignment.repo.to_ascii_lowercase(),
+                    assignment.branch.clone(),
+                ))
+                .or_default()
+                .push(assignment);
+        }
+
+        for ((repo, issue), group) in groups {
+            let own_agent_ids: std::collections::BTreeSet<String> =
+                group.iter().map(|(_, id, _)| id.clone()).collect();
+            let mut resource_agent_ids = own_agent_ids.clone();
+            let mut durable_conflicts = std::collections::BTreeMap::new();
+            for (_, _, legacy) in &group {
+                if let Some(ids) = worktree_owners.get(&legacy.worktree) {
+                    resource_agent_ids.extend(ids.iter().cloned());
+                }
+                if let Some(ids) =
+                    branch_owners.get(&(legacy.repo.to_ascii_lowercase(), legacy.branch.clone()))
+                {
+                    resource_agent_ids.extend(ids.iter().cloned());
+                }
+                for peer in durable_worktree_owners
+                    .get(&legacy.worktree)
+                    .into_iter()
+                    .flatten()
+                    .chain(
+                        durable_branch_owners
+                            .get(&(legacy.repo.to_ascii_lowercase(), legacy.branch.clone()))
+                            .into_iter()
+                            .flatten(),
+                    )
+                    .filter(|peer| peer.issue != issue || !peer.repo.eq_ignore_ascii_case(&repo))
+                {
+                    if let Some(agent_id) = &peer.agent_id {
+                        resource_agent_ids.insert(agent_id.clone());
+                    }
+                    resource_agent_ids.extend(peer.related_agent_ids.iter().cloned());
+                    durable_conflicts
+                        .entry(peer.assignment_id.clone())
+                        .or_insert_with(|| peer.clone());
+                }
+            }
+            let resource_collision = resource_agent_ids
+                .iter()
+                .any(|id| !own_agent_ids.contains(id))
+                || !durable_conflicts.is_empty();
+            let related_agent_ids: Vec<String> = resource_agent_ids.into_iter().collect();
+            if resource_collision {
+                let peer_ids = durable_conflicts.keys().cloned().collect::<Vec<_>>();
+                for peer in durable_conflicts.values() {
+                    let mut related = peer.related_agent_ids.clone();
+                    if let Some(agent_id) = &peer.agent_id {
+                        if !related.contains(agent_id) {
+                            related.push(agent_id.clone());
+                        }
+                    }
+                    for id in &related_agent_ids {
+                        if !related.contains(id) {
+                            related.push(id.clone());
+                        }
+                    }
+                    let error = format!(
+                        "legacy resource collision with assignments {}; agents: {}",
+                        peer_ids.join(", "),
+                        related.join(", ")
+                    );
+                    sqlx::query(
+                        "UPDATE repo_worker_assignments
+                         SET state = 'stale', phase = 'legacy_resource_conflict',
+                             related_agent_ids = ?2, last_error = ?3,
+                             updated_unix = ?4, terminal_unix = ?4
+                         WHERE assignment_id = ?1
+                           AND state IN ('preparing', 'active', 'finishing', 'retained', 'stale')",
+                    )
+                    .bind(&peer.assignment_id)
+                    .bind(serde_json::to_string(&related)?)
+                    .bind(error)
+                    .bind(ciacola_core::now_unix())
+                    .execute(&self.pool)
+                    .await?;
+                }
+            }
+            if let Some(existing) = self.get(&repo, issue).await? {
+                let same_resources = group.iter().all(|(_, id, legacy)| {
+                    existing.related_agent_ids.iter().any(|known| known == id)
+                        && legacy.worktree == existing.worktree
+                        && legacy.branch == existing.branch
+                });
+                if !same_resources || resource_collision {
+                    let mut related = existing.related_agent_ids.clone();
+                    for id in &related_agent_ids {
+                        if !related.contains(id) {
+                            related.push(id.clone());
+                        }
+                    }
+                    let error = format!(
+                        "legacy Store rows conflict with durable assignment; agents: {}",
+                        related.join(", ")
+                    );
+                    sqlx::query(
+                        "UPDATE repo_worker_assignments
+                         SET state = 'stale', phase = 'legacy_conflict_after_migration',
+                             related_agent_ids = ?2, last_error = ?3,
+                             updated_unix = ?4, terminal_unix = ?4
+                         WHERE assignment_id = ?1",
+                    )
+                    .bind(&existing.assignment_id)
+                    .bind(serde_json::to_string(&related)?)
+                    .bind(error)
+                    .bind(ciacola_core::now_unix())
+                    .execute(&self.pool)
+                    .await?;
+                }
+                continue;
+            }
+            let (_, first_agent, first) = &group[0];
+            let agent_ids = related_agent_ids;
+            let bare_path = match git_output(
+                Path::new(&first.worktree),
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+            .await
+            {
+                Ok(path) => PathBuf::from(path),
+                Err(_) => repos.bare(&repo),
+            };
+            let mut state = AssignmentState::Stale;
+            let mut phase = if resource_collision {
+                "legacy_resource_conflict".to_string()
+            } else {
+                "legacy_conflict".to_string()
+            };
+            let mut error = Some(if resource_collision {
+                format!(
+                    "legacy worktree or branch is claimed across assignments {}; agents: {}",
+                    durable_conflicts
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    agent_ids.join(", "),
+                )
+            } else {
+                format!(
+                    "legacy assignment has {} candidate agents: {}",
+                    agent_ids.len(),
+                    agent_ids.join(", ")
+                )
+            });
+            let mut agent_id = None;
+            let mut spawned_by = None;
+            if group.len() == 1 && !resource_collision {
+                agent_id = Some(first_agent.clone());
+                match ledger.get_agent(first_agent).await? {
+                    Some(agent) if !agent.retired => {
+                        spawned_by = agent.spawned_by;
+                        let validation = match git_output(
+                            &bare_path,
+                            &["remote", "get-url", "origin"],
+                        )
+                        .await
+                        {
+                            Ok(origin) if github_origin_matches(&repo, &origin) => {
+                                repos
+                                    .validate_worktree_at(
+                                        Path::new(&first.worktree),
+                                        &first.branch,
+                                        &bare_path,
+                                    )
+                                    .await
+                            }
+                            Ok(origin) => Err(format!(
+                                "legacy bare repository origin '{origin}' does not match '{repo}'"
+                            )
+                            .into()),
+                            Err(e) => Err(e),
+                        };
+                        match validation {
+                            Ok(()) => {
+                                state = AssignmentState::Active;
+                                phase = "legacy_imported".into();
+                                error = None;
+                            }
+                            Err(e) => {
+                                phase = "legacy_worktree_invalid".into();
+                                error = Some(e.to_string());
+                            }
+                        }
+                    }
+                    Some(agent) => {
+                        spawned_by = agent.spawned_by;
+                        phase = "legacy_agent_retired".into();
+                        error = Some(format!("legacy agent '{first_agent}' is retired"));
+                    }
+                    None => {
+                        phase = "legacy_agent_missing".into();
+                        error = Some(format!("legacy agent '{first_agent}' is missing"));
+                    }
+                }
+            }
+            let assignment_id = ulid::Ulid::new().to_string();
+            let now = ciacola_core::now_unix();
+            let issue_sql = sqlite_u64(issue, "issue")?;
+            let pr_sql = first
+                .pr
+                .map(|pr| sqlite_u64(pr, "pull request"))
+                .transpose()?;
+            let terminal = (state == AssignmentState::Stale).then_some(now);
+            let related = serde_json::to_string(&agent_ids)?;
+            sqlx::query(
+                "INSERT INTO repo_worker_assignments
+                     (assignment_id, repo, issue_number, state, phase, base, slug, branch,
+                      worktree, bare_path, agent_id, related_agent_ids, spawned_by, pr, last_error,
+                      created_unix, updated_unix, terminal_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         ?13, ?14, ?15, ?15, ?16)",
+            )
+            .bind(&assignment_id)
+            .bind(&repo)
+            .bind(issue_sql)
+            .bind(state.as_str())
+            .bind(&phase)
+            .bind(&first.slug)
+            .bind(&first.branch)
+            .bind(&first.worktree)
+            .bind(bare_path.display().to_string())
+            .bind(&agent_id)
+            .bind(&related)
+            .bind(&spawned_by)
+            .bind(pr_sql)
+            .bind(&error)
+            .bind(now)
+            .bind(terminal)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_on_start(&self, ledger: &Ledger, repos: &Repos) -> Result<(), FlatError> {
+        let now = ciacola_core::now_unix();
+        sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET state = 'stale', phase = 'restart_during_preparation',
+                 last_error = 'server restarted before provisioning completed',
+                 updated_unix = ?1, terminal_unix = ?1
+             WHERE state = 'preparing'",
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET state = 'stale',
+                 last_error = 'server restarted before finish completed; inspect resources before cleanup',
+                 updated_unix = ?1, terminal_unix = ?1
+             WHERE state = 'finishing'",
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        for assignment in self.list().await? {
+            let problem = match assignment.state {
+                AssignmentState::Active => match assignment.agent_id.as_deref() {
+                    None => Some("active assignment has no agent id".to_string()),
+                    Some(agent_id) => match ledger.get_agent(agent_id).await? {
+                        None => Some(format!("active agent '{agent_id}' is missing")),
+                        Some(agent) if agent.retired => {
+                            Some(format!("active agent '{agent_id}' is retired"))
+                        }
+                        Some(_) => repos
+                            .validate_worktree_at(
+                                Path::new(&assignment.worktree),
+                                &assignment.branch,
+                                Path::new(&assignment.bare_path),
+                            )
+                            .await
+                            .err()
+                            .map(|e| e.to_string()),
+                    },
+                },
+                AssignmentState::Retained => match assignment.agent_id.as_deref() {
+                    None => Some("retained assignment has no agent id".to_string()),
+                    Some(agent_id) => match ledger.get_agent(agent_id).await? {
+                        Some(agent) if agent.retired => repos
+                            .validate_worktree_at(
+                                Path::new(&assignment.worktree),
+                                &assignment.branch,
+                                Path::new(&assignment.bare_path),
+                            )
+                            .await
+                            .err()
+                            .map(|e| e.to_string()),
+                        Some(_) => Some(format!("retained agent '{agent_id}' is not retired")),
+                        None => Some(format!("retained agent '{agent_id}' is missing")),
+                    },
+                },
+                AssignmentState::Completed if Path::new(&assignment.worktree).exists() => {
+                    Some(format!(
+                        "completed assignment still has worktree '{}'",
+                        assignment.worktree
+                    ))
+                }
+                AssignmentState::Preparing
+                | AssignmentState::Finishing
+                | AssignmentState::Completed
+                | AssignmentState::Stale => None,
+            };
+            if let Some(problem) = problem {
+                let now = ciacola_core::now_unix();
+                let done = sqlx::query(
+                    "UPDATE repo_worker_assignments
+                     SET state = 'stale', phase = 'restart_reconciliation', last_error = ?3,
+                         updated_unix = ?4, terminal_unix = ?4
+                     WHERE assignment_id = ?1 AND state = ?2",
+                )
+                .bind(&assignment.assignment_id)
+                .bind(assignment.state.as_str())
+                .bind(&problem)
+                .bind(now)
+                .execute(&self.pool)
+                .await?;
+                if done.rows_affected() != 1 {
+                    return Err("assignment changed during startup reconciliation".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RepoWorkerPlugin {
+    fn assignment_db(&self) -> Option<AssignmentDb> {
+        Some(AssignmentDb::new(self.ctx.as_ref()?.pool.clone()))
+    }
+
+    async fn assignments(&self) -> Result<Vec<Assignment>, FlatError> {
+        match self.assignment_db() {
+            Some(db) => db.list().await,
+            None => Ok(Vec::new()),
         }
     }
 }
@@ -351,8 +1481,18 @@ impl Plugin for RepoWorkerPlugin {
         "repo-worker"
     }
 
+    fn tables(&self) -> &'static [&'static str] {
+        &[ASSIGNMENTS_TABLE]
+    }
+
+    fn migrations(&self) -> &'static [Migration] {
+        MIGRATIONS
+    }
+
     fn setup<'a>(&'a mut self, ctx: &'a PluginContext) -> BoxFut<'a, Result<(), FlatError>> {
         Box::pin(async move {
+            #[cfg(test)]
+            ciacola_core::plugin::apply_migrations(&ctx.pool, self.name(), MIGRATIONS).await?;
             let config: RepoWorkerConfig = match ctx.config_for(self.name()) {
                 Some(value) => value.clone().try_into()?,
                 None => RepoWorkerConfig::default(),
@@ -363,12 +1503,25 @@ impl Plugin for RepoWorkerPlugin {
                     .as_deref()
                     .unwrap_or("~/.local/share/ciacola/repos"),
             );
+            let root = if root.is_absolute() {
+                root
+            } else {
+                std::env::current_dir()?.join(root)
+            };
             self.repos = Some(Repos {
                 root,
                 allowed: Arc::new(config.repos),
                 cloning: Arc::new(tokio::sync::Mutex::new(())),
+                lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             });
             self.ctx = Some(ctx.clone());
+            let assignments = AssignmentDb::new(ctx.pool.clone());
+            assignments
+                .import_legacy(&ctx.ledger, self.repos.as_ref().expect("repos"))
+                .await?;
+            assignments
+                .reconcile_on_start(&ctx.ledger, self.repos.as_ref().expect("repos"))
+                .await?;
             Ok(())
         })
     }
@@ -435,8 +1588,12 @@ role exists rather than a person just calling start_issue.
 Working in {{checkout}}, which is ciacola's own repository.
 
 Dispatching:
-- start_issue, then send, then wait. Pass timeout_secs; the default is
-  120 and real work runs longer, and a turn cut short loses its session.
+- Call start_issue first. When it returns created=true, send the implementation
+  prompt, then wait. When it returns created=false, the durable assignment was
+  already active: inspect and reuse that agent, and do not blindly send the
+  implementation prompt a second time.
+- Pass timeout_secs when waiting; the default is 120 and real work runs longer,
+  and a turn cut short loses its session.
 - Read the diff yourself. The reply is the worker's account of what it did,
   which is not the same thing. When it is ready, report the exact assignment
   and evidence to the human operator; do not claim to open or merge a pull
@@ -609,10 +1766,129 @@ to do, on purpose."
                                 return Ok(CallToolResult::error(refusal.to_string()));
                             }
                         };
-                        let slug = format!("{}-{}", args.repo.replace('/', "-"), args.issue);
+                        let assignments = AssignmentDb::new(ctx.pool.clone());
+                        let (mut assignment, claimed) = match assignments
+                            .reserve(
+                                &args.repo,
+                                args.issue,
+                                args.base.as_deref(),
+                                &repos,
+                                authorization.spawned_by.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                        };
+                        if !claimed {
+                            if assignment.state == AssignmentState::Active {
+                                let _lifecycle = repos.lifecycle.lock().await;
+                                assignment = match assignments
+                                    .get_by_id(&assignment.assignment_id)
+                                    .await
+                                {
+                                    Ok(Some(current)) => current,
+                                    Ok(None) => {
+                                        return Ok(CallToolResult::error(
+                                            "active assignment disappeared".to_string(),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        return Ok(CallToolResult::error(format!(
+                                            "cannot re-read active assignment: {e}"
+                                        )));
+                                    }
+                                };
+                                if assignment.state != AssignmentState::Active {
+                                    return Ok(CallToolResult::error(
+                                        assignment.conflict(args.base.as_deref()),
+                                    ));
+                                }
+                                if args.base.is_some()
+                                    && args.base.as_deref() != assignment.base.as_deref()
+                                {
+                                    return Ok(CallToolResult::error(
+                                        assignment.conflict(args.base.as_deref()),
+                                    ));
+                                }
+                                let agent_id = match assignment.agent_id.as_deref() {
+                                    Some(agent_id) => agent_id,
+                                    None => {
+                                        let error = "active assignment has no agent id";
+                                        let _ = assignments
+                                            .stale(
+                                                &assignment.assignment_id,
+                                                "active_replay",
+                                                error,
+                                            )
+                                            .await;
+                                        return Ok(CallToolResult::error(error.to_string()));
+                                    }
+                                };
+                                match ctx.ledger.get_agent(agent_id).await {
+                                    Ok(Some(agent)) if !agent.retired => {}
+                                    Ok(Some(_)) => {
+                                        let error = format!(
+                                            "active assignment agent '{agent_id}' is retired"
+                                        );
+                                        let _ = assignments
+                                            .stale(
+                                                &assignment.assignment_id,
+                                                "active_replay",
+                                                &error,
+                                            )
+                                            .await;
+                                        return Ok(CallToolResult::error(error));
+                                    }
+                                    Ok(None) => {
+                                        let error = format!(
+                                            "active assignment agent '{agent_id}' is missing"
+                                        );
+                                        let _ = assignments
+                                            .stale(
+                                                &assignment.assignment_id,
+                                                "active_replay",
+                                                &error,
+                                            )
+                                            .await;
+                                        return Ok(CallToolResult::error(error));
+                                    }
+                                    Err(e) => {
+                                        return Ok(CallToolResult::error(format!(
+                                            "cannot validate active assignment agent: {e}"
+                                        )));
+                                    }
+                                }
+                                if let Err(e) = repos
+                                    .validate_worktree_at(
+                                        Path::new(&assignment.worktree),
+                                        &assignment.branch,
+                                        Path::new(&assignment.bare_path),
+                                    )
+                                    .await
+                                {
+                                    let error = e.to_string();
+                                    let _ = assignments
+                                        .stale(
+                                            &assignment.assignment_id,
+                                            "active_replay",
+                                            &error,
+                                        )
+                                        .await;
+                                    return Ok(CallToolResult::error(format!(
+                                        "active assignment is stale: {error}"
+                                    )));
+                                }
+                                return Ok(CallToolResult::json(assignment.response(false)));
+                            }
+                            return Ok(CallToolResult::error(
+                                assignment.conflict(args.base.as_deref()),
+                            ));
+                        }
+
                         let base = match &args.base {
                             Some(base) => base.clone(),
-                            None => gh(
+                            None => match gh(
                                 None,
                                 &[
                                     "repo",
@@ -625,53 +1901,160 @@ to do, on purpose."
                                 ],
                             )
                             .await
-                            .unwrap_or_else(|_| "main".into()),
+                            {
+                                Ok(base) if !base.is_empty() => base,
+                                Ok(_) => {
+                                    let error = "default branch lookup returned an empty name";
+                                    let persistence = assignments
+                                        .record_pre_resource_failure(
+                                            &assignment.assignment_id,
+                                            "default_branch",
+                                            error,
+                                        )
+                                        .await;
+                                    return Ok(CallToolResult::error(match persistence {
+                                        Ok(()) => error.to_string(),
+                                        Err(e) => format!("{error}; {e}"),
+                                    }));
+                                }
+                                Err(e) => {
+                                    let error = e.to_string();
+                                    let persistence = assignments
+                                        .record_pre_resource_failure(
+                                            &assignment.assignment_id,
+                                            "default_branch",
+                                            &error,
+                                        )
+                                        .await;
+                                    return Ok(CallToolResult::error(match persistence {
+                                        Ok(()) => {
+                                            format!("default branch lookup failed: {error}")
+                                        }
+                                        Err(e) => format!(
+                                            "default branch lookup failed: {error}; {e}"
+                                        ),
+                                    }));
+                                }
+                            },
                         };
-                        let (worktree, branch) =
-                            match repos.add_worktree(&args.repo, &slug, &base).await {
-                                Ok(pair) => pair,
-                                Err(e) => return Ok(CallToolResult::error(e.to_string())),
-                            };
+                        if let Err(e) = assignments.set_base(&assignment.assignment_id, &base).await
+                        {
+                            let error = e.to_string();
+                            let _ = assignments
+                                .stale(&assignment.assignment_id, "persist_base", &error)
+                                .await;
+                            return Ok(CallToolResult::error(error));
+                        }
+                        assignment.base = Some(base.clone());
+                        if let Err(e) = assignments
+                            .set_phase(&assignment.assignment_id, "worktree")
+                            .await
+                        {
+                            let error = e.to_string();
+                            let recorded = assignments
+                                .stale(&assignment.assignment_id, "persist_worktree_phase", &error)
+                                .await;
+                            let suffix = recorded
+                                .err()
+                                .map(|record| {
+                                    format!("; stale-state persistence also failed: {record}")
+                                })
+                                .unwrap_or_default();
+                            return Ok(CallToolResult::error(format!("{error}{suffix}")));
+                        }
+                        let (worktree, branch) = match repos
+                            .add_worktree(&args.repo, &assignment.slug, &base)
+                            .await
+                        {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                let error = e.to_string();
+                                let recorded = assignments
+                                    .stale(&assignment.assignment_id, "worktree", &error)
+                                    .await;
+                                let suffix = recorded
+                                    .err()
+                                    .map(|record| format!("; stale-state persistence also failed: {record}"))
+                                    .unwrap_or_default();
+                                return Ok(CallToolResult::error(format!("{error}{suffix}")));
+                            }
+                        };
+                        if worktree.as_path() != Path::new(&assignment.worktree)
+                            || branch != assignment.branch
+                        {
+                            let error = "repository provisioner returned resources different from the durable claim";
+                            let _ = assignments
+                                .stale(&assignment.assignment_id, "worktree_identity", error)
+                                .await;
+                            return Ok(CallToolResult::error(error.to_string()));
+                        }
                         let args_map = std::collections::HashMap::from([
                             ("repo".to_string(), args.repo.clone()),
                             ("issue".to_string(), args.issue.to_string()),
                             ("worktree".to_string(), worktree.display().to_string()),
                         ]);
                         let mut def = roles.to_def(&role, &args_map);
-                        def.name = format!("impl-{slug}");
+                        def.name = format!("impl-{}", assignment.slug);
 
-                        match ctx
-                            .ledger
-                            .create_agent(&def, authorization.spawned_by.as_deref())
-                            .await
-                        {
-                            Ok(agent_id) => {
-                                let assignment = Assignment {
-                                    repo: args.repo.clone(),
-                                    issue: args.issue,
-                                    slug,
-                                    branch: branch.clone(),
-                                    worktree: worktree.display().to_string(),
-                                    pr: None,
-                                };
-                                if let Some(store) =
-                                    ciacola_core::store::Store::new(ctx.pool.clone(), "repo-worker")
-                                        .put(&format!("agent/{agent_id}"), &assignment)
-                                        .await
-                                        .err()
-                                {
-                                    eprintln!("[repo-worker] record: {store}");
-                                }
-                                Ok(CallToolResult::json(json!({
-                                    "agent_id": agent_id,
-                                    "repo": args.repo,
-                                    "issue": args.issue,
-                                    "branch": branch,
-                                    "worktree": worktree.display().to_string(),
-                                })))
+                        let activation: Result<(), FlatError> = async {
+                            let mut tx = ctx.pool.begin_with("BEGIN IMMEDIATE").await?;
+                            let agent_id = ctx
+                                .ledger
+                                .create_agent_in(
+                                    &mut tx,
+                                    &def,
+                                    authorization.spawned_by.as_deref(),
+                                )
+                                .await?;
+                            let related = serde_json::to_string(&[&agent_id])?;
+                            let done = sqlx::query(
+                                "UPDATE repo_worker_assignments
+                                 SET state = 'active', phase = 'ready', agent_id = ?2,
+                                     related_agent_ids = ?3, updated_unix = ?4
+                                 WHERE assignment_id = ?1 AND state = 'preparing'",
+                            )
+                            .bind(&assignment.assignment_id)
+                            .bind(&agent_id)
+                            .bind(related)
+                            .bind(ciacola_core::now_unix())
+                            .execute(&mut *tx)
+                            .await?;
+                            if done.rows_affected() != 1 {
+                                return Err("assignment activation lost its preparing claim".into());
                             }
-                            Err(e) => Ok(CallToolResult::error(e.to_string())),
+                            tx.commit().await?;
+                            Ok(())
                         }
+                        .await;
+                        if let Err(e) = activation {
+                            let error = e.to_string();
+                            let recorded = assignments
+                                .stale(&assignment.assignment_id, "agent_activation", &error)
+                                .await;
+                            let suffix = recorded
+                                .err()
+                                .map(|record| {
+                                    format!("; stale-state persistence also failed: {record}")
+                                })
+                                .unwrap_or_default();
+                            return Ok(CallToolResult::error(format!("{error}{suffix}")));
+                        }
+                        assignment = match assignments.get_by_id(&assignment.assignment_id).await {
+                            Ok(Some(active)) if active.state == AssignmentState::Active => active,
+                            Ok(Some(other)) => {
+                                return Ok(CallToolResult::error(format!(
+                                    "assignment committed in unexpected state '{}'",
+                                    other.state.as_str()
+                                )));
+                            }
+                            Ok(None) => {
+                                return Ok(CallToolResult::error(
+                                    "activated assignment is not discoverable".to_string(),
+                                ));
+                            }
+                            Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                        };
+                        Ok(CallToolResult::json(assignment.response(true)))
                     },
                 )
                 .build()
@@ -679,19 +2062,55 @@ to do, on purpose."
 
         let list = {
             let repos = repos.clone();
+            let pool = ctx.pool.clone();
             ToolBuilder::new("worktrees")
-                .description("Worktrees the system currently holds.")
+                .description("Durable repository assignments and worktrees the system holds.")
                 .read_only()
                 .no_params_handler(move || {
                     let repos = repos.clone();
+                    let pool = pool.clone();
                     async move {
+                        let worktrees = match repos.worktrees() {
+                            Ok(worktrees) => worktrees,
+                            Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                        };
+                        let assignments = match AssignmentDb::new(pool).list().await {
+                            Ok(assignments) => assignments,
+                            Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                        };
+                        let owned: std::collections::HashSet<PathBuf> = assignments
+                            .iter()
+                            .filter(|a| a.state != AssignmentState::Completed)
+                            .map(|a| PathBuf::from(&a.worktree))
+                            .collect();
                         Ok(CallToolResult::json(json!({
                             "root": repos.root.display().to_string(),
-                            "worktrees": repos
-                                .worktrees()
+                            "worktrees": worktrees
                                 .iter()
                                 .map(|p| p.display().to_string())
-                                .collect::<Vec<_>>()
+                                .collect::<Vec<_>>(),
+                            "orphans": worktrees
+                                .iter()
+                                .filter(|p| !owned.contains(*p))
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>(),
+                            "assignments": assignments.iter().map(|a| json!({
+                                "assignment_id": a.assignment_id,
+                                "repo": a.repo,
+                                "issue": a.issue,
+                                "state": a.state.as_str(),
+                                "phase": a.phase,
+                                "agent_id": a.agent_id,
+                                "spawned_by": a.spawned_by,
+                                "base": a.base,
+                                "branch": a.branch,
+                                "worktree": a.worktree,
+                                "bare_path": a.bare_path,
+                                "last_error": a.last_error,
+                                "created_unix": a.created_unix,
+                                "updated_unix": a.updated_unix,
+                                "terminal_unix": a.terminal_unix,
+                            })).collect::<Vec<_>>(),
                         })))
                     }
                 })
@@ -706,6 +2125,7 @@ to do, on purpose."
         // side, decides whether one gets opened.
         if surface == Surface::Operator {
             let ctx_pr = ctx.clone();
+            let repos_pr = repos.clone();
             tools.push(
                 ToolBuilder::new("open_pr")
                     .description(
@@ -716,6 +2136,7 @@ to do, on purpose."
                     .destructive()
                     .handler(move |args: OpenPrArgs| {
                         let ctx = ctx_pr.clone();
+                        let repos = repos_pr.clone();
                         async move {
                             // The title gate is the preflight: keep it
                             // ahead of assignment lookup, gh, git, and
@@ -730,15 +2151,21 @@ to do, on purpose."
                                     args.title
                                 )));
                             }
-                            let store =
-                                ciacola_core::store::Store::new(ctx.pool.clone(), "repo-worker");
-                            let key = format!("agent/{}", args.agent_id);
-                            let Ok(Some(mut a)) = store.get::<Assignment>(&key).await else {
-                                return Ok(CallToolResult::error(format!(
-                                    "no assignment for '{}'",
-                                    args.agent_id
-                                )));
+                            let _lifecycle = repos.lifecycle.lock().await;
+                            let assignments = AssignmentDb::new(ctx.pool.clone());
+                            let a = match assignments.get_by_agent(&args.agent_id).await {
+                                Ok(Some(a)) => a,
+                                Ok(None) => {
+                                    return Ok(CallToolResult::error(format!(
+                                        "no assignment for '{}'",
+                                        args.agent_id
+                                    )));
+                                }
+                                Err(e) => return Ok(CallToolResult::error(e.to_string())),
                             };
+                            if a.state != AssignmentState::Active {
+                                return Ok(CallToolResult::error(a.conflict(None)));
+                            }
                             let worktree = PathBuf::from(&a.worktree);
 
                             // Idempotency, the whole point of this being
@@ -765,8 +2192,12 @@ to do, on purpose."
                             .await
                             {
                                 if let Ok(number) = existing.trim().parse::<u64>() {
-                                    a.pr = Some(number);
-                                    let _ = store.put(&key, &a).await;
+                                    if let Err(e) = assignments
+                                        .update_pr(&a.assignment_id, number)
+                                        .await
+                                    {
+                                        return Ok(CallToolResult::error(e.to_string()));
+                                    }
                                     return Ok(CallToolResult::json(json!({
                                         "pr": number,
                                         "created": false,
@@ -811,8 +2242,19 @@ to do, on purpose."
                                         .rsplit('/')
                                         .next()
                                         .and_then(|n| n.trim().parse::<u64>().ok());
-                                    a.pr = number;
-                                    let _ = store.put(&key, &a).await;
+                                    let Some(number) = number else {
+                                        return Ok(CallToolResult::error(format!(
+                                            "pull request was created but its number could not be parsed from '{url}'; retry to reconcile it"
+                                        )));
+                                    };
+                                    if let Err(e) = assignments
+                                        .update_pr(&a.assignment_id, number)
+                                        .await
+                                    {
+                                        return Ok(CallToolResult::error(format!(
+                                            "pull request #{number} exists, but recording it failed: {e}"
+                                        )));
+                                    }
                                     Ok(CallToolResult::json(json!({
                                         "pr": number,
                                         "url": url,
@@ -836,12 +2278,100 @@ to do, on purpose."
                     .handler(move |args: FinishArgs| {
                         let (ctx, repos) = (ctx_fin.clone(), repos_fin.clone());
                         async move {
-                            let store =
-                                ciacola_core::store::Store::new(ctx.pool.clone(), "repo-worker");
-                            let key = format!("agent/{}", args.agent_id);
-                            let Ok(Some(a)) = store.get::<Assignment>(&key).await else {
-                                return Ok(CallToolResult::error("no assignment".to_string()));
+                            let _lifecycle = repos.lifecycle.lock().await;
+                            let assignments = AssignmentDb::new(ctx.pool.clone());
+                            let found = match (&args.agent_id, &args.assignment_id) {
+                                (Some(agent_id), None) => assignments.get_by_agent(agent_id).await,
+                                (None, Some(assignment_id)) => {
+                                    assignments.get_by_id(assignment_id).await
+                                }
+                                (Some(_), Some(_)) => {
+                                    return Ok(CallToolResult::error(
+                                        "pass agent_id or assignment_id, not both".to_string(),
+                                    ));
+                                }
+                                (None, None) => {
+                                    return Ok(CallToolResult::error(
+                                        "agent_id or assignment_id is required".to_string(),
+                                    ));
+                                }
                             };
+                            let a = match found {
+                                Ok(Some(a)) => a,
+                                Ok(None) => {
+                                    return Ok(CallToolResult::error("no assignment".to_string()));
+                                }
+                                Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                            };
+                            let keep = args.keep.unwrap_or(false);
+                            match a.state {
+                                AssignmentState::Retained if keep => {
+                                    return Ok(CallToolResult::json(json!({
+                                        "assignment_id": a.assignment_id,
+                                        "state": "retained",
+                                        "worktree_removed": false,
+                                        "agent_retired": true,
+                                        "pr": a.pr,
+                                    })));
+                                }
+                                AssignmentState::Completed if !keep => {
+                                    return Ok(CallToolResult::json(json!({
+                                        "assignment_id": a.assignment_id,
+                                        "state": "completed",
+                                        "worktree_removed": true,
+                                        "agent_retired": true,
+                                        "pr": a.pr,
+                                    })));
+                                }
+                                AssignmentState::Active
+                                | AssignmentState::Finishing
+                                | AssignmentState::Retained
+                                | AssignmentState::Stale
+                                    if !keep || a.state != AssignmentState::Retained => {}
+                                _ => return Ok(CallToolResult::error(a.conflict(None))),
+                            }
+                            if !keep {
+                                match assignments.conflicting_resources(&a).await {
+                                    Ok(conflicts) if conflicts.is_empty() => {}
+                                    Ok(conflicts) => {
+                                        return Ok(CallToolResult::error(format!(
+                                            "assignment '{}' shares its worktree or branch with assignments {}; refusing ambiguous cleanup",
+                                            a.assignment_id,
+                                            conflicts.join(", ")
+                                        )));
+                                    }
+                                    Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                                }
+                            }
+                            if a.related_agent_ids.len() > 1 {
+                                return Ok(CallToolResult::error(format!(
+                                    "assignment '{}' has ambiguous legacy owners {}; inspect and retire every agent before manual cleanup",
+                                    a.assignment_id,
+                                    a.related_agent_ids.join(", ")
+                                )));
+                            }
+                            let prior_state = if a.state == AssignmentState::Retained
+                                || a.phase == "finishing_remove_retained"
+                            {
+                                AssignmentState::Retained
+                            } else if a.state == AssignmentState::Stale {
+                                AssignmentState::Stale
+                            } else {
+                                AssignmentState::Active
+                            };
+                            match assignments.begin_finish(&a, keep).await {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    let current = assignments
+                                        .get_by_id(&a.assignment_id)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or(a);
+                                    return Ok(CallToolResult::error(current.conflict(None)));
+                                }
+                                Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                            }
                             // Retire before touching the worktree, and
                             // `retire_agent` is the proof: it flips the
                             // row atomically with the check that no turn
@@ -855,46 +2385,179 @@ to do, on purpose."
                             // successfully and then failed in git or the
                             // store. Treat that as proof too, so the
                             // retained assignment is actually retryable.
-                            let retired = match ctx.ledger.get_agent(&args.agent_id).await {
-                                Ok(Some(agent)) if agent.retired => true,
-                                Ok(Some(_)) => ctx
-                                    .ledger
-                                    .retire_agent(&args.agent_id)
-                                    .await
-                                    .unwrap_or(false),
-                                _ => false,
+                            let Some(agent_id) = a.agent_id.as_deref() else {
+                                let resumable_remove = a.state == AssignmentState::Stale
+                                    || (a.state == AssignmentState::Finishing
+                                        && matches!(
+                                            a.phase.as_str(),
+                                            "finishing_remove"
+                                                | "finishing_remove_retained"
+                                                | "finishing_remove_stale"
+                                        ));
+                                if resumable_remove && !keep {
+                                    let removed = match repos
+                                        .remove_worktree_at(
+                                            &a.slug,
+                                            Path::new(&a.worktree),
+                                            Path::new(&a.bare_path),
+                                        )
+                                        .await
+                                    {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            let error = e.to_string();
+                                            let _ = assignments
+                                                .stale(&a.assignment_id, "cleanup", &error)
+                                                .await;
+                                            return Ok(CallToolResult::error(format!(
+                                                "stale assignment cleanup failed: {error}"
+                                            )));
+                                        }
+                                    };
+                                    if let Err(e) = assignments
+                                        .terminal(
+                                            &a.assignment_id,
+                                            AssignmentState::Completed,
+                                            "cleanup_complete",
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        return Ok(CallToolResult::error(e.to_string()));
+                                    }
+                                    return Ok(CallToolResult::json(json!({
+                                        "assignment_id": a.assignment_id,
+                                        "state": "completed",
+                                        "worktree_removed": removed,
+                                        "agent_retired": false,
+                                        "pr": a.pr,
+                                    })));
+                                }
+                                return Ok(CallToolResult::error(
+                                    "assignment has no agent; clean it by assignment_id with keep=false"
+                                        .to_string(),
+                                ));
+                            };
+                            let mut retired = match ctx.ledger.get_agent(agent_id).await {
+                                Ok(Some(agent)) => agent.retired,
+                                Ok(None) if a.state == AssignmentState::Stale && !keep => true,
+                                Ok(None) => {
+                                    let error = format!("agent '{agent_id}' is missing");
+                                    let _ = assignments
+                                        .stale(&a.assignment_id, "finish_agent_missing", &error)
+                                        .await;
+                                    return Ok(CallToolResult::error(error));
+                                }
+                                Err(e) => {
+                                    let error = format!("cannot read agent for finish: {e}");
+                                    let _ = assignments
+                                        .stale(&a.assignment_id, "finish_agent_read", &error)
+                                        .await;
+                                    return Ok(CallToolResult::error(error));
+                                }
                             };
                             if !retired {
+                                retired = match ctx.ledger.retire_agent(agent_id).await {
+                                    Ok(retired) => retired,
+                                    Err(e) => {
+                                        let error = format!("cannot retire agent: {e}");
+                                        let _ = assignments
+                                            .stale(
+                                                &a.assignment_id,
+                                                "finish_agent_retire",
+                                                &error,
+                                            )
+                                            .await;
+                                        return Ok(CallToolResult::error(error));
+                                    }
+                                };
+                            }
+                            if !retired {
+                                retired = match ctx.ledger.get_agent(agent_id).await {
+                                    Ok(Some(agent)) => agent.retired,
+                                    Ok(None) => false,
+                                    Err(e) => {
+                                        let error = format!("cannot verify agent retirement: {e}");
+                                        let _ = assignments
+                                            .stale(
+                                                &a.assignment_id,
+                                                "finish_agent_verify",
+                                                &error,
+                                            )
+                                            .await;
+                                        return Ok(CallToolResult::error(error));
+                                    }
+                                };
+                            }
+                            if !retired {
+                                if let Err(e) = assignments.restore_after_busy(&a).await {
+                                    return Ok(CallToolResult::error(format!(
+                                        "agent is busy and restoring assignment state failed: {e}"
+                                    )));
+                                }
                                 return Ok(CallToolResult::error(
                                     "agent still has a queued or running turn; \
                                      finish once it goes idle"
                                         .to_string(),
                                 ));
                             }
-                            let keep = args.keep.unwrap_or(false);
                             let removed = if keep {
                                 false
                             } else {
-                                if let Err(e) = repos.remove_worktree(&a.repo, &a.slug).await {
+                                if let Err(e) = repos
+                                    .remove_worktree_at(
+                                        &a.slug,
+                                        Path::new(&a.worktree),
+                                        Path::new(&a.bare_path),
+                                    )
+                                    .await
+                                {
+                                    let error = e.to_string();
+                                    let _ = assignments
+                                        .stale(&a.assignment_id, "cleanup", &error)
+                                        .await;
                                     return Ok(CallToolResult::error(format!(
-                                        "agent retired, but cleanup failed; assignment kept for retry: {e}"
+                                        "agent retired, but cleanup failed; assignment is stale: {error}"
                                     )));
                                 }
                                 true
                             };
-                            // A retired agent is done, not "in progress":
-                            // drop the assignment so it stops appearing
-                            // in the board's "issues in progress" section
-                            // and in `health`'s count. Nothing else in
-                            // this plugin reads a finished assignment, so
-                            // there is no history to preserve by keeping
-                            // it.
-                            if let Err(e) = store.delete(&key).await {
+                            let state = if keep {
+                                AssignmentState::Retained
+                            } else {
+                                AssignmentState::Completed
+                            };
+                            if let Err(e) = assignments
+                                .terminal(
+                                    &a.assignment_id,
+                                    state,
+                                    if keep { "retained" } else { "cleanup_complete" },
+                                    None,
+                                )
+                                .await
+                            {
+                                let error = e.to_string();
+                                let _ = assignments
+                                    .stale(
+                                        &a.assignment_id,
+                                        if keep {
+                                            "finish_terminal_keep"
+                                        } else if prior_state == AssignmentState::Retained {
+                                            "finish_terminal_remove_retained"
+                                        } else {
+                                            "finish_terminal_remove"
+                                        },
+                                        &error,
+                                    )
+                                    .await;
                                 return Ok(CallToolResult::error(format!(
-                                    "agent retired and worktree cleanup completed, but assignment cleanup failed: {e}"
+                                    "agent retired and cleanup applied, but recording '{}' failed: {e}",
+                                    state.as_str()
                                 )));
                             }
                             Ok(CallToolResult::json(json!({
+                                "assignment_id": a.assignment_id,
+                                "state": state.as_str(),
                                 "worktree_removed": removed,
                                 "agent_retired": retired,
                                 "pr": a.pr,
@@ -909,43 +2572,62 @@ to do, on purpose."
 
     fn board_section(&self) -> BoxFut<'_, Option<Section>> {
         Box::pin(async move {
-            let all = self.assignments().await;
+            let all = match self.assignments().await {
+                Ok(all) => all,
+                Err(e) => {
+                    return Some(Section {
+                        title: "repository work (degraded)".into(),
+                        html: format!(
+                            "<p class=\"error\">assignment query failed: {}</p>",
+                            ciacola_core::render::esc(&e.to_string())
+                        ),
+                    });
+                }
+            };
             if all.is_empty() {
                 return None;
             }
             let ledger: Option<Ledger> = self.ctx.as_ref().map(|c| c.ledger.clone());
             let mut html = String::from(
-                "<table><tr><th>issue</th><th>agent</th><th>branch</th><th>pr</th>\
-                 <th>worktree</th></tr>",
+                "<table><tr><th>state</th><th>issue</th><th>agent</th><th>branch</th>\
+                 <th>pr</th><th>worktree</th><th>detail</th></tr>",
             );
-            for (agent_id, a) in &all {
-                let name = match &ledger {
-                    Some(l) => l
-                        .get_agent(agent_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|x| x.name)
-                        .unwrap_or_else(|| agent_id.clone()),
-                    None => agent_id.clone(),
+            for a in &all {
+                let agent = match (&ledger, a.agent_id.as_deref()) {
+                    (Some(l), Some(agent_id)) => {
+                        let name = l
+                            .get_agent(agent_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|x| x.name)
+                            .unwrap_or_else(|| agent_id.to_string());
+                        format!(
+                            "<a href=\"/board/agent/{}\">{}</a>",
+                            ciacola_core::render::esc(agent_id),
+                            ciacola_core::render::esc(&name)
+                        )
+                    }
+                    (_, Some(agent_id)) => ciacola_core::render::esc(agent_id),
+                    _ => "-".into(),
                 };
                 html.push_str(&format!(
-                    "<tr><td>{repo}#{issue}</td>\
-                     <td><a href=\"/board/agent/{id}\">{name}</a></td>\
+                    "<tr><td>{state}</td><td>{repo}#{issue}</td><td>{agent}</td>\
                      <td class=\"mono\">{branch}</td><td>{pr}</td>\
-                     <td class=\"dim mono\">{wt}</td></tr>",
+                     <td class=\"dim mono\">{wt}</td><td>{detail}</td></tr>",
+                    state = ciacola_core::render::esc(a.state.as_str()),
                     repo = ciacola_core::render::esc(&a.repo),
                     issue = a.issue,
-                    id = ciacola_core::render::esc(agent_id),
-                    name = ciacola_core::render::esc(&name),
+                    agent = agent,
                     branch = ciacola_core::render::esc(&a.branch),
                     pr = a.pr.map(|n| format!("#{n}")).unwrap_or_else(|| "-".into()),
                     wt = ciacola_core::render::esc(&a.worktree),
+                    detail = ciacola_core::render::esc(a.last_error.as_deref().unwrap_or(&a.phase)),
                 ));
             }
             html.push_str("</table>");
             Some(Section {
-                title: "issues in progress".into(),
+                title: "repository work".into(),
                 html,
             })
         })
@@ -953,11 +2635,95 @@ to do, on purpose."
 
     fn health(&self) -> BoxFut<'_, serde_json::Value> {
         Box::pin(async move {
-            let all = self.assignments().await;
+            let all = match self.assignments().await {
+                Ok(all) => all,
+                Err(e) => return json!({"status": "degraded", "assignment_error": e.to_string()}),
+            };
+            let worktrees = match self.repos.as_ref().map(Repos::worktrees) {
+                Some(Ok(worktrees)) => worktrees,
+                Some(Err(e)) => {
+                    return json!({
+                        "status": "degraded",
+                        "assignments": all.len(),
+                        "worktree_error": e.to_string(),
+                    });
+                }
+                None => Vec::new(),
+            };
+            let owned: std::collections::HashSet<PathBuf> = all
+                .iter()
+                .filter(|a| a.state != AssignmentState::Completed)
+                .map(|a| PathBuf::from(&a.worktree))
+                .collect();
+            let orphan_count = worktrees
+                .iter()
+                .filter(|path| !owned.contains(*path))
+                .count();
+            let stale_count = all
+                .iter()
+                .filter(|a| a.state == AssignmentState::Stale)
+                .count();
+            let missing_owned = all
+                .iter()
+                .filter(|a| {
+                    matches!(a.state, AssignmentState::Active | AssignmentState::Retained)
+                        && !Path::new(&a.worktree).exists()
+                })
+                .count();
+            let missing_active = all
+                .iter()
+                .filter(|a| a.state == AssignmentState::Active && !Path::new(&a.worktree).exists())
+                .count();
+            let completed_with_worktree = all
+                .iter()
+                .filter(|a| {
+                    a.state == AssignmentState::Completed && Path::new(&a.worktree).exists()
+                })
+                .count();
+            let mut agent_state_drift = 0;
+            let mut agent_query_error = None;
+            if let Some(ctx) = &self.ctx {
+                for assignment in all.iter().filter(|a| {
+                    matches!(a.state, AssignmentState::Active | AssignmentState::Retained)
+                }) {
+                    let expected_retired = assignment.state == AssignmentState::Retained;
+                    let Some(agent_id) = assignment.agent_id.as_deref() else {
+                        agent_state_drift += 1;
+                        continue;
+                    };
+                    match ctx.ledger.get_agent(agent_id).await {
+                        Ok(Some(agent)) if agent.retired == expected_retired => {}
+                        Ok(_) => agent_state_drift += 1,
+                        Err(e) => {
+                            agent_query_error = Some(e.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+            let degraded = stale_count > 0
+                || orphan_count > 0
+                || missing_owned > 0
+                || completed_with_worktree > 0
+                || agent_state_drift > 0
+                || agent_query_error.is_some();
             json!({
+                "status": if degraded { "degraded" } else { "ok" },
                 "assignments": all.len(),
-                "with_pr": all.iter().filter(|(_, a)| a.pr.is_some()).count(),
-                "worktrees": self.repos.as_ref().map(|r| r.worktrees().len()).unwrap_or(0),
+                "active": all.iter().filter(|a| a.state == AssignmentState::Active).count(),
+                "preparing": all.iter().filter(|a| a.state == AssignmentState::Preparing).count(),
+                "finishing": all.iter().filter(|a| a.state == AssignmentState::Finishing).count(),
+                "retained": all.iter().filter(|a| a.state == AssignmentState::Retained).count(),
+                "completed": all.iter().filter(|a| a.state == AssignmentState::Completed).count(),
+                "stale": stale_count,
+                "with_pr": all.iter().filter(|a| a.pr.is_some()).count(),
+                "worktrees": worktrees.len(),
+                "orphans": orphan_count,
+                "missing_active_worktrees": missing_active,
+                "missing_owned_worktrees": missing_owned,
+                "completed_with_worktree": completed_with_worktree,
+                "agent_state_drift": agent_state_drift,
+                "agent_query_error": agent_query_error,
             })
         })
     }
@@ -981,6 +2747,17 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    async fn configure_local_transport(bare: &Path, origin: &Path, repo: &str) {
+        let expected = format!("https://github.com/{repo}.git");
+        let local = format!("file://{}", origin.display());
+        git(bare, &["config", "remote.origin.url", &expected]).await;
+        git(
+            bare,
+            &["config", &format!("url.{local}.insteadOf"), &expected],
+        )
+        .await;
     }
 
     fn bundled_roles() -> Roles {
@@ -1066,6 +2843,7 @@ mod tests {
             root: tmp.join("root"),
             allowed: Arc::new(vec!["local/repo".into()]),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
         std::fs::create_dir_all(&repos.root).expect("mkdir root");
         CloneCommand::new(format!("file://{}", origin.display()))
@@ -1074,6 +2852,7 @@ mod tests {
             .execute()
             .await
             .expect("clone");
+        configure_local_transport(&repos.bare("local/repo"), &origin, "local/repo").await;
         (tmp, repos)
     }
 
@@ -1096,7 +2875,480 @@ mod tests {
         .execute(&pool)
         .await
         .expect("plugin store");
+        ciacola_core::plugin::apply_migrations(&pool, "repo-worker", MIGRATIONS)
+            .await
+            .expect("repo-worker migrations");
         (plugin(context(pool, ledger.clone()), repos), ledger)
+    }
+
+    struct AssignmentFixture<'a> {
+        agent_id: &'a str,
+        repo: &'a str,
+        issue: u64,
+        slug: &'a str,
+        branch: &'a str,
+        worktree: &'a Path,
+        pr: Option<u64>,
+    }
+
+    async fn record_assignment(
+        plugin: &RepoWorkerPlugin,
+        fixture: AssignmentFixture<'_>,
+    ) -> Assignment {
+        let assignment_id = ulid::Ulid::new().to_string();
+        let now = ciacola_core::now_unix();
+        let bare = plugin
+            .repos
+            .as_ref()
+            .expect("repos")
+            .bare(fixture.repo)
+            .display()
+            .to_string();
+        sqlx::query(
+            "INSERT INTO repo_worker_assignments
+                 (assignment_id, repo, issue_number, state, phase, base, slug, branch,
+                  worktree, bare_path, agent_id, related_agent_ids, pr, created_unix, updated_unix)
+             VALUES (?1, ?2, ?3, 'active', 'ready', 'main', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+        )
+        .bind(&assignment_id)
+        .bind(fixture.repo)
+        .bind(sqlite_u64(fixture.issue, "issue").expect("issue range"))
+        .bind(fixture.slug)
+        .bind(fixture.branch)
+        .bind(fixture.worktree.display().to_string())
+        .bind(bare)
+        .bind(fixture.agent_id)
+        .bind(serde_json::to_string(&[fixture.agent_id]).expect("agent ids"))
+        .bind(fixture.pr.map(|pr| sqlite_u64(pr, "pr").expect("pr range")))
+        .bind(now)
+        .execute(&plugin.ctx.as_ref().expect("context").pool)
+        .await
+        .expect("assignment");
+        plugin
+            .assignment_db()
+            .expect("assignment db")
+            .get_by_id(&assignment_id)
+            .await
+            .expect("read assignment")
+            .expect("assignment row")
+    }
+
+    #[tokio::test]
+    async fn sequential_start_replays_one_durable_assignment() {
+        let (tmp, repos) = local_repos("sequential-start").await;
+        let (plugin, ledger) = memory_plugin(repos).await;
+        let args = json!({"repo": "local/repo", "issue": 73, "base": "main"});
+
+        let first = operator_tool(&plugin, "start_issue")
+            .call(args.clone())
+            .await;
+        let replay = operator_tool(&plugin, "start_issue").call(args).await;
+        let first = serde_json::to_string(&first).expect("render first start");
+        let replay = serde_json::to_string(&replay).expect("render replay");
+
+        assert!(first.contains("\"created\":true"), "got: {first}");
+        assert!(replay.contains("\"created\":false"), "got: {replay}");
+        let assignments = plugin.assignments().await.expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].state, AssignmentState::Active);
+        assert_eq!(ledger.list_agents().await.expect("agents").len(), 1);
+        assert_eq!(
+            plugin
+                .repos
+                .as_ref()
+                .expect("repos")
+                .worktrees()
+                .expect("worktrees")
+                .len(),
+            1
+        );
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_start_has_one_assignment_agent_and_worktree() {
+        let (tmp, repos) = local_repos("concurrent-start").await;
+        let (plugin, ledger) = memory_plugin(repos).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let start = |tool: Tool, barrier: Arc<tokio::sync::Barrier>| async move {
+            barrier.wait().await;
+            tool.call(json!({"repo": "local/repo", "issue": 73, "base": "main"}))
+                .await
+        };
+        let (left, right) = tokio::join!(
+            start(operator_tool(&plugin, "start_issue"), barrier.clone()),
+            start(operator_tool(&plugin, "start_issue"), barrier),
+        );
+
+        let left = serde_json::to_string(&left).expect("render left");
+        let right = serde_json::to_string(&right).expect("render right");
+        assert_eq!(
+            usize::from(left.contains("\"created\":true"))
+                + usize::from(right.contains("\"created\":true")),
+            1,
+            "one call must activate the claim: left={left}; right={right}"
+        );
+        assert!(
+            left.contains("\"created\":false")
+                || right.contains("\"created\":false")
+                || left.contains("preparing")
+                || right.contains("preparing"),
+            "the loser must replay or observe the in-flight claim: left={left}; right={right}"
+        );
+        assert_eq!(plugin.assignments().await.expect("assignments").len(), 1);
+        assert_eq!(ledger.list_agents().await.expect("agents").len(), 1);
+        assert_eq!(
+            plugin
+                .repos
+                .as_ref()
+                .expect("repos")
+                .worktrees()
+                .expect("worktrees")
+                .len(),
+            1
+        );
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn file_backed_restart_replays_the_active_assignment() {
+        let (tmp, repos) = local_repos("restart-replay").await;
+        let db_path = tmp.join("ciacola.db");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("file pool");
+        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS plugin_kv (
+                 plugin TEXT NOT NULL,
+                 key TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 updated_unix INTEGER NOT NULL,
+                 PRIMARY KEY (plugin, key))",
+        )
+        .execute(&pool)
+        .await
+        .expect("plugin store");
+        let mut ctx = context(pool.clone(), ledger.clone());
+        ctx.plugin_config = toml::from_str(&format!(
+            "[repo-worker]\nroot = {:?}\nrepos = [\"local/repo\"]",
+            repos.root.display().to_string()
+        ))
+        .expect("config");
+        let args = json!({"repo": "local/repo", "issue": 73, "base": "main"});
+
+        let mut first = RepoWorkerPlugin::default();
+        first.setup(&ctx).await.expect("first setup");
+        let created = operator_tool(&first, "start_issue")
+            .call(args.clone())
+            .await;
+        let created = serde_json::to_string(&created).expect("render create");
+        assert!(created.contains("\"created\":true"), "got: {created}");
+        let original = first.assignments().await.expect("assignments")[0].clone();
+        drop(first);
+        drop(ctx);
+        drop(ledger);
+        pool.close().await;
+
+        let fresh_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(false),
+            )
+            .await
+            .expect("reopened file pool");
+        let fresh_ledger = Ledger::setup(fresh_pool.clone())
+            .await
+            .expect("reopened ledger");
+        let mut fresh_ctx = context(fresh_pool.clone(), fresh_ledger.clone());
+        fresh_ctx.plugin_config = toml::from_str(&format!(
+            "[repo-worker]\nroot = {:?}\nrepos = [\"local/repo\"]",
+            repos.root.display().to_string()
+        ))
+        .expect("restart config");
+        let mut restarted = RepoWorkerPlugin::default();
+        restarted.setup(&fresh_ctx).await.expect("restart setup");
+        let replay = operator_tool(&restarted, "start_issue").call(args).await;
+        let replay = serde_json::to_string(&replay).expect("render replay");
+        assert!(replay.contains("\"created\":false"), "got: {replay}");
+        let after = restarted.assignments().await.expect("assignments");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].assignment_id, original.assignment_id);
+        assert_eq!(after[0].agent_id, original.agent_id);
+        assert_eq!(fresh_ledger.list_agents().await.expect("agents").len(), 1);
+        drop(restarted);
+        drop(fresh_ctx);
+        drop(fresh_ledger);
+        fresh_pool.close().await;
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_insert_failure_leaves_no_agent_and_a_stale_claim() {
+        let (tmp, repos) = local_repos("agent-insert-failure").await;
+        let (plugin, ledger) = memory_plugin(repos).await;
+        let pool = &plugin.ctx.as_ref().expect("context").pool;
+        sqlx::query(
+            "CREATE TRIGGER inject_agent_insert_failure
+             BEFORE INSERT ON agents BEGIN
+                 SELECT RAISE(FAIL, 'injected agent insert failure');
+             END",
+        )
+        .execute(pool)
+        .await
+        .expect("trigger");
+
+        let out = operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 73, "base": "main"}))
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+        assert!(
+            rendered.contains("injected agent insert failure"),
+            "got: {rendered}"
+        );
+        assert!(ledger.list_agents().await.expect("agents").is_empty());
+        let assignments = plugin.assignments().await.expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].state, AssignmentState::Stale);
+        assert_eq!(assignments[0].phase, "agent_activation");
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn activation_failure_rolls_back_agent_and_can_clean_the_worktree() {
+        let (tmp, repos) = local_repos("activation-failure").await;
+        let (plugin, ledger) = memory_plugin(repos).await;
+        let pool = &plugin.ctx.as_ref().expect("context").pool;
+        sqlx::query(
+            "CREATE TRIGGER inject_activation_failure
+             BEFORE UPDATE OF state ON repo_worker_assignments
+             WHEN NEW.state = 'active' BEGIN
+                 SELECT RAISE(FAIL, 'injected activation failure');
+             END",
+        )
+        .execute(pool)
+        .await
+        .expect("trigger");
+
+        let out = operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 73, "base": "main"}))
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+        assert!(
+            rendered.contains("injected activation failure"),
+            "got: {rendered}"
+        );
+        assert!(ledger.list_agents().await.expect("agents").is_empty());
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(assignment.state, AssignmentState::Stale);
+        assert_eq!(assignment.phase, "agent_activation");
+        assert!(Path::new(&assignment.worktree).exists());
+
+        let cleaned = operator_tool(&plugin, "finish_issue")
+            .call(json!({"assignment_id": assignment.assignment_id}))
+            .await;
+        let cleaned = serde_json::to_string(&cleaned).expect("render cleanup");
+        assert!(
+            cleaned.contains("\"state\":\"completed\""),
+            "got: {cleaned}"
+        );
+        assert!(!Path::new(&assignment.worktree).exists());
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn provisioning_failure_never_creates_an_agent_and_is_cleanable() {
+        let (tmp, repos) = local_repos("provisioning-failure").await;
+        git(
+            &repos.bare("local/repo"),
+            &[
+                "config",
+                "remote.origin.url",
+                "https://github.com/wrong/repo.git",
+            ],
+        )
+        .await;
+        let (plugin, ledger) = memory_plugin(repos).await;
+
+        let out = operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 73, "base": "main"}))
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+        assert!(rendered.contains("expected"), "got: {rendered}");
+        assert!(!rendered.contains("\"created\":true"), "got: {rendered}");
+        assert!(ledger.list_agents().await.expect("agents").is_empty());
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(assignment.state, AssignmentState::Stale);
+        assert_eq!(assignment.phase, "worktree");
+        assert!(!Path::new(&assignment.worktree).exists());
+
+        let cleaned = operator_tool(&plugin, "finish_issue")
+            .call(json!({"assignment_id": assignment.assignment_id}))
+            .await;
+        let cleaned = serde_json::to_string(&cleaned).expect("render cleanup");
+        assert!(
+            cleaned.contains("\"state\":\"completed\""),
+            "got: {cleaned}"
+        );
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn legacy_slug_collision_imports_stale_and_refuses_ambiguous_cleanup() {
+        let root = std::env::temp_dir().join(format!("ciacola-legacy-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("root");
+        let repos = Repos {
+            root: root.clone(),
+            allowed: Arc::new(Vec::new()),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let (plugin, ledger) = memory_plugin(repos).await;
+        let first_agent = ledger
+            .create_agent(&ciacola_core::AgentDef::new("first", "s"), None)
+            .await
+            .expect("first agent");
+        let second_agent = ledger
+            .create_agent(&ciacola_core::AgentDef::new("second", "s"), None)
+            .await
+            .expect("second agent");
+        let slug = "acme-a-b-1";
+        let branch = format!("agent/{slug}");
+        let shared_worktree = root.join(format!("wt-{slug}"));
+        let durable = record_assignment(
+            &plugin,
+            AssignmentFixture {
+                agent_id: &first_agent,
+                repo: "acme/a-b",
+                issue: 1,
+                slug,
+                branch: &branch,
+                worktree: &shared_worktree,
+                pr: None,
+            },
+        )
+        .await;
+        sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET state = 'stale', phase = 'seeded_legacy_stale'
+             WHERE assignment_id = ?1",
+        )
+        .bind(&durable.assignment_id)
+        .execute(&plugin.ctx.as_ref().expect("context").pool)
+        .await
+        .expect("seed stale");
+
+        for (agent_id, repo) in [(&first_agent, "acme/a-b"), (&second_agent, "acme-a/b")] {
+            let value = json!({
+                "repo": repo,
+                "issue": 1,
+                "slug": slug,
+                "branch": branch,
+                "worktree": shared_worktree.display().to_string(),
+                "pr": null,
+            });
+            sqlx::query(
+                "INSERT INTO plugin_kv (plugin, key, value, updated_unix)
+                 VALUES ('repo-worker', ?1, ?2, ?3)",
+            )
+            .bind(format!("agent/{agent_id}"))
+            .bind(value.to_string())
+            .bind(ciacola_core::now_unix())
+            .execute(&plugin.ctx.as_ref().expect("context").pool)
+            .await
+            .expect("legacy row");
+        }
+
+        let assignments = plugin.assignment_db().expect("assignment db");
+        assignments
+            .import_legacy(&ledger, plugin.repos.as_ref().expect("repos"))
+            .await
+            .expect("legacy import");
+        let imported = assignments.list().await.expect("assignments");
+        assert_eq!(imported.len(), 2);
+        assert!(
+            imported
+                .iter()
+                .all(|assignment| assignment.state == AssignmentState::Stale)
+        );
+        assert!(imported.iter().all(|assignment| {
+            assignment.related_agent_ids.contains(&first_agent)
+                && assignment.related_agent_ids.contains(&second_agent)
+        }));
+        let second = imported
+            .iter()
+            .find(|assignment| assignment.repo == "acme-a/b")
+            .expect("second assignment");
+        let refused = operator_tool(&plugin, "finish_issue")
+            .call(json!({"assignment_id": second.assignment_id}))
+            .await;
+        let refused = serde_json::to_string(&refused).expect("render refusal");
+        assert!(refused.contains(&durable.assignment_id), "got: {refused}");
+        assert!(refused.contains(&first_agent), "got: {refused}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn health_degrades_for_durable_and_physical_drift() {
+        let root = std::env::temp_dir().join(format!("ciacola-health-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("root");
+        let repos = Repos {
+            root: root.clone(),
+            allowed: Arc::new(Vec::new()),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let (plugin, ledger) = memory_plugin(repos.clone()).await;
+        let agent_id = ledger
+            .create_agent(&ciacola_core::AgentDef::new("drifted", "s"), None)
+            .await
+            .expect("agent");
+        assert!(ledger.retire_agent(&agent_id).await.expect("retire"));
+        record_assignment(
+            &plugin,
+            AssignmentFixture {
+                agent_id: &agent_id,
+                repo: "local/repo",
+                issue: 1,
+                slug: "missing-active",
+                branch: "agent/missing-active",
+                worktree: &root.join("wt-missing-active"),
+                pr: None,
+            },
+        )
+        .await;
+        let (completed, _) = plugin
+            .assignment_db()
+            .expect("assignment db")
+            .reserve("local/repo", 2, Some("main"), &repos, None)
+            .await
+            .expect("completed reservation");
+        std::fs::create_dir_all(&completed.worktree).expect("completed worktree");
+        sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET state = 'completed', phase = 'cleanup_complete'
+             WHERE assignment_id = ?1",
+        )
+        .bind(&completed.assignment_id)
+        .execute(&plugin.ctx.as_ref().expect("context").pool)
+        .await
+        .expect("complete assignment");
+
+        let health = plugin.health().await;
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(health["missing_active_worktrees"], 1);
+        assert_eq!(health["agent_state_drift"], 1);
+        assert_eq!(health["completed_with_worktree"], 1);
+        assert_eq!(health["orphans"], 1);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]
@@ -1106,6 +3358,7 @@ mod tests {
             root: root.clone(),
             allowed: Arc::new(Vec::new()),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
         let (plugin, _ledger) = memory_plugin(repos).await;
 
@@ -1138,21 +3391,19 @@ mod tests {
             .expect("agent");
         let seq = ledger.enqueue_turn(&agent_id, "work").await.expect("turn");
         assert!(ledger.claim_turn(&agent_id, seq).await.expect("claim"));
-        let store = plugin.store().expect("store");
-        store
-            .put(
-                &format!("agent/{agent_id}"),
-                &Assignment {
-                    repo: "local/repo".into(),
-                    issue: 42,
-                    slug: slug.into(),
-                    branch,
-                    worktree: worktree.display().to_string(),
-                    pr: None,
-                },
-            )
-            .await
-            .expect("assignment");
+        record_assignment(
+            &plugin,
+            AssignmentFixture {
+                agent_id: &agent_id,
+                repo: "local/repo",
+                issue: 42,
+                slug,
+                branch: &branch,
+                worktree: &worktree,
+                pr: None,
+            },
+        )
+        .await;
 
         let out = operator_tool(&plugin, "finish_issue")
             .call(json!({"agent_id": agent_id}))
@@ -1162,8 +3413,10 @@ mod tests {
         assert!(rendered.contains("queued or running"), "got: {rendered}");
         assert!(worktree.exists(), "finish removed a live worktree");
         assert!(
-            store
-                .get::<Assignment>(&format!("agent/{agent_id}"))
+            plugin
+                .assignment_db()
+                .expect("assignment db")
+                .get_by_agent(&agent_id)
                 .await
                 .expect("read assignment")
                 .is_some(),
@@ -1182,28 +3435,26 @@ mod tests {
             root: root.clone(),
             allowed: Arc::new(Vec::new()),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
         let (plugin, ledger) = memory_plugin(repos).await;
         let agent_id = ledger
             .create_agent(&ciacola_core::AgentDef::new("worker", "s"), None)
             .await
             .expect("agent");
-        plugin
-            .store()
-            .unwrap()
-            .put(
-                &format!("agent/{agent_id}"),
-                &Assignment {
-                    repo: "local/repo".into(),
-                    issue: 42,
-                    slug: "local-repo-42".into(),
-                    branch: "agent/local-repo-42".into(),
-                    worktree: worktree.display().to_string(),
-                    pr: Some(44),
-                },
-            )
-            .await
-            .expect("assignment");
+        record_assignment(
+            &plugin,
+            AssignmentFixture {
+                agent_id: &agent_id,
+                repo: "local/repo",
+                issue: 42,
+                slug: "local-repo-42",
+                branch: "agent/local-repo-42",
+                worktree: &worktree,
+                pr: Some(44),
+            },
+        )
+        .await;
 
         let out = operator_tool(&plugin, "finish_issue")
             .call(json!({"agent_id": agent_id, "keep": true}))
@@ -1212,7 +3463,9 @@ mod tests {
 
         assert!(rendered.contains("agent_retired"), "got: {rendered}");
         assert!(ledger.get_agent(&agent_id).await.unwrap().unwrap().retired);
-        assert!(plugin.assignments().await.is_empty());
+        let assignments = plugin.assignments().await.expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].state, AssignmentState::Retained);
         assert!(worktree.exists(), "keep=true must retain the worktree");
         std::fs::remove_dir_all(root).ok();
     }
@@ -1226,52 +3479,36 @@ mod tests {
             root: root.clone(),
             allowed: Arc::new(Vec::new()),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
         let (plugin, ledger) = memory_plugin(repos).await;
         let agent_id = ledger
             .create_agent(&ciacola_core::AgentDef::new("worker", "s"), None)
             .await
             .expect("agent");
-        let store = plugin.store().unwrap();
-        store
-            .put(
-                &format!("agent/{agent_id}"),
-                &Assignment {
-                    repo: "local/repo".into(),
-                    issue: 42,
-                    slug: "local-repo-42".into(),
-                    branch: "agent/local-repo-42".into(),
-                    worktree: worktree.display().to_string(),
-                    pr: None,
-                },
-            )
-            .await
-            .expect("assignment");
+        record_assignment(
+            &plugin,
+            AssignmentFixture {
+                agent_id: &agent_id,
+                repo: "local/repo",
+                issue: 42,
+                slug: "local-repo-42",
+                branch: "agent/local-repo-42",
+                worktree: &worktree,
+                pr: None,
+            },
+        )
+        .await;
 
         let finish = operator_tool(&plugin, "finish_issue");
         let failed = finish.call(json!({"agent_id": agent_id})).await;
         let failed = serde_json::to_string(&failed).expect("render");
-        assert!(
-            failed.contains("assignment kept for retry"),
-            "got: {failed}"
-        );
+        assert!(failed.contains("assignment is stale"), "got: {failed}");
         assert!(ledger.get_agent(&agent_id).await.unwrap().unwrap().retired);
-        assert!(
-            store
-                .get::<Assignment>(&format!("agent/{agent_id}"))
-                .await
-                .unwrap()
-                .is_some()
-        );
-
-        // A later cleanup recognizes the already-retired agent instead
-        // of getting stuck forever at the retirement gate.
-        let retried = finish
-            .call(json!({"agent_id": agent_id, "keep": true}))
-            .await;
-        let retried = serde_json::to_string(&retried).expect("render");
-        assert!(retried.contains("agent_retired"), "got: {retried}");
-        assert!(plugin.assignments().await.is_empty());
+        let assignments = plugin.assignments().await.expect("assignments");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].state, AssignmentState::Stale);
+        assert!(assignments[0].last_error.is_some());
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1299,6 +3536,7 @@ mod tests {
             root: tmp.join("root"),
             allowed: Arc::new(vec!["local/repo".into()]),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
         std::fs::create_dir_all(&repos.root).expect("mkdir root");
         let bare = repos.bare("local/repo");
@@ -1327,7 +3565,11 @@ mod tests {
         .trim()
         .to_string();
 
-        repos.ensure_clone("local/repo").await.expect("refresh");
+        let url = format!("file://{}", origin.display());
+        repos
+            .ensure_clone_from("local/repo", &url)
+            .await
+            .expect("refresh");
 
         let got = String::from_utf8_lossy(
             &tokio::process::Command::new("git")
@@ -1374,6 +3616,7 @@ mod tests {
             root: tmp.join("root"),
             allowed: Arc::new(vec!["local/repo".into()]),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
         let url = format!("file://{}", origin.display());
 
@@ -1421,6 +3664,7 @@ mod tests {
             root: tmp.join("root"),
             allowed: Arc::new(vec!["local/repo".into()]),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
         std::fs::create_dir_all(&repos.root).expect("mkdir root");
         let bare = repos.bare("local/repo");
@@ -1430,16 +3674,20 @@ mod tests {
             .execute()
             .await
             .expect("clone");
+        let url = format!("file://{}", origin.display());
 
         // One unit of work in flight, exactly as a batch has.
         let (_wt, branch) = repos
-            .add_worktree("local/repo", "local-repo-1", "main")
+            .add_worktree_from("local/repo", "local-repo-1", "main", &url)
             .await
             .expect("worktree");
 
         // A second `start_issue` refreshes the clone while the first is
         // still working. That is where the branch used to disappear.
-        repos.ensure_clone("local/repo").await.expect("refresh");
+        repos
+            .ensure_clone_from("local/repo", &url)
+            .await
+            .expect("refresh");
 
         let refs = tokio::process::Command::new("git")
             .args(["for-each-ref", "--format=%(refname:short)"])
@@ -1479,6 +3727,7 @@ mod tests {
             root: tmp.join("root"),
             allowed: Arc::new(vec!["local/repo".into()]),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
         std::fs::create_dir_all(&repos.root).expect("mkdir root");
         let bare = repos.bare("local/repo");
@@ -1488,8 +3737,9 @@ mod tests {
             .execute()
             .await
             .expect("clone");
+        let url = format!("file://{}", origin.display());
         repos
-            .add_worktree("local/repo", "local-repo-1", "main")
+            .add_worktree_from("local/repo", "local-repo-1", "main", &url)
             .await
             .expect("worktree");
 
@@ -1497,7 +3747,7 @@ mod tests {
         // writing local heads would try to update it and be refused.
         git(&origin, &["config", "receive.denyCurrentBranch", "ignore"]).await;
 
-        let refreshed = repos.ensure_clone("local/repo").await;
+        let refreshed = repos.ensure_clone_from("local/repo", &url).await;
         std::fs::remove_dir_all(&tmp).ok();
         refreshed.expect("refresh must not be blocked by a live worktree");
     }
@@ -1605,6 +3855,7 @@ mod tests {
             root: root_path.clone(),
             allowed: Arc::new(vec!["local/repo".into()]),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
         let (mut plugin, ledger) = memory_plugin(repos).await;
         let ctx = plugin.ctx.as_mut().expect("context");
@@ -1678,8 +3929,8 @@ mod tests {
         assert!(!root_path.exists(), "preflight must run before clone");
         assert_eq!(ledger.list_agents().await.expect("agents").len(), 2);
         assert!(
-            ciacola_core::Store::new(pool, "repo-worker")
-                .list::<Assignment>(Some("agent/"))
+            AssignmentDb::new(pool)
+                .list()
                 .await
                 .expect("assignments")
                 .is_empty(),
@@ -1696,6 +3947,7 @@ mod tests {
             root: root.clone(),
             allowed: Arc::new(vec!["local/repo".into()]),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
         let (plugin, ledger) = memory_plugin(repos).await;
         let start = plugin
@@ -1907,12 +4159,14 @@ mod tests {
 
         let repos_root = root.join("repos");
         std::fs::create_dir_all(&repos_root).expect("mkdir");
+        let bare = repos_root.join(format!("{}.git", repo_storage_key("local/repo")));
         CloneCommand::new(format!("file://{}", origin.display()))
             .bare()
-            .directory(repos_root.join("local__repo.git"))
+            .directory(&bare)
             .execute()
             .await
             .expect("bare clone");
+        configure_local_transport(&bare, &origin, "local/repo").await;
 
         let plugin_config: toml::Value = toml::from_str(&format!(
             "[repo-worker]\nroot = {:?}\nrepos = [\"local/repo\"]",
