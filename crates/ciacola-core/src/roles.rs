@@ -591,20 +591,24 @@ use crate::plugin::{BoxFut, Plugin, PluginContext, Surface};
 /// `setup` only builds the loopback path into the catalog. Contributes
 /// prompts, which no other plugin does yet.
 pub struct RolesPlugin {
-    declared: Vec<Role>,
     roles: Option<Roles>,
     ledger: Option<Ledger>,
     max_depth: i64,
 }
 
 impl RolesPlugin {
-    pub fn new(declared: Vec<Role>) -> Self {
+    pub fn new() -> Self {
         Self {
-            declared,
             roles: None,
             ledger: None,
             max_depth: crate::limits::DEFAULT_MAX_SPAWN_DEPTH,
         }
+    }
+}
+
+impl Default for RolesPlugin {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -615,15 +619,7 @@ impl Plugin for RolesPlugin {
 
     fn setup<'a>(&'a mut self, ctx: &'a PluginContext) -> BoxFut<'a, Result<(), FlatError>> {
         Box::pin(async move {
-            let mut roles = Roles::with_runtime(
-                self.declared.clone(),
-                ctx.loopback_mcp_config.clone(),
-                ctx.runtime.clone(),
-            );
-            if !ctx.operator_mcp_config.is_empty() {
-                roles = roles.with_operator_mcp_config(ctx.operator_mcp_config.clone());
-            }
-            self.roles = Some(roles);
+            self.roles = Some(ctx.roles.clone());
             self.ledger = Some(ctx.ledger.clone());
             self.max_depth = ctx.limits.max_spawn_depth;
             Ok(())
@@ -650,7 +646,9 @@ impl Plugin for RolesPlugin {
     }
 
     fn health(&self) -> BoxFut<'_, serde_json::Value> {
-        Box::pin(async move { json!({ "roles": self.declared.len() }) })
+        Box::pin(async move {
+            json!({ "roles": self.roles.as_ref().map_or(0, |roles| roles.all().len()) })
+        })
     }
 }
 

@@ -262,6 +262,11 @@ pub struct PluginContext {
     /// Server-wide agent defaults, so a plugin building its own roles
     /// inherits them instead of quietly opting out.
     pub runtime: crate::roles::Runtime,
+    /// The server's one merged role catalog, after configured roles have
+    /// replaced shipped roles with the same name. Plugins that wire a named
+    /// role into a higher-level workflow must use this catalog rather than
+    /// rebuilding their own private copy.
+    pub roles: crate::roles::Roles,
 }
 
 impl PluginContext {
@@ -912,6 +917,7 @@ mod tests {
             plugin_config: toml::Value::Table(toml::map::Map::new()),
             limits: Default::default(),
             runtime: Default::default(),
+            roles: crate::roles::Roles::new(Vec::new(), String::new()),
         }
     }
 

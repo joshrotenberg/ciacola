@@ -484,6 +484,7 @@ mod tests {
             plugin_config: toml::Value::Table(toml::map::Map::new()),
             limits: Default::default(),
             runtime: Default::default(),
+            roles: ciacola_core::roles::Roles::new(Vec::new(), String::new()),
         };
         let state = HookState {
             ctx,

@@ -309,7 +309,6 @@ struct FinishArgs {
 pub struct RepoWorkerPlugin {
     repos: Option<Repos>,
     ctx: Option<PluginContext>,
-    roles: Option<Roles>,
 }
 
 /// Per-agent state, keyed by agent id in the plugin's key-value slice.
@@ -367,15 +366,6 @@ impl Plugin for RepoWorkerPlugin {
                 allowed: Arc::new(config.repos),
                 cloning: Arc::new(tokio::sync::Mutex::new(())),
             });
-            // The server's runtime, not Default: an empty one meant this
-            // plugin's role silently opted out of every server-wide
-            // setting, which is how the first real run ended up with
-            // role-level hermetic but ambient credentials.
-            self.roles = Some(Roles::with_runtime(
-                self.roles(),
-                ctx.loopback_mcp_config.clone(),
-                ctx.runtime.clone(),
-            ));
             self.ctx = Some(ctx.clone());
             Ok(())
         })
@@ -568,11 +558,12 @@ to do, on purpose."
 
     fn tools(&self, surface: Surface) -> Vec<Tool> {
         let operator_surface = surface == Surface::Operator;
-        let (Some(repos), Some(ctx), Some(roles)) =
-            (self.repos.clone(), self.ctx.clone(), self.roles.clone())
-        else {
+        let (Some(repos), Some(ctx)) = (self.repos.clone(), self.ctx.clone()) else {
             return Vec::new();
         };
+        // Higher-level plugin wiring consumes the same configured catalog as
+        // roles, spawn_role, completion, and persistent role agents.
+        let roles = ctx.roles.clone();
 
         let start = {
             let (repos, ctx, roles) = (repos.clone(), ctx.clone(), roles.clone());
@@ -608,6 +599,20 @@ to do, on purpose."
                         let Some(role) = roles.get(ROLE).cloned() else {
                             return Ok(CallToolResult::error("role missing".to_string()));
                         };
+                        if role.surface.as_deref() == Some("operator")
+                            && (caller.is_some() || !operator_surface)
+                        {
+                            return Ok(CallToolResult::error(format!(
+                                "role '{}' carries the operator surface, and agents may not start it; ask the operator",
+                                role.name
+                            )));
+                        }
+                        if role.inherit_provider_tools && (caller.is_some() || !operator_surface) {
+                            return Ok(CallToolResult::error(format!(
+                                "role '{}' inherits its provider's native tool policy, which an agent cannot bound; ask the operator to start the issue",
+                                role.name
+                            )));
+                        }
                         let grant = match ciacola_core::grant_child_tools(
                             &ctx.ledger,
                             caller.as_deref(),
@@ -994,6 +999,40 @@ mod tests {
         );
     }
 
+    fn bundled_roles() -> Roles {
+        Roles::new(RepoWorkerPlugin::default().roles(), "agent.json")
+            .with_operator_mcp_config("operator.json")
+    }
+
+    fn native_implementer_role() -> Role {
+        Role {
+            name: ROLE.into(),
+            description: "Codex implementation role".into(),
+            provider: Some("codex".into()),
+            model: None,
+            effort: Some("high".into()),
+            hermetic: Some("none".into()),
+            working_dir: Some("{{worktree}}".into()),
+            allowed_tools: Vec::new(),
+            inherit_provider_tools: true,
+            sandbox: Some("workspace-write".into()),
+            max_turns: Some(60),
+            rotate_after_turns: None,
+            loopback: false,
+            surface: None,
+            arguments: vec!["repo".into(), "issue".into(), "worktree".into()],
+            system_prompt: "Implement {{repo}}#{{issue}} in {{worktree}}".into(),
+        }
+    }
+
+    fn roles_with_implementer(role: Role) -> Roles {
+        Roles::new(vec![role], "agent.json").with_operator_mcp_config("operator.json")
+    }
+
+    fn native_implementer_roles() -> Roles {
+        roles_with_implementer(native_implementer_role())
+    }
+
     fn context(pool: sqlx::SqlitePool, ledger: Ledger) -> PluginContext {
         let (tx, _rx) = tower_mcp::context::notification_channel(8);
         let notify = ciacola_core::Notifier(tx);
@@ -1009,6 +1048,7 @@ mod tests {
             plugin_config: toml::Value::Table(Default::default()),
             limits: Default::default(),
             runtime: Default::default(),
+            roles: bundled_roles(),
         }
     }
 
@@ -1016,7 +1056,6 @@ mod tests {
         RepoWorkerPlugin {
             repos: Some(repos),
             ctx: Some(ctx),
-            roles: Some(Roles::new(Vec::new(), "agent.json")),
         }
     }
 
@@ -1542,6 +1581,7 @@ mod tests {
             plugin_config,
             limits: Default::default(),
             runtime: Default::default(),
+            roles: bundled_roles(),
         };
         let mut plugin = RepoWorkerPlugin::default();
         plugin.setup(&ctx).await.expect("setup");
@@ -1567,6 +1607,152 @@ mod tests {
             "must refuse: {rendered}"
         );
         assert!(!root.exists(), "authority refusal must happen before clone");
+        assert_eq!(ledger.list_agents().await.expect("list").len(), 1);
+    }
+
+    /// Issue #70: repo-worker used to rebuild its own shipped role catalog in
+    /// setup, so the public roles tool showed an operator's configured Codex
+    /// override while start_issue silently created the Claude-shaped role.
+    #[tokio::test]
+    async fn start_issue_uses_the_server_merged_role_catalog() {
+        let (tmp, repos) = local_repos("merged-role").await;
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        let mut ctx = context(pool, ledger.clone());
+        ctx.roles = native_implementer_roles();
+        ctx.plugin_config = toml::from_str(&format!(
+            "[repo-worker]\nroot = {:?}\nrepos = [\"local/repo\"]",
+            repos.root.display().to_string()
+        ))
+        .expect("config");
+
+        let mut plugin = RepoWorkerPlugin::default();
+        plugin.setup(&ctx).await.expect("setup");
+        let start = operator_tool(&plugin, "start_issue");
+        let out = start
+            .call(json!({"repo": "local/repo", "issue": 70, "base": "main"}))
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+        assert!(rendered.contains("\"agent_id\""), "got: {rendered}");
+
+        let agents = ledger.list_agents().await.expect("agents");
+        assert_eq!(agents.len(), 1);
+        let def = &agents[0].def;
+        assert_eq!(def.provider.as_str(), "codex");
+        assert_eq!(def.model, None, "the shipped Claude model must not leak");
+        assert!(def.allowed_tools.is_empty());
+        assert!(def.inherit_provider_tools);
+        assert_eq!(def.sandbox.as_deref(), Some("workspace-write"));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A configured native-tool role is an operator-only provisioning
+    /// decision. An authenticated agent cannot use start_issue to mint a
+    /// child whose provider-native authority has no named ceiling.
+    #[tokio::test]
+    async fn start_issue_refuses_native_tool_inheritance_from_an_agent() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        let parent = ledger
+            .create_agent(&ciacola_core::AgentDef::new("parent", "s"), None)
+            .await
+            .expect("parent");
+        let root =
+            std::env::temp_dir().join(format!("ciacola-native-authority-{}", ulid::Ulid::new()));
+        let mut ctx = context(pool, ledger.clone());
+        ctx.roles = native_implementer_roles();
+        ctx.plugin_config = toml::from_str(&format!(
+            "[repo-worker]\nroot = {:?}\nrepos = [\"local/repo\"]",
+            root.display().to_string()
+        ))
+        .expect("config");
+
+        let mut plugin = RepoWorkerPlugin::default();
+        plugin.setup(&ctx).await.expect("setup");
+        let start = plugin
+            .tools(Surface::Agent)
+            .into_iter()
+            .find(|tool| tool.definition().name == "start_issue")
+            .expect("start_issue");
+        let mut extensions = Extensions::new();
+        extensions.insert(ciacola_core::AgentIdentity(parent));
+        let request =
+            RequestContext::new(RequestId::Number(70)).with_extensions(Arc::new(extensions));
+        let out = start
+            .call_with_context(
+                request,
+                json!({"repo": "local/repo", "issue": 70, "base": "main"}),
+            )
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+        assert!(
+            rendered.contains("inherits its provider's native tool policy"),
+            "must refuse: {rendered}"
+        );
+        assert!(
+            !root.exists(),
+            "refusal must happen before clone or worktree"
+        );
+        assert_eq!(ledger.list_agents().await.expect("list").len(), 1);
+    }
+
+    /// Configured roles can also select the operator loopback mount. Honor the
+    /// override, but keep the same anti-escalation boundary as spawn_role.
+    #[tokio::test]
+    async fn start_issue_refuses_an_operator_role_from_an_agent() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        let parent = ledger
+            .create_agent(&ciacola_core::AgentDef::new("parent", "s"), None)
+            .await
+            .expect("parent");
+        let root =
+            std::env::temp_dir().join(format!("ciacola-operator-role-{}", ulid::Ulid::new()));
+        let mut operator_role = native_implementer_role();
+        operator_role.inherit_provider_tools = false;
+        operator_role.surface = Some("operator".into());
+        operator_role.loopback = true;
+        let mut ctx = context(pool, ledger.clone());
+        ctx.roles = roles_with_implementer(operator_role);
+        ctx.plugin_config = toml::from_str(&format!(
+            "[repo-worker]\nroot = {:?}\nrepos = [\"local/repo\"]",
+            root.display().to_string()
+        ))
+        .expect("config");
+
+        let mut plugin = RepoWorkerPlugin::default();
+        plugin.setup(&ctx).await.expect("setup");
+        let start = plugin
+            .tools(Surface::Agent)
+            .into_iter()
+            .find(|tool| tool.definition().name == "start_issue")
+            .expect("start_issue");
+        let mut extensions = Extensions::new();
+        extensions.insert(ciacola_core::AgentIdentity(parent));
+        let request =
+            RequestContext::new(RequestId::Number(71)).with_extensions(Arc::new(extensions));
+        let out = start
+            .call_with_context(
+                request,
+                json!({"repo": "local/repo", "issue": 70, "base": "main"}),
+            )
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+        assert!(
+            rendered.contains("carries the operator surface"),
+            "must refuse: {rendered}"
+        );
+        assert!(
+            !root.exists(),
+            "refusal must happen before clone or worktree"
+        );
         assert_eq!(ledger.list_agents().await.expect("list").len(), 1);
     }
 
@@ -1631,13 +1817,14 @@ mod tests {
             plugin_config,
             limits: Default::default(),
             runtime: Default::default(),
+            roles: bundled_roles(),
         };
         let mut plugin = RepoWorkerPlugin::default();
         plugin.setup(&ctx).await.expect("setup");
 
         // The manager's authority comes from the shipped role, not a
         // stand-in typed into this test.
-        let roles = plugin.roles.clone().expect("roles");
+        let roles = ctx.roles.clone();
         let manager_role = roles.get(MANAGER).cloned().expect("manager role bundled");
         let manager_args =
             std::collections::HashMap::from([("checkout".to_string(), root.display().to_string())]);
