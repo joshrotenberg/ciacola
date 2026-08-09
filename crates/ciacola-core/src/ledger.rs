@@ -77,6 +77,10 @@ pub struct TurnRow {
     /// `reported`, `unreported`, `not_priced`, or `legacy` for rows
     /// written before the provider contract.
     pub cost_state: String,
+    /// True only when a reported amount is authoritative for the whole
+    /// provider turn. A reported partial amount remains useful spend, but
+    /// is a lower bound rather than complete terminal cost.
+    pub cost_complete: bool,
     pub elapsed_ms: i64,
     /// `measured`, `upper_bound`, `unknown`, `not_attempted`, or
     /// `legacy` for rows written before elapsed provenance was tracked.
@@ -149,6 +153,7 @@ const AGENT_SELECT: &str = "\
 
 const TURN_SELECT: &str = "\
     SELECT agent_id, seq, prompt, state, reply, error, cost_micro_usd, cost_state,
+           cost_complete,
            elapsed_ms, elapsed_state, claimed_unix_ms, tokens_in, tokens_out,
            tokens_cached, usage_state, usage_complete, provider_turns, provider,
            settled_unix, admission_override, turn_protection_state,
@@ -227,6 +232,7 @@ fn turn_row(row: SqliteRow) -> Result<TurnRow, FlatError> {
         error: row.try_get("error")?,
         cost_micro_usd: row.try_get("cost_micro_usd")?,
         cost_state: row.try_get("cost_state")?,
+        cost_complete: row.try_get::<i64, _>("cost_complete")? != 0,
         elapsed_ms: row.try_get("elapsed_ms")?,
         elapsed_state: row.try_get("elapsed_state")?,
         claimed_unix_ms: row.try_get("claimed_unix_ms")?,
@@ -510,6 +516,16 @@ impl Ledger {
             Migration::add_column(
                 "0033_turns_protection_claim_version",
                 "ALTER TABLE turns ADD COLUMN turn_protection_claim_version INTEGER NOT NULL DEFAULT 0",
+            ),
+            Migration::add_column(
+                "0034_turns_cost_complete",
+                "ALTER TABLE turns ADD COLUMN cost_complete INTEGER NOT NULL DEFAULT 0",
+            ),
+            Migration::new(
+                "0035_turns_cost_complete_backfill",
+                "UPDATE turns SET cost_complete = 1
+                  WHERE cost_state = 'reported'
+                    AND elapsed_state = 'not_attempted'",
             ),
         ];
         crate::plugin::apply_migrations(&pool, "core", MIGRATIONS).await?;
@@ -1125,6 +1141,7 @@ impl Ledger {
             "UPDATE turns SET state = ?3, error = ?4,
                  cost_micro_usd = 0,
                  cost_state = CASE WHEN state = 'queued' THEN 'reported' ELSE ?5 END,
+                 cost_complete = CASE WHEN state = 'queued' THEN 1 ELSE 0 END,
                  tokens_in = CASE
                      WHEN state = 'queued' OR usage_state <> 'reported' THEN 0
                      ELSE tokens_in
@@ -1194,7 +1211,7 @@ impl Ledger {
     ) -> Result<bool, FlatError> {
         let done = sqlx::query(
             "UPDATE turns SET state = 'failed', error = ?3,
-                 cost_micro_usd = 0, cost_state = 'reported',
+                 cost_micro_usd = 0, cost_state = 'reported', cost_complete = 1,
                  tokens_in = 0, tokens_out = 0, tokens_cached = 0,
                  usage_state = 'reported', usage_complete = 1, provider_turns = 0,
                  elapsed_ms = 0, elapsed_state = 'not_attempted',
@@ -1232,7 +1249,9 @@ impl Ledger {
         let mut tx = self.pool.begin().await?;
         let done = sqlx::query(
             "UPDATE turns SET state = 'ok', reply = ?3, cost_micro_usd = ?4,
-                 cost_state = ?5, elapsed_ms = ?6, elapsed_state = 'measured',
+                 cost_state = ?5,
+                 cost_complete = CASE WHEN ?5 = 'reported' AND ?15 THEN 1 ELSE 0 END,
+                 elapsed_ms = ?6, elapsed_state = 'measured',
                  tokens_in = CASE
                      WHEN ?10 = 'reported' OR usage_state <> 'reported' THEN ?7
                      ELSE tokens_in
@@ -1269,6 +1288,7 @@ impl Ledger {
         .bind(exchange.provider_turns.map(i64::from))
         .bind(crate::time::now_unix())
         .bind(exchange.session.as_deref())
+        .bind(exchange.cost_complete)
         .execute(&mut *tx)
         .await?;
         let recorded = done.rows_affected() == 1;
@@ -1318,7 +1338,8 @@ impl Ledger {
     /// ones on the board. A queued row is explicitly `not_attempted`.
     // This compatibility path still accepts scalar telemetry. New provider
     // execution paths should prefer `fail_exchange`, which preserves the
-    // provider's typed accounting states.
+    // provider's typed accounting states. A positive scalar is banked but
+    // remains incomplete because this API cannot prove terminal provenance.
     #[allow(clippy::too_many_arguments)]
     pub async fn fail_turn(
         &self,
@@ -1347,6 +1368,7 @@ impl Ledger {
                      WHEN state = 'queued' AND ?5 = 0 THEN 'reported'
                      ELSE ?6
                  END,
+                 cost_complete = CASE WHEN state = 'queued' THEN 1 ELSE 0 END,
                  elapsed_ms = ?7,
                  elapsed_state = CASE
                      WHEN state = 'queued' THEN 'not_attempted'
@@ -1430,7 +1452,9 @@ impl Ledger {
             "UPDATE turns SET state = ?3, error = ?4,
                  reply = CASE WHEN ?17 = '' THEN reply ELSE ?17 END,
                  cost_micro_usd = ?5,
-                 cost_state = ?6, elapsed_ms = ?7, elapsed_state = 'measured',
+                 cost_state = ?6,
+                 cost_complete = CASE WHEN ?6 = 'reported' AND ?18 THEN 1 ELSE 0 END,
+                 elapsed_ms = ?7, elapsed_state = 'measured',
                  tokens_in = CASE
                      WHEN ?11 = 'reported' OR usage_state <> 'reported' THEN ?8
                      ELSE tokens_in
@@ -1470,6 +1494,7 @@ impl Ledger {
         .bind(failure_kind(exchange.failure_kind))
         .bind(exchange.session.as_deref())
         .bind(&exchange.reply)
+        .bind(exchange.cost_complete)
         .execute(&mut *tx)
         .await?;
         let recorded = done.rows_affected() == 1;
@@ -1766,6 +1791,7 @@ mod session_tests {
             reply: "ok".into(),
             session: Some(session.into()),
             cost: ciacola_agent::Cost::Reported { micro_usd: 1 },
+            cost_complete: true,
             usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage {
                 input: 1,
                 output: 1,
@@ -2376,6 +2402,7 @@ mod session_tests {
             reply: "partial answer before the ceiling".into(),
             session: None,
             cost: ciacola_agent::Cost::Unreported,
+            cost_complete: false,
             usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage {
                 input: 12,
                 output: 3,
@@ -2439,6 +2466,7 @@ mod session_tests {
             reply: "done".into(),
             session: None,
             cost: ciacola_agent::Cost::Reported { micro_usd: 10 },
+            cost_complete: true,
             usage: ciacola_agent::Usage::Unreported,
             usage_complete: false,
             provider_turns: Some(1),
@@ -2477,6 +2505,7 @@ mod session_tests {
             reply: String::new(),
             session: None,
             cost: ciacola_agent::Cost::Unreported,
+            cost_complete: false,
             usage: ciacola_agent::Usage::Unreported,
             usage_complete: false,
             provider_turns: None,
@@ -2622,6 +2651,7 @@ mod session_tests {
             reply: "done".into(),
             session: None,
             cost: ciacola_agent::Cost::Reported { micro_usd: 0 },
+            cost_complete: true,
             usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage::default()),
             usage_complete: true,
             provider_turns: Some(0),
@@ -2844,8 +2874,10 @@ mod session_tests {
         ] {
             sqlx::query(
                 "INSERT INTO turns
-                     (agent_id, seq, prompt, state, at_unix, usage_state, elapsed_state)
-                 VALUES ('codex-agent', ?1, 'work', ?2, ?3, 'reported', ?4)",
+                     (agent_id, seq, prompt, state, at_unix, cost_state,
+                      usage_state, elapsed_state)
+                 VALUES ('codex-agent', ?1, 'work', ?2, ?3, 'reported',
+                         'reported', ?4)",
             )
             .bind(seq)
             .bind(state)
@@ -2864,7 +2896,12 @@ mod session_tests {
         .expect("legacy turn");
 
         let ledger = Ledger::setup(pool.clone()).await.expect("upgrade");
-        for (seq, complete) in [(1, false), (2, false), (3, false), (4, true)] {
+        for (seq, usage_complete, cost_complete) in [
+            (1, false, false),
+            (2, false, false),
+            (3, false, false),
+            (4, true, true),
+        ] {
             let turn = ledger
                 .get_turn("codex-agent", seq)
                 .await
@@ -2872,7 +2909,8 @@ mod session_tests {
                 .expect("turn");
             assert_eq!(turn.provider, "codex");
             assert_eq!(turn.settled_unix, Some(100 + seq));
-            assert_eq!(turn.usage_complete, complete);
+            assert_eq!(turn.usage_complete, usage_complete);
+            assert_eq!(turn.cost_complete, cost_complete);
             assert_eq!(turn.admission_override, None);
             assert_eq!(turn.turn_protection_state, "legacy");
             assert_eq!(turn.turn_protection, None);
@@ -2920,6 +2958,7 @@ mod session_tests {
         assert_eq!(mixed.provider, "codex");
         assert!(mixed.settled_unix.is_some());
         assert!(!mixed.usage_complete);
+        assert!(!mixed.cost_complete);
         assert_eq!(mixed.turn_protection_state, "legacy");
         assert_eq!(mixed.failure_kind, "legacy");
         let providers = ciacola_agent::ProviderRegistry::new()
@@ -3254,6 +3293,7 @@ mod session_tests {
             reply: "partial".into(),
             session: Some("fenced-session".into()),
             cost: ciacola_agent::Cost::Reported { micro_usd: 7 },
+            cost_complete: true,
             usage: ciacola_agent::Usage::Unreported,
             usage_complete: false,
             provider_turns: None,
@@ -3489,6 +3529,7 @@ mod session_tests {
             reply: "done".into(),
             session: None,
             cost: ciacola_agent::Cost::Reported { micro_usd: 73 },
+            cost_complete: true,
             usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage {
                 input: 10,
                 output: 2,
@@ -3558,6 +3599,7 @@ mod session_tests {
                     cost: ciacola_agent::Cost::Reported {
                         micro_usd: u64::MAX,
                     },
+                    cost_complete: false,
                     usage: ciacola_agent::Usage::Unreported,
                     usage_complete: false,
                     provider_turns: None,
@@ -3590,6 +3632,7 @@ mod session_tests {
                     cost: ciacola_agent::Cost::Reported {
                         micro_usd: u64::MAX,
                     },
+                    cost_complete: true,
                     usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage {
                         input: u64::MAX,
                         output: u64::MAX,

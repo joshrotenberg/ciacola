@@ -164,6 +164,10 @@ impl Health {
             "not_priced": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND cost_state = 'not_priced'").await,
             "legacy": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND cost_state = 'legacy'").await,
         });
+        let cost_completeness = json!({
+            "complete": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND cost_state = 'reported' AND cost_complete = 1").await,
+            "incomplete": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND cost_state = 'reported' AND cost_complete = 0").await,
+        });
         let usage_states = json!({
             "reported": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND usage_state = 'reported'").await,
             "unreported": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND usage_state = 'unreported'").await,
@@ -238,6 +242,7 @@ impl Health {
                 .await,
             "telemetry": {
                 "cost_states": cost_states,
+                "cost_completeness": cost_completeness,
                 "usage_states": usage_states,
                 "elapsed_states": elapsed_states,
                 "turn_protection_states": protection_states,
@@ -381,6 +386,7 @@ mod tests {
             reply: "done".into(),
             session: Some(session.into()),
             cost: ciacola_agent::Cost::Reported { micro_usd: 0 },
+            cost_complete: true,
             usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage::default()),
             usage_complete: true,
             provider_turns: Some(1),
@@ -424,6 +430,7 @@ mod tests {
             reply: String::new(),
             session: None,
             cost: ciacola_agent::Cost::Unreported,
+            cost_complete: false,
             usage: ciacola_agent::Usage::Unreported,
             usage_complete: false,
             provider_turns: None,
@@ -572,6 +579,7 @@ mod tests {
                         reply: "done".into(),
                         session: None,
                         cost: ciacola_agent::Cost::Reported { micro_usd: 0 },
+                        cost_complete: true,
                         usage: ciacola_agent::Usage::Reported(
                             ciacola_agent::TokenUsage::default(),
                         ),
@@ -614,19 +622,55 @@ mod tests {
                 .expect("interrupt")
         );
 
+        let partial = ledger
+            .create_agent(&AgentDef::new("partial", "s"), None)
+            .await
+            .expect("agent");
+        let seq = ledger.enqueue_turn(&partial, "work").await.expect("turn");
+        assert!(ledger.claim_turn(&partial, seq).await.expect("claim"));
+        assert!(
+            ledger
+                .fail_exchange(
+                    &partial,
+                    seq,
+                    "failed",
+                    "stopped after partial spend",
+                    &Exchange {
+                        reply: String::new(),
+                        session: None,
+                        cost: ciacola_agent::Cost::Reported { micro_usd: 7 },
+                        cost_complete: false,
+                        usage: ciacola_agent::Usage::Unreported,
+                        usage_complete: false,
+                        provider_turns: None,
+                        elapsed_ms: 1,
+                        error: Some("stopped after partial spend".into()),
+                        failure_kind: Some(ciacola_agent::FailureKind::Reported),
+                    },
+                )
+                .await
+                .expect("partial failure")
+        );
+
         let report = Health::new(ledger, "").report().await;
-        assert_eq!(report["reported_cost_micro_usd"], 0);
-        assert_eq!(report["telemetry"]["cost_states"]["reported"], 2);
+        assert_eq!(report["reported_cost_micro_usd"], 7);
+        assert_eq!(report["telemetry"]["cost_states"]["reported"], 3);
         assert_eq!(report["telemetry"]["cost_states"]["unreported"], 1);
+        assert_eq!(report["telemetry"]["cost_completeness"]["complete"], 2);
+        assert_eq!(report["telemetry"]["cost_completeness"]["incomplete"], 1);
         assert_eq!(report["telemetry"]["usage_states"]["reported"], 2);
-        assert_eq!(report["telemetry"]["usage_states"]["unreported"], 1);
-        assert_eq!(report["telemetry"]["elapsed_states"]["measured"], 2);
+        assert_eq!(report["telemetry"]["usage_states"]["unreported"], 2);
+        assert_eq!(report["telemetry"]["elapsed_states"]["measured"], 3);
         assert_eq!(report["telemetry"]["elapsed_states"]["not_attempted"], 1);
         assert_eq!(report["admission"]["window_seconds"], DAY_SECS);
         assert_eq!(report["admission"]["providers"][0]["provider"], "claude");
         assert_eq!(report["admission"]["providers"][0]["tokens_in"], 0);
         assert_eq!(
             report["admission"]["providers"][0]["usage_unreported_turns"],
+            2
+        );
+        assert_eq!(
+            report["admission"]["providers"][0]["cost_incomplete_turns"],
             1
         );
     }

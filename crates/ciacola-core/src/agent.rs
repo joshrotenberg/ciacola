@@ -324,6 +324,12 @@ pub struct Exchange {
     /// erase an id already in the ledger.
     pub session: Option<String>,
     pub cost: Cost,
+    /// Whether a reported cost came from the provider's terminal outcome
+    /// rather than a best-known lower bound captured before a failure.
+    ///
+    /// A partial reported amount is still banked, but admission must treat
+    /// it as a completeness gap under a configured USD stop.
+    pub cost_complete: bool,
     /// Tokens, kept separately from cost because they are the portable
     /// measure: codex reports usage but no price, so a ledger that
     /// records only dollars goes blank the moment a second provider
@@ -657,6 +663,7 @@ fn exchange_from(def: &AgentDef, outcome: TurnOutcome) -> Exchange {
         "exchange complete"
     );
 
+    let cost_complete = matches!(outcome.cost, Cost::Reported { .. });
     let usage_complete = matches!(outcome.usage, Usage::Reported(_));
     let failure_kind = outcome.failure.as_ref().map(|failure| failure.kind);
     Exchange {
@@ -665,6 +672,7 @@ fn exchange_from(def: &AgentDef, outcome: TurnOutcome) -> Exchange {
         reply: outcome.reply,
         session: outcome.resume.as_ref().map(|r| r.value().to_string()),
         cost: outcome.cost,
+        cost_complete,
         usage: outcome.usage,
         usage_complete,
         provider_turns: outcome.provider_turns,
@@ -697,6 +705,7 @@ fn partial_exchange(
         } else {
             Cost::NotPriced
         }),
+        cost_complete: false,
         usage: partial
             .usage
             .map(Usage::Reported)
@@ -900,6 +909,7 @@ mod migration_tests {
         };
         let x = exchange_from(&def(), outcome);
         assert_eq!(x.cost_micro_usd(), 1_250_000, "spend must survive");
+        assert!(x.cost_complete, "terminal reported spend is authoritative");
         assert_eq!(
             x.session.as_deref(),
             Some("sess-1"),
@@ -940,6 +950,7 @@ mod migration_tests {
         let x = partial_exchange(&e, &capabilities, Duration::from_secs(1))
             .expect("a run that spent money is an exchange");
         assert_eq!(x.cost_micro_usd(), 900_000);
+        assert!(!x.cost_complete, "partial spend is only a lower bound");
         assert_eq!(x.session.as_deref(), Some("sess-mid"));
         assert_eq!(x.elapsed_ms, 1_200_000);
         assert_eq!(x.tokens().input, 40);

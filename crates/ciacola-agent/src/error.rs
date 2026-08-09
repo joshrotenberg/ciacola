@@ -49,7 +49,9 @@ pub struct PartialTelemetry {
     /// knows it. Present even here so a cancelled turn can still be
     /// resumed rather than restarted.
     pub resume: Option<ResumeId>,
-    /// Spend known before the turn stopped, if the adapter has it.
+    /// Spend known before the turn stopped, if the adapter has it. A
+    /// reported value here is a lower bound, never proof of complete
+    /// terminal cost.
     pub cost: Option<Cost>,
     /// Tokens known before the turn stopped, if the adapter has them.
     pub usage: Option<TokenUsage>,

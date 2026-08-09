@@ -908,6 +908,47 @@ mod config_injection_tests {
         }
     }
 
+    struct PartialCostProvider;
+
+    impl ciacola_agent::Provider for PartialCostProvider {
+        fn key(&self) -> ciacola_agent::ProviderKey {
+            ciacola_agent::ProviderKey::new("partial-cost")
+        }
+
+        fn capabilities(&self) -> ciacola_agent::Capabilities {
+            let mut capabilities =
+                ciacola_agent::Capabilities::none(ciacola_agent::ProviderKey::new("partial-cost"));
+            capabilities.client_assigned_resume = true;
+            capabilities.allowed_tools = true;
+            capabilities.reports_cost = true;
+            capabilities
+        }
+
+        fn run<'a>(
+            &'a self,
+            _intent: &'a ciacola_agent::TurnIntent,
+            _events: &'a dyn ciacola_agent::TurnEvents,
+        ) -> ciacola_agent::BoxFut<'a, Result<ciacola_agent::TurnOutcome, ciacola_agent::AgentError>>
+        {
+            Box::pin(async {
+                Err(ciacola_agent::AgentError::Other {
+                    provider: ciacola_agent::ProviderKey::new("partial-cost"),
+                    detail: "provider stopped after reporting partial spend".into(),
+                    partial: ciacola_agent::PartialTelemetry {
+                        cost: Some(ciacola_agent::Cost::Reported { micro_usd: 900_000 }),
+                        elapsed: Some(Duration::from_millis(25)),
+                        ..ciacola_agent::PartialTelemetry::none()
+                    }
+                    .into(),
+                })
+            })
+        }
+
+        fn owns_process(&self, _ps_line: &str) -> bool {
+            false
+        }
+    }
+
     struct SnapshotBlockingProvider {
         started: Arc<tokio::sync::Notify>,
     }
@@ -1512,6 +1553,83 @@ mod config_injection_tests {
         assert_eq!(turn.usage_state, "reported");
         assert_eq!(turn.reported_cost_micro_usd(), None);
         assert_eq!(turn.reported_tokens(), Some((17, 3, 5)));
+    }
+
+    #[tokio::test]
+    async fn partial_reported_cost_is_banked_and_keeps_usd_admission_unobservable() {
+        let providers = ciacola_agent::ProviderRegistry::new()
+            .with(Arc::new(PartialCostProvider))
+            .expect("provider");
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool)
+            .await
+            .expect("ledger")
+            .with_providers(providers);
+        let agent_id = ledger
+            .create_agent(
+                &crate::agent::AgentDef::new("a", "system").provider("partial-cost"),
+                None,
+            )
+            .await
+            .expect("agent");
+        let seq = ledger.enqueue_turn(&agent_id, "do it").await.expect("turn");
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+
+        run_turn(&ledger, &Notifier(tx), &agent_id, seq).await;
+
+        let turn = ledger
+            .get_turn(&agent_id, seq)
+            .await
+            .expect("turn query")
+            .expect("turn");
+        assert_eq!(turn.state, "failed");
+        assert_eq!(turn.reported_cost_micro_usd(), Some(900_000));
+        assert!(!turn.cost_complete, "partial spend is a lower bound");
+        assert_eq!(
+            ledger
+                .get_agent(&agent_id)
+                .await
+                .expect("agent query")
+                .expect("agent row")
+                .cost_micro_usd,
+            900_000,
+            "known spend must still be banked on the agent"
+        );
+
+        let limits = crate::limits::Limits {
+            daily_stop_usd: Some(10.0),
+            ..Default::default()
+        };
+        let report = ledger.admission_report(&limits).await.expect("report");
+        assert_eq!(report.global.reported_spend_micro_usd, 900_000);
+        assert_eq!(report.global.cost_gaps, 1);
+        assert_eq!(
+            report.global.state,
+            crate::limits::AdmissionState::Unobservable
+        );
+        let provider = report
+            .providers
+            .iter()
+            .find(|status| status.accounting.provider == "partial-cost")
+            .expect("provider accounting");
+        assert_eq!(provider.accounting.cost_incomplete_turns, 1);
+        assert_eq!(provider.state, crate::limits::AdmissionState::Unobservable);
+
+        assert!(matches!(
+            ledger
+                .admit_turn(
+                    &limits,
+                    crate::admission::AdmissionAuthority::Automatic,
+                    &agent_id,
+                    "again",
+                    "test",
+                )
+                .await
+                .expect("admission"),
+            crate::admission::AdmissionDecision::Unobservable { .. }
+        ));
     }
 
     /// Exercises the real hand executor ordering, including dropping the

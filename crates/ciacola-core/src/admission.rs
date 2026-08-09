@@ -353,10 +353,20 @@ impl Ledger {
                     "reported" => {
                         reported_spend_micro_usd = reported_spend_micro_usd
                             .saturating_add(nonnegative(row.cost_micro_usd, "cost")?);
+                        if attempted {
+                            if row.cost_complete {
+                                provider.cost_complete_turns += 1;
+                            } else {
+                                provider.cost_incomplete_turns += 1;
+                            }
+                        }
                     }
                     "legacy" if row.cost_micro_usd != 0 => {
                         reported_spend_micro_usd = reported_spend_micro_usd
                             .saturating_add(nonnegative(row.cost_micro_usd, "legacy cost")?);
+                        if attempted {
+                            provider.cost_legacy_unknown_turns += 1;
+                        }
                     }
                     "unreported" if attempted => provider.cost_unreported_turns += 1,
                     "not_priced" if attempted => provider.cost_not_priced_turns += 1,
@@ -455,6 +465,7 @@ struct WindowRow {
     state: String,
     cost_micro_usd: i64,
     cost_state: String,
+    cost_complete: bool,
     tokens_in: i64,
     tokens_out: i64,
     tokens_cached: i64,
@@ -482,7 +493,7 @@ where
          SELECT COALESCE(NULLIF(t.provider, ''),
                          NULLIF(json_extract(a.def, '$.provider'), ''),
                          'claude') AS provider,
-                t.state, t.cost_micro_usd, t.cost_state,
+                t.state, t.cost_micro_usd, t.cost_state, t.cost_complete,
                 t.tokens_in, t.tokens_out, t.tokens_cached, t.usage_state,
                 t.usage_complete, t.elapsed_state
            FROM window_turns t
@@ -498,6 +509,7 @@ where
                 state: row.try_get("state")?,
                 cost_micro_usd: row.try_get("cost_micro_usd")?,
                 cost_state: row.try_get("cost_state")?,
+                cost_complete: row.try_get::<i64, _>("cost_complete")? != 0,
                 tokens_in: row.try_get("tokens_in")?,
                 tokens_out: row.try_get("tokens_out")?,
                 tokens_cached: row.try_get("tokens_cached")?,
@@ -866,6 +878,7 @@ mod tests {
             reply: "done".into(),
             session: None,
             cost: Cost::NotPriced,
+            cost_complete: false,
             usage: Usage::Reported(TokenUsage {
                 input: 80,
                 output: 20,
@@ -933,6 +946,7 @@ mod tests {
             reply: String::new(),
             session: None,
             cost: Cost::NotPriced,
+            cost_complete: false,
             usage: Usage::Unreported,
             usage_complete: false,
             provider_turns: None,
@@ -1001,6 +1015,7 @@ mod tests {
             reply: String::new(),
             session: None,
             cost: Cost::NotPriced,
+            cost_complete: false,
             usage: Usage::Reported(TokenUsage {
                 input: 70,
                 output: 5,
@@ -1046,6 +1061,7 @@ mod tests {
             reply: String::new(),
             session: None,
             cost: Cost::NotPriced,
+            cost_complete: false,
             usage: Usage::Reported(TokenUsage {
                 input: 7,
                 output: 3,

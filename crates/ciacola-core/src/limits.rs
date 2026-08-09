@@ -224,6 +224,8 @@ pub struct ProviderAccounting {
     pub usage_not_tracked_turns: u64,
     pub usage_legacy_unknown_turns: u64,
     pub running_partial_turns: u64,
+    pub cost_complete_turns: u64,
+    pub cost_incomplete_turns: u64,
     pub cost_unreported_turns: u64,
     pub cost_not_priced_turns: u64,
     pub cost_legacy_unknown_turns: u64,
@@ -242,7 +244,8 @@ impl ProviderAccounting {
     }
 
     pub fn cost_gaps(&self) -> u64 {
-        self.cost_unreported_turns
+        self.cost_incomplete_turns
+            .saturating_add(self.cost_unreported_turns)
             .saturating_add(self.cost_legacy_unknown_turns)
             .saturating_add(if self.reports_cost {
                 self.cost_not_priced_turns
