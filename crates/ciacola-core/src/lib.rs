@@ -51,6 +51,7 @@
 mod admission;
 pub mod agent;
 pub mod complete;
+pub mod delegation;
 pub mod exec;
 pub mod health;
 pub mod identity;
@@ -68,6 +69,10 @@ pub mod store;
 pub mod time;
 
 pub use agent::{Agent, AgentDef, Exchange, FlatError, Turn, prompt, run_exchange};
+pub use delegation::{
+    DelegatableAction, DelegationBackendStatus, DelegationInheritance, DelegationPolicy,
+    DelegationPolicyError, DelegationScope, DelegationSurface,
+};
 pub use exec::{DispatchReadiness, HandExecutor, TurnExecutor, run_turn};
 pub use identity::{AgentIdentity, ChildToolGrant, TOKEN_HEADER, grant_child_tools};
 pub use ledger::{AgentRow, Ledger, TurnRow};

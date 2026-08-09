@@ -156,7 +156,8 @@ uses stdio operator access. Changing the root secret and restarting rotates it.
 Provider-backed agent credentials are explicitly refused on this mount,
 including roles that previously selected `surface = "operator"`. A secure
 delegated supervisor channel needs stronger process provenance than a bearer
-shared between provider processes and is tracked separately.
+shared between provider processes; its still-disabled design is recorded in
+[ADR 0001](docs/adr/0001-process-isolated-delegated-supervision.md).
 
 Provider CLI children also start fail-closed. Every opening and resumed Claude
 or Codex execution clears the daemon's inherited environment, then restores a

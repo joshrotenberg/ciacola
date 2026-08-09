@@ -43,6 +43,11 @@ pub struct Config {
     /// ambient provider config, and where session data lands.
     #[serde(default)]
     pub runtime: ciacola_core::roles::Runtime,
+    /// Reserved supervisor authority, keyed by an explicitly declared role.
+    /// The shape is parsed now so policy mistakes fail loudly, but validation
+    /// refuses every policy until a secure delegation backend is available.
+    #[serde(default)]
+    pub delegation: DelegationConfig,
 }
 
 impl Default for Config {
@@ -53,8 +58,19 @@ impl Default for Config {
             plugins: empty_table(),
             limits: Default::default(),
             runtime: Default::default(),
+            delegation: Default::default(),
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationConfig {
+    /// Policies do not live on `Role`: keeping them separate prevents role
+    /// rendering, persistent-agent upserts, and `spawn_role` from inheriting
+    /// authority before the provenance boundary exists.
+    #[serde(default)]
+    pub roles: BTreeMap<String, ciacola_core::DelegationPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +184,22 @@ fn validate(config: &Config) -> Result<(), FlatError> {
         }
         validate_sandbox(&format!("agent '{}'", agent.name), agent.sandbox.as_deref())?;
     }
+    validate_delegation(config)?;
+    Ok(())
+}
+
+fn validate_delegation(config: &Config) -> Result<(), FlatError> {
+    // Plugin-shipped roles do not exist yet when startup config is parsed.
+    // Once a backend exists, resolve policy keys against the merged shipped +
+    // configured catalog. Until then every syntactically valid policy has the
+    // same safe product state, including a policy for a shipped role.
+    if let Some(role_name) = config.delegation.roles.keys().next() {
+        return Err(format!(
+            "delegation.roles.{role_name}: secure delegation backend is unavailable; provider-backed supervisor authority remains disabled"
+        )
+        .into());
+    }
+
     Ok(())
 }
 
@@ -547,6 +579,145 @@ mod tests {
         assert!(
             operator.to_string().contains("authenticated human HTTP"),
             "{operator}"
+        );
+    }
+
+    #[test]
+    fn explicit_delegation_policy_parses_then_fails_closed_without_a_backend() {
+        let error = parse(
+            r#"
+                [delegation.roles.repo-manager]
+                actions = ["repo-worker/open_pr", "repo-worker/finish_issue"]
+                scope = "descendant_assignments"
+            "#,
+        )
+        .expect_err("delegation must not activate without a provenance backend");
+        assert!(
+            error
+                .to_string()
+                .contains("secure delegation backend is unavailable"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn malformed_or_unknown_delegation_policy_is_rejected_before_backend_selection() {
+        let malformed = parse(
+            r#"
+                [[roles]]
+                name = "manager"
+                description = "manager"
+                system_prompt = "Manage"
+
+                [delegation.roles.manager]
+                actions = "repo-worker/open_pr"
+            "#,
+        )
+        .expect_err("actions must be an explicit list");
+        assert!(malformed.to_string().contains("actions"), "{malformed}");
+
+        let unknown_field = parse(
+            r#"
+                [[roles]]
+                name = "manager"
+                description = "manager"
+                system_prompt = "Manage"
+
+                [delegation.roles.manager]
+                actions = ["repo-worker/open_pr"]
+                bearer = "never"
+            "#,
+        )
+        .expect_err("raw capability material has no config shape");
+        assert!(
+            unknown_field.to_string().contains("unknown field `bearer`"),
+            "{unknown_field}"
+        );
+    }
+
+    #[test]
+    fn delegation_actions_are_closed_and_nonempty() {
+        let empty = parse(
+            r#"
+                [[roles]]
+                name = "manager"
+                description = "manager"
+                system_prompt = "Manage"
+
+                [delegation.roles.manager]
+                actions = []
+            "#,
+        )
+        .expect_err("an empty grant must not become a placeholder policy");
+        assert!(empty.to_string().contains("actions"), "{empty}");
+
+        let duplicate = parse(
+            r#"
+                [[roles]]
+                name = "manager"
+                description = "manager"
+                system_prompt = "Manage"
+
+                [delegation.roles.manager]
+                actions = ["repo-worker/open_pr", "repo-worker/open_pr"]
+            "#,
+        )
+        .expect_err("duplicate authority must be rejected");
+        assert!(
+            duplicate.to_string().contains("appears more than once"),
+            "{duplicate}"
+        );
+
+        let unknown = parse(
+            r#"
+                [[roles]]
+                name = "manager"
+                description = "manager"
+                system_prompt = "Manage"
+
+                [delegation.roles.manager]
+                actions = ["repo-worker/delete_repository"]
+            "#,
+        )
+        .expect_err("actions must come from the closed enum");
+        assert!(
+            unknown.to_string().contains("delete_repository"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn a_persistent_role_instance_cannot_inherit_reserved_delegation() {
+        let text = r#"
+                [[roles]]
+                name = "manager"
+                description = "manager"
+                system_prompt = "Manage"
+
+                [[agents]]
+                name = "persistent-manager"
+                role = "manager"
+
+                [delegation.roles.manager]
+                actions = ["repo-worker/open_pr"]
+            "#;
+        let config: Config = toml::from_str(text).expect("reserved config shape");
+        let roles = Roles::with_runtime(config.roles.clone(), "agent.json", config.runtime.clone());
+        let def = role_definition(&config, &config.agents[0], &roles, "agent.json")
+            .expect("ordinary role definition");
+        let stored = serde_json::to_value(def).expect("stored definition");
+        assert!(
+            stored.get("delegation").is_none(),
+            "reserved authority entered AgentDef: {stored}"
+        );
+
+        let error = validate(&config)
+            .expect_err("reserved authority must fail before persistent-agent upsert");
+        assert!(
+            error
+                .to_string()
+                .contains("secure delegation backend is unavailable"),
+            "{error}"
         );
     }
 
