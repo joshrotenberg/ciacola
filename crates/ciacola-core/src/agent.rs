@@ -304,6 +304,14 @@ pub struct Exchange {
     /// lands. Cached input is a subset of input, reported when the
     /// provider distinguishes it.
     pub usage: Usage,
+    /// Whether `usage` came from the provider's terminal outcome rather
+    /// than a best-known lower bound captured before a failure.
+    ///
+    /// `Usage::Reported` answers whether buckets were observed;
+    /// this answers whether those buckets are authoritative for the
+    /// whole turn. Admission needs both to fail closed without throwing
+    /// away useful partial accounting.
+    pub usage_complete: bool,
     pub provider_turns: Option<u32>,
     pub elapsed_ms: u64,
     /// The provider reported the run as an error. The exchange still
@@ -601,12 +609,14 @@ fn exchange_from(def: &AgentDef, outcome: TurnOutcome) -> Exchange {
         "exchange complete"
     );
 
+    let usage_complete = matches!(outcome.usage, Usage::Reported(_));
     Exchange {
         error: outcome.failure_message().map(str::to_string),
         reply: outcome.reply,
         session: outcome.resume.as_ref().map(|r| r.value().to_string()),
         cost: outcome.cost,
         usage: outcome.usage,
+        usage_complete,
         provider_turns: outcome.provider_turns,
         elapsed_ms,
     }
@@ -644,6 +654,7 @@ fn partial_exchange(
             } else {
                 Usage::NotTracked
             }),
+        usage_complete: false,
         // The contract carries no provider-turn count on a partial, and
         // inventing one would be worse than admitting the gap.
         provider_turns: None,
@@ -852,7 +863,11 @@ mod migration_tests {
             partial: PartialTelemetry {
                 resume: Some(ResumeId::ProviderAssigned("sess-mid".into())),
                 cost: Some(Cost::Reported { micro_usd: 900_000 }),
-                usage: None,
+                usage: Some(TokenUsage {
+                    input: 40,
+                    output: 2,
+                    cached_input: 10,
+                }),
                 elapsed: Some(Duration::from_secs(1_200)),
             }
             .into(),
@@ -865,6 +880,8 @@ mod migration_tests {
         assert_eq!(x.cost_micro_usd(), 900_000);
         assert_eq!(x.session.as_deref(), Some("sess-mid"));
         assert_eq!(x.elapsed_ms, 1_200_000);
+        assert_eq!(x.tokens().input, 40);
+        assert!(!x.usage_complete, "partial buckets are only a lower bound");
         assert!(x.error.is_some());
     }
 

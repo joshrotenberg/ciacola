@@ -20,4 +20,5 @@ tracing = { workspace = true }
 axum = { workspace = true }
 
 [dev-dependencies]
+ciacola-agent = { workspace = true }
 toml = { workspace = true }

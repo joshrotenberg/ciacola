@@ -119,7 +119,7 @@ async fn receive(
         .flatten()
         .unwrap_or_default();
     let (code, message) = match &outcome {
-        ciacola_core::plugin::Submission::Submitted { seq } => {
+        ciacola_core::plugin::Submission::Submitted { seq, .. } => {
             stats.fires += 1;
             stats.last_detail = Some(format!("submitted turn {seq}"));
             (StatusCode::ACCEPTED, format!("{} {seq}\n", agent.agent_id))
@@ -141,6 +141,36 @@ async fn receive(
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 format!("over daily budget (${spent_usd:.2} of ${limit_usd:.2})\n"),
+            )
+        }
+        ciacola_core::plugin::Submission::OverTokens {
+            provider,
+            used_tokens,
+            limit_tokens,
+        } => {
+            stats.rejects += 1;
+            stats.last_detail = Some(format!(
+                "over {provider} token limit: {used_tokens} of {limit_tokens}"
+            ));
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("over {provider} daily token limit ({used_tokens} of {limit_tokens})\n"),
+            )
+        }
+        ciacola_core::plugin::Submission::Unobservable { provider, reason } => {
+            stats.rejects += 1;
+            stats.last_detail = Some(format!("{provider} automatic admission refused: {reason}"));
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("{provider} automatic admission refused: {reason}\n"),
+            )
+        }
+        ciacola_core::plugin::Submission::Unguarded { provider, reason } => {
+            stats.rejects += 1;
+            stats.last_detail = Some(format!("{provider} automatic admission refused: {reason}"));
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("{provider} automatic admission refused: {reason}\n"),
             )
         }
         ciacola_core::plugin::Submission::Failed { reason } => {
@@ -334,6 +364,61 @@ mod tests {
 
     use super::*;
 
+    struct ReportingProvider;
+
+    impl ciacola_agent::Provider for ReportingProvider {
+        fn key(&self) -> ciacola_agent::ProviderKey {
+            ciacola_agent::ProviderKey::claude()
+        }
+
+        fn capabilities(&self) -> ciacola_agent::Capabilities {
+            let mut capabilities = ciacola_agent::Capabilities::none(self.key());
+            capabilities.reports_cost = true;
+            capabilities.reports_token_usage = true;
+            capabilities
+        }
+
+        fn run<'a>(
+            &'a self,
+            _intent: &'a ciacola_agent::TurnIntent,
+            _events: &'a dyn ciacola_agent::TurnEvents,
+        ) -> ciacola_agent::BoxFut<'a, Result<ciacola_agent::TurnOutcome, ciacola_agent::AgentError>>
+        {
+            Box::pin(async { unreachable!("webhook tests do not run providers") })
+        }
+
+        fn owns_process(&self, _ps_line: &str) -> bool {
+            false
+        }
+    }
+
+    struct UnpricedProvider;
+
+    impl ciacola_agent::Provider for UnpricedProvider {
+        fn key(&self) -> ciacola_agent::ProviderKey {
+            ciacola_agent::ProviderKey::codex()
+        }
+
+        fn capabilities(&self) -> ciacola_agent::Capabilities {
+            let mut capabilities = ciacola_agent::Capabilities::none(self.key());
+            capabilities.reports_token_usage = true;
+            capabilities
+        }
+
+        fn run<'a>(
+            &'a self,
+            _intent: &'a ciacola_agent::TurnIntent,
+            _events: &'a dyn ciacola_agent::TurnEvents,
+        ) -> ciacola_agent::BoxFut<'a, Result<ciacola_agent::TurnOutcome, ciacola_agent::AgentError>>
+        {
+            Box::pin(async { unreachable!("webhook tests do not run providers") })
+        }
+
+        fn owns_process(&self, _ps_line: &str) -> bool {
+            false
+        }
+    }
+
     /// Records what it was handed and does nothing else, the same
     /// CI-safe stand-in `ciacola-schedule` uses: nothing here shells
     /// out to a provider, so a submitted turn stays `queued` forever,
@@ -378,7 +463,14 @@ mod tests {
 
     async fn setup(hooks: Vec<Hook>) -> (HookState, Arc<RecordingExecutor>, Ledger, SqlitePool) {
         let pool = kv_pool().await;
-        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        let providers = ciacola_agent::ProviderRegistry::new()
+            .with(Arc::new(ReportingProvider))
+            .and_then(|providers| providers.with(Arc::new(UnpricedProvider)))
+            .expect("providers");
+        let ledger = Ledger::setup(pool.clone())
+            .await
+            .expect("ledger")
+            .with_providers(providers);
         let (tx, _rx) = tower_mcp::context::notification_channel(8);
         let exec = Arc::new(RecordingExecutor::default());
         let ctx = PluginContext {
@@ -519,6 +611,22 @@ mod tests {
             "the daily spend limit must be enforced on the webhook path exactly like any other, \
              per plugin::submit being the one convergence point"
         );
+    }
+
+    #[tokio::test]
+    async fn unguarded_provider_is_a_non_retryable_configuration_error() {
+        let (state, exec, ledger, pool) = setup(vec![hook("issue", "a")]).await;
+        ledger
+            .create_agent(&AgentDef::new("a", "sys").provider("codex"), None)
+            .await
+            .expect("create agent");
+
+        let (status, body) = receive(State(state), Path("issue".into()), "hi".into()).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("unpriced provider"), "{body}");
+        assert!(exec.submitted.lock().unwrap().is_empty());
+        assert_eq!(turn_count(&pool).await, 0);
     }
 
     #[tokio::test]

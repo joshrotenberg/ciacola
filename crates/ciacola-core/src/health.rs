@@ -17,7 +17,6 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
-use sqlx::SqlitePool;
 use tower_mcp::{
     CallToolResult, ReadResourceResult, Resource, ResourceBuilder, ResourceContent, Tool,
     ToolBuilder,
@@ -26,6 +25,8 @@ use tower_mcp::{
 use std::sync::Arc;
 
 use crate::agent::FlatError;
+use crate::ledger::Ledger;
+use crate::limits::Limits;
 use crate::plugin::PluginHost;
 use crate::time::now_unix;
 
@@ -34,12 +35,16 @@ const MIN_PRUNE_DAYS: i64 = 1;
 
 #[derive(Clone)]
 pub struct Health {
-    pool: SqlitePool,
+    ledger: Ledger,
     db_path: String,
     /// The backends this build was assembled with. Reported so an
     /// operator can see what a `provider` key on an agent will actually
     /// resolve to, rather than discovering it on the first failed turn.
     providers: Vec<String>,
+    /// The same admission policy every submission boundary enforces.
+    /// Keeping it here makes health a view of live policy, rather than
+    /// a second interpretation of the configuration.
+    limits: Limits,
     /// Set after the host exists, so health can ask every plugin for
     /// its own slice instead of knowing their tables. Before this,
     /// prune deleted from `work_items` and `findings` directly.
@@ -47,11 +52,13 @@ pub struct Health {
 }
 
 impl Health {
-    pub fn new(pool: SqlitePool, db_path: impl Into<String>) -> Self {
+    pub fn new(ledger: Ledger, db_path: impl Into<String>) -> Self {
+        let providers = ledger.providers().keys();
         Self {
-            pool,
+            ledger,
             db_path: db_path.into(),
-            providers: Vec::new(),
+            providers,
+            limits: Limits::default(),
             host: None,
         }
     }
@@ -64,14 +71,35 @@ impl Health {
     /// Report which backends are registered.
     pub fn with_providers(mut self, providers: &ciacola_agent::ProviderRegistry) -> Self {
         self.providers = providers.keys();
+        self.ledger = self.ledger.with_providers(providers.clone());
+        self
+    }
+
+    /// Report admission against the same limits used to accept work.
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
         self
     }
 
     async fn count(&self, sql: &str) -> i64 {
         sqlx::query_as::<_, (i64,)>(sql)
-            .fetch_one(&self.pool)
+            .fetch_one(self.ledger.pool())
             .await
             .map(|(n,)| n)
+            .unwrap_or_default()
+    }
+
+    /// Sum non-negative ledger counters without SQLite's signed-integer
+    /// aggregate overflow turning an extreme-but-valid provider report
+    /// into a query error (and, historically, a misleading zero).
+    async fn sum_nonnegative(&self, sql: &str) -> i64 {
+        sqlx::query_as::<_, (i64,)>(sql)
+            .fetch_all(self.ledger.pool())
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .fold(0_i64, |total, (value,)| total.saturating_add(value.max(0)))
+            })
             .unwrap_or_default()
     }
 
@@ -92,9 +120,13 @@ impl Health {
 
     pub async fn report(&self) -> serde_json::Value {
         let now = now_unix();
+        let admission = match self.ledger.admission_report(&self.limits).await {
+            Ok(report) => json!(report),
+            Err(error) => json!({ "error": error.to_string() }),
+        };
         let oldest_turn =
             sqlx::query_as::<_, (Option<i64>,)>("SELECT MIN(at_unix) FROM turns WHERE at_unix > 0")
-                .fetch_one(&self.pool)
+                .fetch_one(self.ledger.pool())
                 .await
                 .ok()
                 .and_then(|(v,)| v);
@@ -109,7 +141,7 @@ impl Health {
              FROM agents a WHERE a.retired = 0
              ORDER BY 3 DESC LIMIT 5",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(self.ledger.pool())
         .await
         .unwrap_or_default();
 
@@ -139,6 +171,7 @@ impl Health {
         json!({
             "db_bytes": self.db_bytes(),
             "providers": self.providers,
+            "admission": admission,
             "plugins": plugins,
             "agents_active": self.count("SELECT COUNT(*) FROM agents WHERE retired = 0").await,
             "agents_retired": self.count("SELECT COUNT(*) FROM agents WHERE retired = 1").await,
@@ -147,16 +180,16 @@ impl Health {
                 .count("SELECT COUNT(*) FROM turns WHERE prompt <> '' OR reply IS NOT NULL")
                 .await,
             "reported_cost_micro_usd": self
-                .count(
-                    "SELECT COALESCE(SUM(cost_micro_usd), 0) FROM turns
+                .sum_nonnegative(
+                    "SELECT cost_micro_usd FROM turns
                      WHERE state IN ('ok', 'failed', 'killed')
                        AND (cost_state = 'reported'
                             OR (cost_state = 'legacy' AND cost_micro_usd <> 0))"
                 )
                 .await,
             "tokens_in": self
-                .count(
-                    "SELECT COALESCE(SUM(tokens_in), 0) FROM turns
+                .sum_nonnegative(
+                    "SELECT tokens_in FROM turns
                      WHERE state IN ('ok', 'failed', 'killed')
                        AND (usage_state = 'reported'
                             OR (usage_state = 'legacy'
@@ -164,8 +197,8 @@ impl Health {
                 )
                 .await,
             "tokens_out": self
-                .count(
-                    "SELECT COALESCE(SUM(tokens_out), 0) FROM turns
+                .sum_nonnegative(
+                    "SELECT tokens_out FROM turns
                      WHERE state IN ('ok', 'failed', 'killed')
                        AND (usage_state = 'reported'
                             OR (usage_state = 'legacy'
@@ -173,8 +206,8 @@ impl Health {
                 )
                 .await,
             "tokens_cached": self
-                .count(
-                    "SELECT COALESCE(SUM(tokens_cached), 0) FROM turns
+                .sum_nonnegative(
+                    "SELECT tokens_cached FROM turns
                      WHERE state IN ('ok', 'failed', 'killed')
                        AND (usage_state = 'reported'
                             OR (usage_state = 'legacy'
@@ -221,7 +254,7 @@ impl Health {
                AND (prompt <> '' OR reply <> '')",
         )
         .bind(cutoff)
-        .execute(&self.pool)
+        .execute(self.ledger.pool())
         .await?
         .rows_affected();
 
@@ -231,7 +264,7 @@ impl Health {
             None => json!({}),
         };
 
-        sqlx::query("VACUUM").execute(&self.pool).await?;
+        sqlx::query("VACUUM").execute(self.ledger.pool()).await?;
 
         Ok(json!({
             "older_than_days": older_than_days.max(MIN_PRUNE_DAYS),
@@ -321,7 +354,9 @@ mod tests {
 
     #[tokio::test]
     async fn health_counts_reported_zero_separately_from_unreported() {
-        let pool = SqlitePool::connect("sqlite::memory:").await.expect("pool");
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
         let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
 
         let measured = ledger
@@ -342,6 +377,7 @@ mod tests {
                         usage: ciacola_agent::Usage::Reported(
                             ciacola_agent::TokenUsage::default(),
                         ),
+                        usage_complete: true,
                         provider_turns: Some(0),
                         elapsed_ms: 1,
                         error: None,
@@ -379,7 +415,7 @@ mod tests {
                 .expect("interrupt")
         );
 
-        let report = Health::new(pool, "").report().await;
+        let report = Health::new(ledger, "").report().await;
         assert_eq!(report["reported_cost_micro_usd"], 0);
         assert_eq!(report["telemetry"]["cost_states"]["reported"], 2);
         assert_eq!(report["telemetry"]["cost_states"]["unreported"], 1);
@@ -387,5 +423,12 @@ mod tests {
         assert_eq!(report["telemetry"]["usage_states"]["unreported"], 1);
         assert_eq!(report["telemetry"]["elapsed_states"]["measured"], 2);
         assert_eq!(report["telemetry"]["elapsed_states"]["not_attempted"], 1);
+        assert_eq!(report["admission"]["window_seconds"], DAY_SECS);
+        assert_eq!(report["admission"]["providers"][0]["provider"], "claude");
+        assert_eq!(report["admission"]["providers"][0]["tokens_in"], 0);
+        assert_eq!(
+            report["admission"]["providers"][0]["usage_unreported_turns"],
+            1
+        );
     }
 }

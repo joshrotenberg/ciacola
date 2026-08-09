@@ -161,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with(std::sync::Arc::new(ciacola_agent_claude::ClaudeProvider))
         .and_then(|providers| providers.with(std::sync::Arc::new(codex_provider)))
         .map_err(|e| -> ciacola_core::FlatError { e.to_string().into() })?;
+    declared_early.limits.validate_providers(&providers)?;
     providers
         .get(&declared_early.runtime.default_provider_key())
         .map_err(|error| -> ciacola_core::FlatError { error.to_string().into() })?;
@@ -298,8 +299,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         eprintln!("[ciacola] config: {line}");
     }
 
-    let health = Health::new(pool, database.path.display().to_string())
-        .with_providers(ledger.providers())
+    let health = Health::new(ledger.clone(), database.path.display().to_string())
+        .with_limits(declared.limits.clone())
         .with_host(host.clone());
 
     // Core verbs, then every plugin's contribution for this surface.
@@ -308,7 +309,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ciacola is. Enum arguments need no help; they are in the schema.
     let completing = configured_roles;
 
-    let mut stdio_router = server::router_with_limits(
+    let mut stdio_router = server::router_interactive_with_limits(
         ledger.clone(),
         exec.clone(),
         notify.clone(),

@@ -90,10 +90,15 @@ Then open the board at `http://127.0.0.1:4823/board`.
 ledger defaults to `$XDG_DATA_HOME/ciacola/ciacola.db`, or to
 `$HOME/.local/share/ciacola/ciacola.db` when `XDG_DATA_HOME` is unset.
 Set `CIACOLA_DB` to override it. The resolved path is printed at startup.
-Before adding schedules, set the `daily_warn_usd` and `daily_stop_usd`
-circuit breakers in the copied config. See `ciacola.example.toml` for the
-annotated settings and `HANDOFF.md` for the design, the known-broken list,
-and what to do next.
+Before adding schedules, configure a hard stop the selected backend can
+actually report. Priced providers use `daily_stop_usd`; unpriced providers
+such as Codex need `[limits.providers.codex].daily_stop_tokens`. The rolling
+token total is input + output, with cached input already included in input.
+USD and token stops are independent, and Ciacola carries no provider price
+table. An interactive one-off run can acknowledge missing coverage with
+`send_supervised` plus a persisted reason, but no override crosses a known
+hard stop. See `ciacola.example.toml` for the annotated settings and
+`HANDOFF.md` for deeper design context.
 
 ## License
 

@@ -63,6 +63,18 @@ struct SendArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct SupervisedSendArgs {
+    /// The agent to speak to.
+    agent_id: String,
+    /// What to say.
+    text: String,
+    /// Why this one-off run may proceed without complete automatic
+    /// admission coverage. Persisted on the turn.
+    reason: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AgentArgs {
     /// The agent to look at.
     agent_id: String,
@@ -90,6 +102,18 @@ struct ResendArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct SupervisedResendArgs {
+    /// The agent whose turn to send again.
+    agent_id: String,
+    /// The turn to repeat. Its prompt is reused verbatim.
+    seq: i64,
+    /// Why this one-off run may proceed without complete automatic
+    /// admission coverage. Persisted on the new turn.
+    reason: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RetireArgs {
     /// The agent to retire. Must be idle; its conversation stays in
     /// the ledger.
@@ -109,9 +133,13 @@ struct KillArgs {
 fn submission_result(agent_id: &str, outcome: crate::plugin::Submission) -> CallToolResult {
     use crate::plugin::Submission;
     match outcome {
-        Submission::Submitted { seq } => CallToolResult::json(json!({
+        Submission::Submitted {
+            seq,
+            admission_override,
+        } => CallToolResult::json(json!({
             "agent_id": agent_id,
             "seq": seq,
+            "admission_override": admission_override,
         })),
         Submission::Busy { reason } => CallToolResult::error(reason),
         Submission::OverBudget {
@@ -120,6 +148,19 @@ fn submission_result(agent_id: &str, outcome: crate::plugin::Submission) -> Call
         } => CallToolResult::error(format!(
             "over daily budget: ${spent_usd:.2} spent, limit ${limit_usd:.2}. \
              Running turns finish; new ones resume when the rolling day falls below."
+        )),
+        Submission::OverTokens {
+            provider,
+            used_tokens,
+            limit_tokens,
+        } => CallToolResult::error(format!(
+            "over {provider} daily token limit: {used_tokens} input + output tokens reported, limit {limit_tokens}. Running turns finish; new ones resume when the rolling day falls below."
+        )),
+        Submission::Unobservable { provider, reason } => CallToolResult::error(format!(
+            "{provider} admission telemetry is incomplete: {reason}. Automatic work fails closed; use send_supervised from the interactive stdio server with a reason for a one-off run."
+        )),
+        Submission::Unguarded { provider, reason } => CallToolResult::error(format!(
+            "{provider} automatic work is unguarded: {reason}. Configure [limits.providers.{provider}].daily_stop_tokens, or use send_supervised from the interactive stdio server with a reason for a one-off run."
         )),
         Submission::Failed { reason } => CallToolResult::error(reason),
     }
@@ -166,9 +207,17 @@ fn turn_json(turn: &TurnRow) -> serde_json::Value {
         .reported_cost_micro_usd()
         .map(|micro| micro as f64 / 1e6);
     let tokens = turn.reported_tokens();
+    let admission_override = turn.admission_override.as_deref().map(|raw| {
+        serde_json::from_str(raw).unwrap_or_else(|_| {
+            json!({
+                "invalid_persisted_json": raw,
+            })
+        })
+    });
     json!({
         "agent_id": turn.agent_id,
         "seq": turn.seq,
+        "provider": turn.provider,
         "state": turn.state,
         "prompt": turn.prompt,
         "reply": turn.reply,
@@ -179,10 +228,13 @@ fn turn_json(turn: &TurnRow) -> serde_json::Value {
         "tokens_out": tokens.map(|tokens| tokens.1),
         "tokens_cached": tokens.map(|tokens| tokens.2),
         "usage_state": turn.usage_state,
+        "usage_complete": turn.usage_complete,
         "provider_turns": turn.provider_turns,
         "elapsed_ms": turn.elapsed_ms,
         "elapsed_state": turn.elapsed_state,
         "claimed_unix_ms": turn.claimed_unix_ms,
+        "settled_unix": turn.settled_unix,
+        "admission_override": admission_override,
     })
 }
 
@@ -222,7 +274,7 @@ call.";
 
 /// The whole server, parameterised only by who executes turns.
 pub fn router(ledger: Ledger, exec: Arc<dyn TurnExecutor>, notify: Notifier) -> McpRouter {
-    router_with(ledger, exec, notify, true)
+    router_with_limits(ledger, exec, notify, true, Default::default())
 }
 
 /// The same server with the tool set chosen by the caller. `include_kill:
@@ -366,6 +418,30 @@ pub fn router_with_limits(
     include_kill: bool,
     limits: crate::limits::Limits,
 ) -> McpRouter {
+    router_with_admission_profile(ledger, exec, notify, include_kill, limits, false)
+}
+
+/// The human's stdio surface. This is intentionally distinct from the
+/// operator HTTP tool set: supervisor agents use `/mcp-operator`, so
+/// tool authority alone is not proof that a person is present.
+pub fn router_interactive_with_limits(
+    ledger: Ledger,
+    exec: Arc<dyn TurnExecutor>,
+    notify: Notifier,
+    include_kill: bool,
+    limits: crate::limits::Limits,
+) -> McpRouter {
+    router_with_admission_profile(ledger, exec, notify, include_kill, limits, true)
+}
+
+fn router_with_admission_profile(
+    ledger: Ledger,
+    exec: Arc<dyn TurnExecutor>,
+    notify: Notifier,
+    include_kill: bool,
+    limits: crate::limits::Limits,
+    interactive: bool,
+) -> McpRouter {
     let max_depth = limits.max_spawn_depth;
     // The operator surface is the one carrying kill; the same flag says
     // whose word to take about parentage when a call arrives without an
@@ -398,6 +474,39 @@ pub fn router_with_limits(
                         &args.agent_id,
                         &args.text,
                         "send",
+                    )
+                    .await;
+                    Ok(submission_result(&args.agent_id, outcome))
+                }
+            })
+            .build()
+    };
+
+    let send_supervised = {
+        let ledger = ledger.clone();
+        let exec = exec.clone();
+        let notify = notify.clone();
+        let limits = limits.clone();
+        ToolBuilder::new("send_supervised")
+            .description(
+                "Interactive one-off send for an unguarded or temporarily unobservable provider. Requires a reason, persists the override on the turn, and never bypasses a known USD or token stop.",
+            )
+            .non_destructive()
+            .handler(move |args: SupervisedSendArgs| {
+                let ledger = ledger.clone();
+                let exec = exec.clone();
+                let notify = notify.clone();
+                let limits = limits.clone();
+                async move {
+                    let outcome = crate::plugin::submit_supervised(
+                        &ledger,
+                        exec.as_ref(),
+                        &notify,
+                        &limits,
+                        &args.agent_id,
+                        &args.text,
+                        "send_supervised",
+                        &args.reason,
                     )
                     .await;
                     Ok(submission_result(&args.agent_id, outcome))
@@ -548,6 +657,45 @@ pub fn router_with_limits(
             .build()
     };
 
+    let resend_supervised = {
+        let ledger = ledger.clone();
+        let exec = exec.clone();
+        let notify = notify.clone();
+        let limits = limits.clone();
+        ToolBuilder::new("resend_supervised")
+            .description(
+                "Interactive one-off resend for an unguarded or temporarily unobservable provider. Reuses the earlier prompt, requires a reason, persists the override, and never bypasses a known stop.",
+            )
+            .non_destructive()
+            .handler(move |args: SupervisedResendArgs| {
+                let ledger = ledger.clone();
+                let exec = exec.clone();
+                let notify = notify.clone();
+                let limits = limits.clone();
+                async move {
+                    let Ok(Some(turn)) = ledger.get_turn(&args.agent_id, args.seq).await else {
+                        return Ok(CallToolResult::error(format!(
+                            "no turn {}/{}",
+                            args.agent_id, args.seq
+                        )));
+                    };
+                    let outcome = crate::plugin::submit_supervised(
+                        &ledger,
+                        exec.as_ref(),
+                        &notify,
+                        &limits,
+                        &args.agent_id,
+                        &turn.prompt,
+                        "resend_supervised",
+                        &args.reason,
+                    )
+                    .await;
+                    Ok(submission_result(&args.agent_id, outcome))
+                }
+            })
+            .build()
+    };
+
     let retire = {
         let ledger = ledger.clone();
         ToolBuilder::new("retire")
@@ -624,10 +772,12 @@ pub fn router_with_limits(
         .instructions(if include_kill { OPERATOR } else { AGENT })
         .tool(spawn)
         .tool(send)
+        .tool_if(interactive, send_supervised)
         .tool(get)
         .tool(list)
         .tool(wait)
         .tool(resend)
+        .tool_if(interactive, resend_supervised)
         .tool(retire);
     if include_kill {
         router.tool(kill)
@@ -657,7 +807,11 @@ mod telemetry_serialization_tests {
             tokens_out: 0,
             tokens_cached: 0,
             usage_state: usage_state.into(),
+            usage_complete: usage_state == "reported",
             provider_turns: None,
+            provider: "claude".into(),
+            settled_unix: Some(1),
+            admission_override: None,
         }
     }
 
@@ -713,6 +867,49 @@ mod identity_tests {
 
     fn rendered(result: &CallToolResult) -> String {
         serde_json::to_string(result).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn supervised_admission_tools_exist_only_on_the_interactive_profile() {
+        let ledger = ledger().await;
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+        let notify = Notifier(tx);
+        let exec: Arc<dyn TurnExecutor> =
+            crate::HandExecutor::start(ledger.clone(), notify.clone(), 1);
+        let automatic = router_with_limits(
+            ledger.clone(),
+            exec.clone(),
+            notify.clone(),
+            true,
+            Default::default(),
+        );
+        let interactive =
+            router_interactive_with_limits(ledger, exec, notify, true, Default::default());
+
+        assert!(
+            automatic
+                .tool_annotations_map()
+                .get("send_supervised")
+                .is_none()
+        );
+        assert!(
+            automatic
+                .tool_annotations_map()
+                .get("resend_supervised")
+                .is_none()
+        );
+        assert!(
+            interactive
+                .tool_annotations_map()
+                .get("send_supervised")
+                .is_some()
+        );
+        assert!(
+            interactive
+                .tool_annotations_map()
+                .get("resend_supervised")
+                .is_some()
+        );
     }
 
     /// The hole this closes: an authenticated caller claimed to be

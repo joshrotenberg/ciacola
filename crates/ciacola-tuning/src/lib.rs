@@ -448,6 +448,7 @@ mod tests {
                     output: 1,
                     cached_input: 0,
                 }),
+                usage_complete: true,
                 provider_turns: Some(1),
                 elapsed_ms: elapsed_ms as u64,
                 error: None,

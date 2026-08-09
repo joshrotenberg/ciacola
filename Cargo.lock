@@ -372,6 +372,7 @@ dependencies = [
 name = "ciacola-schedule"
 version = "0.0.1"
 dependencies = [
+ "ciacola-agent",
  "ciacola-core",
  "schemars",
  "serde",
@@ -404,6 +405,7 @@ name = "ciacola-webhook"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "ciacola-agent",
  "ciacola-core",
  "schemars",
  "serde",

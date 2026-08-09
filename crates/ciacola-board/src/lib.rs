@@ -39,6 +39,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use ciacola_core::ledger::{Ledger, TurnRow};
+use ciacola_core::limits::{AdmissionReport, AdmissionState, ProviderAdmissionStatus};
 use ciacola_core::plugin::PluginHost;
 use ciacola_core::render::{ago, chip, esc, human_count, page_with, usd};
 
@@ -84,6 +85,184 @@ pub fn router_with_limits(
         .merge(plugin_routes)
 }
 
+fn human_u64_count(value: u64) -> String {
+    match value {
+        0..=999 => value.to_string(),
+        1_000..=999_999 => format!("{:.1}k", value as f64 / 1e3),
+        _ => format!("{:.1}M", value as f64 / 1e6),
+    }
+}
+
+fn usd_u64(micro_usd: u64) -> String {
+    format!("${:.4}", micro_usd as f64 / 1e6)
+}
+
+fn optional_count(value: Option<u64>) -> String {
+    value
+        .map(human_u64_count)
+        .unwrap_or_else(|| "&mdash;".into())
+}
+
+fn optional_usd(value: Option<u64>) -> String {
+    value.map(usd_u64).unwrap_or_else(|| "&mdash;".into())
+}
+
+fn telemetry_gaps(status: &ProviderAdmissionStatus) -> String {
+    let accounting = &status.accounting;
+    let mut gaps = Vec::new();
+    if accounting.usage_incomplete_turns > 0 {
+        gaps.push(format!(
+            "tokens partial {}",
+            human_u64_count(accounting.usage_incomplete_turns)
+        ));
+    }
+    if accounting.usage_unreported_turns > 0 {
+        gaps.push(format!(
+            "tokens unreported {}",
+            human_u64_count(accounting.usage_unreported_turns)
+        ));
+    }
+    if accounting.usage_not_tracked_turns > 0 {
+        gaps.push(format!(
+            "tokens not tracked {}",
+            human_u64_count(accounting.usage_not_tracked_turns)
+        ));
+    }
+    if accounting.usage_legacy_unknown_turns > 0 {
+        gaps.push(format!(
+            "tokens legacy {}",
+            human_u64_count(accounting.usage_legacy_unknown_turns)
+        ));
+    }
+    if accounting.cost_unreported_turns > 0 {
+        gaps.push(format!(
+            "cost unreported {}",
+            human_u64_count(accounting.cost_unreported_turns)
+        ));
+    }
+    if accounting.cost_not_priced_turns > 0 && accounting.reports_cost {
+        gaps.push(format!(
+            "cost not priced {}",
+            human_u64_count(accounting.cost_not_priced_turns)
+        ));
+    }
+    if accounting.cost_legacy_unknown_turns > 0 {
+        gaps.push(format!(
+            "cost legacy {}",
+            human_u64_count(accounting.cost_legacy_unknown_turns)
+        ));
+    }
+    if accounting.running_partial_turns > 0 {
+        gaps.push(format!(
+            "running partial {}",
+            human_u64_count(accounting.running_partial_turns)
+        ));
+    }
+    if gaps.is_empty() {
+        "none".into()
+    } else {
+        esc(&gaps.join("; "))
+    }
+}
+
+fn admission_state(status: &ProviderAdmissionStatus) -> String {
+    if status.accounting.active_agents == 0 {
+        return format!(
+            "INACTIVE <span class=\"dim\">{} if selected</span>",
+            status.state.as_str()
+        );
+    }
+    let label = match status.state {
+        AdmissionState::Stopped => "<b style=\"color:#f85149\">STOPPED</b>".to_string(),
+        AdmissionState::Warning => "<b style=\"color:#d29922\">WARNING</b>".to_string(),
+        AdmissionState::Unobservable => concat!(
+            "<b style=\"color:#f85149\">AUTO BLOCKED</b>",
+            " <span class=\"dim\">unobservable</span>"
+        )
+        .to_string(),
+        AdmissionState::Unguarded => concat!(
+            "<b style=\"color:#f85149\">AUTO BLOCKED</b>",
+            " <span class=\"dim\">unguarded</span>"
+        )
+        .to_string(),
+        AdmissionState::Ok => "OK".to_string(),
+    };
+    match &status.detail {
+        Some(detail) => format!("{label}<br><span class=\"dim\">{}</span>", esc(detail)),
+        None => label,
+    }
+}
+
+fn global_admission_state(state: AdmissionState) -> String {
+    match state {
+        AdmissionState::Stopped => "<b style=\"color:#f85149\">STOPPED</b>".into(),
+        AdmissionState::Warning => "<b style=\"color:#d29922\">WARNING</b>".into(),
+        AdmissionState::Unobservable => "<b style=\"color:#f85149\">UNOBSERVABLE</b>".into(),
+        AdmissionState::Unguarded => "<b style=\"color:#f85149\">UNGUARDED</b>".into(),
+        AdmissionState::Ok => "OK".into(),
+    }
+}
+
+fn admission_section(report: Result<AdmissionReport, ciacola_core::FlatError>) -> String {
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            return format!(
+                "<h2>admission <span class=\"dim\">rolling 24h</span></h2>\
+                 <div class=\"msg err\">admission report error: {}</div>",
+                esc(&error.to_string())
+            );
+        }
+    };
+
+    let mut html = format!(
+        "<h2>admission <span class=\"dim\">rolling 24h</span></h2>\
+         <p class=\"dim\">USD admission: <b>{spend}</b> reported &middot; warn {warn} &middot; \
+         stop {stop} &middot; cost telemetry gaps {gaps} &middot; state {state}</p>\
+         <table><tr><th>provider</th><th class=\"num\">active agents</th>\
+         <th class=\"num\">reported total</th>\
+         <th class=\"num\">input</th><th class=\"num\">output</th>\
+         <th class=\"num\">cached <span class=\"dim\">(included in input)</span></th>\
+         <th class=\"num\">warn</th><th class=\"num\">stop</th>\
+         <th>telemetry gaps</th><th>state</th><th>automatic</th></tr>",
+        spend = usd_u64(report.global.reported_spend_micro_usd),
+        warn = optional_usd(report.global.daily_warn_micro_usd),
+        stop = optional_usd(report.global.daily_stop_micro_usd),
+        gaps = human_u64_count(report.global.cost_gaps),
+        state = global_admission_state(report.global.state),
+    );
+    for status in &report.providers {
+        let accounting = &status.accounting;
+        html.push_str(&format!(
+            "<tr><td>{provider}</td><td class=\"num\">{active}</td>\
+             <td class=\"num\">{total}</td>\
+             <td class=\"num\">{input}</td><td class=\"num\">{output}</td>\
+             <td class=\"num\">{cached}</td><td class=\"num\">{warn}</td>\
+             <td class=\"num\">{stop}</td><td class=\"dim\">{gaps}</td>\
+             <td>{state}</td><td>{automatic}</td></tr>",
+            provider = esc(&accounting.provider),
+            active = human_u64_count(accounting.active_agents),
+            total = human_u64_count(accounting.total_tokens()),
+            input = human_u64_count(accounting.tokens_in),
+            output = human_u64_count(accounting.tokens_out),
+            cached = human_u64_count(accounting.tokens_cached),
+            warn = optional_count(status.daily_warn_tokens),
+            stop = optional_count(status.daily_stop_tokens),
+            gaps = telemetry_gaps(status),
+            state = admission_state(status),
+            automatic = if accounting.active_agents == 0 {
+                "<span class=\"dim\">n/a</span>"
+            } else if status.automatic_allowed {
+                "yes"
+            } else {
+                "<b style=\"color:#f85149\">no</b>"
+            },
+        ));
+    }
+    html.push_str("</table>");
+    html
+}
+
 async fn overview_body(state: &BoardState) -> String {
     let agents = match state.ledger.list_agents().await {
         Ok(agents) => agents,
@@ -127,9 +306,13 @@ async fn overview_body(state: &BoardState) -> String {
             (_, Some(stop)) => format!(" <span class=\"dim\">of {}</span>", usd(stop)),
             _ => String::new(),
         },
-        human_count(tokens.0 + tokens.1),
+        human_count(tokens.0.saturating_add(tokens.1)),
         retired,
     );
+
+    body.push_str(&admission_section(
+        state.ledger.admission_report(&state.limits).await,
+    ));
 
     // Whatever the plugins contribute, in registration order.
     for section in state.host.board_sections().await {
@@ -276,7 +459,10 @@ fn turn_cost(turn: &TurnRow) -> String {
 
 fn turn_usage(turn: &TurnRow) -> String {
     match turn.reported_tokens() {
-        Some((input, output, _cached)) => format!("{input} in / {output} out"),
+        Some((input, output, _cached)) if turn.usage_complete => {
+            format!("{input} in / {output} out")
+        }
+        Some((input, output, _cached)) => format!("{input} in / {output} out (partial)"),
         None => match turn.usage_state.as_str() {
             "not_tracked" => "tokens not tracked".into(),
             "unreported" => "tokens unreported".into(),
@@ -314,6 +500,17 @@ fn turn_html(turn: &TurnRow) -> String {
     }
     if let Some(error) = &turn.error {
         out.push_str(&format!("<div class=\"msg err\">{}</div>", esc(error)));
+    }
+    if let Some(admission_override) = &turn.admission_override {
+        let detail = serde_json::from_str::<serde_json::Value>(admission_override)
+            .ok()
+            .and_then(|value| {
+                let kind = value.get("kind")?.as_str()?;
+                let reason = value.get("reason")?.as_str()?;
+                Some(format!("supervised {kind} override: {reason}"))
+            })
+            .unwrap_or_else(|| "supervised admission override (invalid audit record)".into());
+        out.push_str(&format!("<p class=\"dim\">{}</p>", esc(&detail)));
     }
     out
 }
@@ -394,6 +591,46 @@ mod tests {
     use super::*;
     use tokio_stream::StreamExt;
 
+    fn admission_report(providers: Vec<ProviderAdmissionStatus>) -> AdmissionReport {
+        AdmissionReport {
+            window_seconds: 86_400,
+            checked_unix: 100_000,
+            since_unix: 13_600,
+            global: ciacola_core::limits::GlobalAdmissionStatus {
+                reported_spend_micro_usd: 0,
+                daily_warn_micro_usd: None,
+                daily_stop_micro_usd: None,
+                cost_gaps: 0,
+                state: AdmissionState::Ok,
+            },
+            providers,
+        }
+    }
+
+    fn admission_status(
+        provider: &str,
+        state: AdmissionState,
+        automatic_allowed: bool,
+    ) -> ProviderAdmissionStatus {
+        ProviderAdmissionStatus {
+            accounting: ciacola_core::limits::ProviderAccounting {
+                provider: provider.into(),
+                active_agents: 1,
+                reports_token_usage: true,
+                tokens_in: 80,
+                tokens_out: 20,
+                tokens_cached: 50,
+                usage_complete_turns: 1,
+                ..Default::default()
+            },
+            daily_warn_tokens: Some(75),
+            daily_stop_tokens: Some(100),
+            state,
+            automatic_allowed,
+            detail: None,
+        }
+    }
+
     async fn state() -> BoardState {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:")
             .await
@@ -440,7 +677,11 @@ mod tests {
             tokens_out: 0,
             tokens_cached: 0,
             usage_state: usage_state.into(),
+            usage_complete: usage_state == "reported",
             provider_turns: None,
+            provider: "claude".into(),
+            settled_unix: Some(1),
+            admission_override: None,
         }
     }
 
@@ -469,6 +710,85 @@ mod tests {
 
         row.elapsed_state = "legacy".into();
         assert!(turn_html(&row).contains("1.0s legacy"));
+    }
+
+    #[test]
+    fn admission_table_keeps_cached_tokens_inside_reported_total() {
+        let html = admission_section(Ok(admission_report(vec![admission_status(
+            "codex",
+            AdmissionState::Stopped,
+            false,
+        )])));
+
+        assert!(html.contains("cached <span class=\"dim\">(included in input)</span>"));
+        assert!(html.contains(
+            "<td>codex</td><td class=\"num\">1</td><td class=\"num\">100</td><td class=\"num\">80</td><td class=\"num\">20</td><td class=\"num\">50</td>"
+        ));
+        assert!(html.contains("STOPPED"), "{html}");
+        assert!(html.contains(">no</b>"), "{html}");
+    }
+
+    #[test]
+    fn admission_table_summarizes_global_usd_policy_from_the_same_report() {
+        let mut report = admission_report(vec![admission_status(
+            "claude",
+            AdmissionState::Warning,
+            true,
+        )]);
+        report.global.reported_spend_micro_usd = 12_500_000;
+        report.global.daily_warn_micro_usd = Some(10_000_000);
+        report.global.daily_stop_micro_usd = Some(20_000_000);
+        report.global.cost_gaps = 2;
+        report.global.state = AdmissionState::Warning;
+
+        let html = admission_section(Ok(report));
+        assert!(html.contains("USD admission: <b>$12.5000</b> reported"));
+        assert!(html.contains("warn $10.0000"));
+        assert!(html.contains("stop $20.0000"));
+        assert!(html.contains("cost telemetry gaps 2"));
+        assert!(html.contains("state <b style=\"color:#d29922\">WARNING</b>"));
+    }
+
+    #[test]
+    fn admission_table_distinguishes_warning_blocked_and_telemetry_gaps() {
+        let warning = admission_status("claude", AdmissionState::Warning, true);
+        let mut blocked = admission_status("codex", AdmissionState::Unobservable, false);
+        blocked.accounting.tokens_in = 0;
+        blocked.accounting.tokens_out = 0;
+        blocked.accounting.tokens_cached = 0;
+        blocked.accounting.usage_unreported_turns = 1;
+        blocked.accounting.usage_not_tracked_turns = 2;
+        blocked.detail = Some("token accounting is incomplete".into());
+
+        let html = admission_section(Ok(admission_report(vec![warning, blocked])));
+        assert!(html.contains("WARNING"), "{html}");
+        assert!(html.contains("AUTO BLOCKED"), "{html}");
+        assert!(html.contains("tokens unreported 1"), "{html}");
+        assert!(html.contains("tokens not tracked 2"), "{html}");
+        assert!(
+            html.contains(
+                "<td>codex</td><td class=\"num\">1</td><td class=\"num\">0</td><td class=\"num\">0</td>"
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn unused_registered_provider_is_neutral_until_an_agent_selects_it() {
+        let mut unused = admission_status("codex", AdmissionState::Unguarded, false);
+        unused.accounting.active_agents = 0;
+        let html = admission_section(Ok(admission_report(vec![unused])));
+        assert!(html.contains("INACTIVE"), "{html}");
+        assert!(html.contains("unguarded if selected"), "{html}");
+        assert!(html.contains("<span class=\"dim\">n/a</span>"), "{html}");
+        assert!(!html.contains("AUTO BLOCKED"), "{html}");
+    }
+
+    #[test]
+    fn admission_report_errors_are_visible_instead_of_rendered_as_zero() {
+        let html = admission_section(Err("broken admission query".into()));
+        assert!(html.contains("admission report error: broken admission query"));
+        assert!(!html.contains("<table>"));
     }
 
     /// `/board/events` is a long-lived SSE response by design: without
