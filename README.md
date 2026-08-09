@@ -1,303 +1,247 @@
-# ciacola
+# Ciacola
 
-A laptop-local server that runs coding agents as durable, resumable
-conversations, fronted entirely by MCP.
+Ciacola is a local agent server for durable, resumable software work. It keeps
+provider conversations, turns, repository assignments, costs, limits, and
+recovery state in one SQLite ledger, then exposes them through MCP and a live
+operator board.
 
-*Ciacola* is Venetian for a long, circular conversation. It is what a
-swarm of agents talking each other into a conclusion looks like from
-the outside, and it is what this system's unit actually is: not a job,
-not a task, but a conversation that persists.
+Use it when agent work should survive a server restart, stay attributable to a
+role and repository issue, and stop safely instead of being silently retried.
 
-**Status: early and supervised.** Real repository work has reached reviewed
-pull requests through both provider paths, but unattended operation is still
-being hardened. The product shape works; its interfaces are not yet stable.
+> **Status: early and supervised.** Claude and Codex have both completed real,
+> reviewed repository work through Ciacola. The core workflow is usable for
+> dogfood, but configuration and public interfaces can still change. Ciacola is
+> a single-operator local product, not a multi-tenant security boundary.
 
-## The idea
+![Ciacola supervision overview](docs/images/board-overview.png)
 
-An agent is a durable conversation. The provider keeps the
-conversation; ciacola keeps its id and what it cost. So:
+## What it does
 
-- an agent exists while nothing is running,
-- a *turn* is one process execution against it,
-- and recovery is **resume**, not retry.
+- Treats an agent as a durable provider conversation, not a disposable job.
+- Writes every turn before dispatch and resumes provider state after restart.
+- Keeps queued work closed until configuration, plugins, HTTP, and recovery are
+  ready.
+- Runs Claude and Codex behind one capability-aware provider contract.
+- Applies rolling admission breakers and provider-native per-turn ceilings.
+- Gives each agent an authenticated, least-authority MCP scope.
+- Tracks an issue from assignment through worktree, branch, pull request, and
+  cleanup.
+- Shows attention, active work, execution context, repository journeys, usage,
+  and health on a live, responsive board.
+- Lets plugins contribute tools, roles, board sections, health, routes, and
+  retention without privileged side paths.
 
-That last point is why there is no work queue at the centre. A queue's
-durability buys re-execution, which is the one thing paid agent work
-must never do, and the durable record a queue would hold already exists:
-a turn is written to the ledger before anything is told to run it. The
-default executor polls that record, so a turn queued before a crash is
-picked up after one, with no queue and no recovery pass involved.
-At startup, dispatch stays closed until the complete loopback HTTP server is
-listening and crash recovery has reconciled the ledger. Configuration, plugin,
-or port-binding failures therefore leave queued work untouched and launch no
-provider.
+The core operator tools are deliberately small:
 
-## Six verbs
-
+```text
+spawn   define an agent; runs nothing and costs nothing
+send    add a durable turn and return immediately
+wait    wait for one turn to settle
+get     inspect one agent and its conversation
+list    inspect every active agent and its lineage
+kill    stop a running turn without deleting the agent
 ```
-spawn   define an agent; runs nothing, costs nothing
-send    say something; returns immediately with a turn number
-wait    block until a turn finishes
-get     one agent, with its whole conversation
-list    every agent, with state, cost, and lineage
-kill    stop a running turn; the agent survives
-```
 
-Agents are given these same verbs through an authenticated, least-authority
-loopback scope, which is all "multi-agent orchestration" turns out to
-require. A conductor spawning debaters is a prompt, not a framework.
+## Supported today
 
-## Everything else is a plugin
+<!-- markdownlint-disable MD013 -->
 
-Including the parts it leans on hardest: the kanban, memory, findings,
-schedules, references, git state, webhooks, model statistics, and the
-repository worker. They register through the same trait a third party
-would, because a built-in with a privileged path leaves the plugin API
-a second-class citizen that rots.
+| Capability | Claude | Codex |
+| --- | --- | --- |
+| Authentication | Authenticated Claude home or Unix startup token descriptor | Authenticated Codex home or Unix startup token descriptor |
+| Resume identity | Claude session id | Codex thread id |
+| Usage | Reported input, output, cache, and USD cost when the CLI supplies them | Reported input, output, and cache; no Ciacola price table |
+| Per-turn ceiling | Integer micro-USD, checked at provider-response boundaries | Versioned native rollout units for tested CLI versions, checked at provider-response boundaries |
+| Provider tools | Named Claude tool allowlist | Native Codex policy; named Claude-style grants are refused |
+| Containment | Hermetic provider settings; Claude does not claim an OS sandbox | `read-only`, `workspace-write`, or `workspace-write-no-network` |
+| Scoped Ciacola MCP | Yes, on opening and resume | Yes, on opening and resume |
+| Known gap | Budget enforcement can overshoot through in-flight work | Budget terminal JSON can omit usage; unsupported CLI versions fail closed for configured ceilings |
 
-A plugin contributes to every cross-cutting surface rather than merely
-adding tools: board sections, HTTP routes, health statistics, its own
-retention policy, background loops, and the roles that know how to use
-its tools.
+<!-- markdownlint-enable MD013 -->
 
-It is also not a lock-in, which is what lets it stay small. Agents are handed
-a strict MCP scope; any other MCP server can be added to it and the agent
-cannot tell the difference. A plugin earns its keep only when it needs
-something core owns.
+Provider capabilities are explicit rather than reduced to a fictional common
+denominator. See [Configuration](docs/configuration.md#providers) for the full
+matrix and versioned ceiling semantics.
 
-## Providers
+## Quickstart
 
-Claude and Codex are built-in adapters behind the same provider contract.
-An agent can select `provider = "claude"` or `provider = "codex"`; a
-server-wide `default_provider` covers definitions that omit it. Existing
-stored conversations cannot be moved between providers after their first
-recorded turn; retire one and create a new agent to change backends.
+### Prerequisites
 
-Provider controls stay explicit where the CLIs differ. Claude accepts named
-tool grants. Codex uses its native execution policy plus `read-only`,
-`workspace-write`, or `workspace-write-no-network` containment. Codex reports
-real token usage, but not a monetary price, so the ledger records those turns
-as unpriced rather than inventing a dollar value. See `ciacola.example.toml`
-for the complete configuration surface.
+- Git and a current stable Rust toolchain.
+- One provider CLI: [Claude Code](https://code.claude.com/docs)
+  or [Codex CLI](https://github.com/openai/codex), already authenticated.
+- `gh auth login` for repository and pull-request work.
+- [`mcp-repl`](https://github.com/joshrotenberg/mcp-repl) for the interactive
+  operator workflow.
 
-The same rule applies to per-turn ceilings: the contract is shared, but the
-unit is provider-native and versioned. Claude enforces micro-USD through its
-native maximum-budget setting. Supported Codex CLIs enforce native rollout
-units; depending on the CLI version, those are either weighted non-cached
-input plus output or provider-supplied rollout units with that calculation as
-a fallback. Neither adapter claims an exact portable-token boundary. Both
-providers observe the ceiling at response boundaries, so work already in
-flight can cross the configured value. Codex root and subagent responses may
-be concurrent, so this is not an upper bound of exactly one response.
-
-## Running it
-
-For a durable server, copy the annotated config and start it:
+Ciacola is currently installed from source. Its four wrapper dependencies are
+pinned Git revisions, so use the checked-in lockfile:
 
 ```sh
-cp ciacola.example.toml ciacola.toml
-cargo run -p ciacola
-```
-
-Then open the board at `http://127.0.0.1:4823/board`.
-
-For interactive operator work, run the server through its stdio MCP surface:
-
-```sh
-mcp-repl -- cargo run -p ciacola
-```
-
-The ordinary HTTP MCP surface at `/mcp` is for agents, not anonymous clients.
-Ciacola injects each active agent's scoped `x-ciacola-agent` credential into
-every loopback MCP request. The complete mount, including `/mcp/health`,
-rejects missing, malformed, unknown, and retired credentials before MCP
-initialization or tool dispatch. The credential remains stable across server
-restarts and provider-session rotation, and is revoked when the agent retires;
-there is no in-place credential rotation API, so retire and recreate an agent
-to mint a replacement. Humans should use stdio or the separately authenticated
-operator surface below; there is deliberately no public liveness exception
-inside `/mcp`.
-
-The HTTP operator surface at `/mcp-operator` is bearer authenticated. Keep
-the root secret in a credential manager, pass it to the server through a
-dedicated inherited descriptor, and pass it to an HTTP client through an
-ephemeral descriptor-backed profile:
-
-```sh
-# Build before the secret descriptor exists, so Cargo and build scripts never
-# inherit it. Then start the actual binary in the first terminal.
+git clone https://github.com/joshrotenberg/ciacola.git
+cd ciacola
 cargo build --locked -p ciacola
-operator_token="$(openssl rand -hex 32)"
-CIACOLA_OPERATOR_TOKEN_FD=3 ./target/debug/ciacola \
-  3< <(printf '%s' "$operator_token")
-
-# Second terminal. Load or paste the same value into an unexported variable.
-mcp-repl --config /dev/fd/3 --server ciacola_operator 3< <(
-  printf '[servers.ciacola_operator]\ntransport = "http"\nurl = "http://127.0.0.1:4823/mcp-operator"\nbearer = "%s"\n' \
-    "$operator_token"
-)
+cargo install --locked mcp-repl
 ```
 
-These bash/zsh examples carry the secret through pipes. It reaches neither
-argv, an exported environment variable, nor a persistent config file.
-`mcp-repl` currently warns about a literal bearer in the profile; in this
-recipe the complete profile exists only on the pipe, so nothing is saved.
-`CIACOLA_OPERATOR_TOKEN_FD` contains only a descriptor number. Ciacola reads
-and closes it before starting Tokio or any provider process. Supplying the
-secret itself as `CIACOLA_OPERATOR_TOKEN` is rejected. An ambient client-side
-`MCP_BEARER` is also rejected unless its exact name is in
-`provider_env_passthrough`; that explicit opt-in snapshots it for provider
-children and then removes the daemon's ambient copy. Startup environment
-values can remain visible to same-user process inspection even after unset,
-so prefer a dedicated credential mechanism over that escape hatch.
-Omit the descriptor to disable human HTTP operator access;
-stdio remains available. Operator descriptor ingestion is Unix-only; Windows
-uses stdio operator access. Changing the root secret and restarting rotates it.
-Provider-backed agent credentials are explicitly refused on this mount,
-including roles that previously selected `surface = "operator"`. A secure
-delegated supervisor channel needs stronger process provenance than a bearer
-shared between provider processes; its still-disabled design is recorded in
-[ADR 0001](docs/adr/0001-process-isolated-delegated-supervision.md).
-
-Provider CLI children also start fail-closed. Every opening and resumed Claude
-or Codex execution clears the daemon's inherited environment, then restores a
-small baseline: path, home/user identity, temporary-directory selection,
-locale, and the essential Windows process variables when applicable. Git can
-therefore use its normal `HOME`-based configuration. SSH agents, Git
-overrides, proxies, GitHub credentials, Ciacola variables, client bearers, and
-other workflow values are absent unless their exact names appear in
-`[runtime].provider_env_passthrough`:
+Create `ciacola.toml`. This safe starting point uses the shipped Claude issue
+implementer. Replace `OWNER/REPO` with a repository your authenticated `gh`
+client can read and write:
 
 ```toml
 [runtime]
-provider_env_passthrough = ["SSH_AUTH_SOCK", "HTTPS_PROXY"]
+hermetic = "full"
+
+[limits]
+daily_warn_usd = 5.0
+daily_stop_usd = 10.0
+max_spawn_depth = 3
+
+[limits.providers.claude]
+# $2.00 in integer micro-USD. Enforcement is response-boundary, not exact.
+per_turn_ceiling = 2_000_000
+
+[plugins.repo-worker]
+root = "~/.local/share/ciacola/repos"
+repos = ["OWNER/REPO"]
 ```
 
-There are no globs and a missing named value stays absent. An adapter always
-removes its own authentication, routing, cloud, and config selectors from this
-neutral snapshot before applying the intended provider home and credential,
-so even an explicit `OPENAI_API_KEY` passthrough cannot override Codex and an
-explicit `ANTHROPIC_API_KEY` cannot override Claude. Opposite-provider values,
-`MCP_BEARER`, `CIACOLA_*`, and arbitrary sentinels can pass only when named
-deliberately. Per-turn `CIACOLA_MCP_*` header variables are generated by the
-adapter after filtering. Proxy URLs, SSH sockets, askpass programs, and GitHub
-tokens can themselves convey authority; opting them in grants that authority
-to the direct provider child.
-
-Authenticate a configured `claude_home` / `codex_home` separately, or, on
-Unix, deliver one startup credential per provider through an inherited
-descriptor. Build first so Cargo and build scripts never inherit the
-descriptor, then launch the binary directly:
+Start Ciacola as an interactive stdio MCP server:
 
 ```sh
-cargo build --locked -p ciacola
-CIACOLA_CLAUDE_TOKEN_FD=3 CIACOLA_CODEX_TOKEN_FD=4 \
-  ./target/debug/ciacola \
-  3< <(printf '%s' "$claude_token") \
-  4< <(printf '%s' "$codex_token")
+mcp-repl -- ./target/debug/ciacola
 ```
 
-The variables contain descriptor numbers only. Ciacola validates that all
-operator/provider descriptors are distinct and above stderr, reads bounded
-UTF-8 values, closes the originals, and keeps credentials only in redacted
-adapter memory. The child receives exactly `CLAUDE_CODE_OAUTH_TOKEN` or
-`CODEX_API_KEY`; the source descriptor variables reach neither child, argv,
-config, nor SQLite. The former `token_env` and `codex_token_env` settings are
-rejected with migration guidance because secret-valued startup environments
-can remain visible through same-user process inspection. After removing those
-fields, config-managed agents are redefined safely on startup; any other
-persisted agent carrying the legacy marker must be replaced or retired and
-recreated. Supplying a descriptor alone does not erase that marker. Windows
-does not support this descriptor ingress and must use separately authenticated
-provider homes.
+The startup banner prints the resolved ledger, providers, limits, roles,
+plugins, recovery result, and dispatch state. Open
+[http://127.0.0.1:4823/board](http://127.0.0.1:4823/board) while the REPL stays
+running.
 
-This is deterministic direct-child credential selection, not an OS security
-boundary. A provider running as the same user may still inspect accessible
-files or process metadata, and a model-launched descendant may receive values
-the provider intentionally propagates. Use a separate user/container when
-those processes must distrust one another.
+An absent `ciacola.toml` is valid and starts an empty server. The annotated
+[`ciacola.example.toml`](ciacola.example.toml) shows every supported section.
 
-`ciacola.toml` is optional; when absent the server starts empty. The
-ledger defaults to `$XDG_DATA_HOME/ciacola/ciacola.db`, or to
-`$HOME/.local/share/ciacola/ciacola.db` when `XDG_DATA_HOME` is unset.
-Set `CIACOLA_DB` to override it. The resolved path is printed at startup.
-Before adding schedules, configure both limit planes for the selected
-backend:
+## First issue to draft PR
 
-- The rolling 24-hour admission breakers decide whether another turn may be
-  queued. Priced providers use `daily_stop_usd`; unpriced providers such as
-  Codex also need `[limits.providers.codex].daily_stop_tokens`. The rolling
-  token total is reported input + output, with cached input already included
-  in input. USD and token stops are independent, and Ciacola carries no
-  provider price table.
-  Reported spend observed before a failed turn stopped is still added to the
-  rolling total, but is labeled partial rather than complete. While such a
-  lower bound remains in the window, a configured USD stop is unobservable
-  and automatic submissions fail closed.
-- `[limits.providers.<provider>].per_turn_ceiling` bounds each admitted
-  provider execution in the provider's declared unit. The effective value,
-  meter, cache treatment, and enforcement granularity are copied onto the
-  queued turn before dispatch. Recovery and config changes therefore cannot
-  silently widen it, and the same ceiling is reapplied whether the turn opens
-  or resumes a provider conversation.
+Inside `mcp-repl`, start one allowlisted issue:
 
-Omitting `per_turn_ceiling` is an explicit unbounded default: it does not
-block automatic work that otherwise passes admission, and the board labels it
-`UNBOUNDED`. Configuring a ceiling that the detected provider/CLI cannot honor
-labels it `UNSUPPORTED` and refuses automatic work before provider side
-effects. A human may use `send_supervised` with a persisted reason to override
-only that unavailable protection (or incomplete rolling telemetry); no
-override crosses a known rolling stop.
+```text
+start_issue repo=OWNER/REPO issue=123
+```
 
-The two planes solve different problems. Admission is not a reservation: an
-already-admitted turn can finish beyond the rolling threshold, and concurrent
-turns multiply that exposure. A per-turn ceiling narrows one execution, but a
-response-boundary provider can still overshoot through work already in flight;
-Codex root/subagent concurrency can multiply that soft-boundary overshoot, and
-concurrent Ciacola turns each receive their own ceiling. Codex budget failures
-currently omit a terminal usage object
-([openai/codex#37676](https://github.com/openai/codex/issues/37676)), so Ciacola
-records usage as unreported—or preserves an earlier partial snapshot—rather
-than inventing a measurement. See
-`ciacola.example.toml` for the annotated settings and `HANDOFF.md` for deeper
-design context.
+The result contains a durable assignment and an implementer `agent_id`. Send
+the task once, then wait for that returned turn sequence:
 
-Ciacola is a single-operator, laptop-local product, not a multi-tenant
-security boundary. The loopback listener and bearer checks reject callers
-that do not hold authority, and strict internal Codex turns ask the CLI to
-exclude Ciacola credentials from model-launched shells. Those controls are
-defense in depth, not cross-process isolation: a hostile process already
-running as the same OS user may still inspect another process on platforms or
-provider modes without an OS sandbox. Use a separate OS account or stronger
-containment for mutually untrusted local workloads.
+```text
+send agent_id=AGENT_ID text="Implement the issue, verify the full gate, and commit."
+call wait agent_id=AGENT_ID seq=1 timeout_secs=600
+```
 
-## Workflow fixture
+`call wait` is intentional because `wait` is also an mcp-repl task command.
+If `start_issue` returns `created=false`, reuse the existing assignment and do
+not send the implementation prompt again.
 
-Destructive and failure-path repository dogfood uses the private
-[`joshrotenberg/ciacola-fixture`](https://github.com/joshrotenberg/ciacola-fixture)
-repository rather than a real project. Its `develop` default branch, tiny
-one-line fixture, deterministic pass/fail/delay switches, CI workflow, labeled
-issues, and scenario catalog cover cloning, assignment, publication, cleanup,
-conflicts, drift, restart, permissions, and provider parity. Access is limited
-to approved fixture maintainers. The repository is allowlisted only in local
-dogfood configuration; no fixture credential or allowlist is committed here.
+Read the worker reply, inspect the diff and commit yourself, and run the
+repository's gate. Publication is a separate human action. Push exactly the
+reviewed full commit OID and open a draft PR:
 
-The initial real-server proof ([#58](https://github.com/joshrotenberg/ciacola/issues/58))
-ran fixture issue
-[#2](https://github.com/joshrotenberg/ciacola-fixture/issues/2) through an
-isolated `fix/{slug}` worktree and Codex turn. An intentional server
-interruption left the first turn without a resume id; restart settled it as an
-orphan, automatic resend failed closed on incomplete rolling-token telemetry,
-and an audited supervised resend under the same native per-turn ceiling
-completed the requested commit. Ciacola then pushed the exact approved OID,
-opened private draft PR
-[#7](https://github.com/joshrotenberg/ciacola-fixture/pull/7), observed all
-fixture checks pass, reconciled the merged PR, retired the agent, and removed
-the managed worktree and branch. Replaying `open_pr` returned that same merged
-PR with `created = false`; replaying `finish_issue` returned the same completed
-cleanup result. This proves both a happy path and a fail-closed recovery path
-without granting write access to an unrelated repository or operator checkout.
+<!-- markdownlint-disable MD013 -->
+
+```text
+open_pr agent_id=AGENT_ID expected_head=FULL_COMMIT_OID title="fix: describe the change" body="Closes #123" draft=true
+```
+
+<!-- markdownlint-enable MD013 -->
+
+After the PR is merged, reconcile and remove the managed worktree:
+
+```text
+finish_issue agent_id=AGENT_ID keep=false
+```
+
+Cleanup refuses dirty work, unpublished commits, open or closed-unmerged PRs,
+and moved heads unless the operator supplies the exact explicit discard fence.
+See [Operations](docs/operations.md#repository-journeys) before recovering a
+stale assignment or discarding work.
+
+## Operating Ciacola
+
+- The board is the normal supervision surface. MCP remains the power and
+  control interface.
+- `Ctrl-C` stops HTTP intake and drains in-flight turns for up to ten minutes.
+  A second `Ctrl-C` abandons them for restart recovery.
+- The ledger defaults to `$XDG_DATA_HOME/ciacola/ciacola.db`, or
+  `$HOME/.local/share/ciacola/ciacola.db`. `CIACOLA_DB` overrides it.
+- Rolling daily stops decide whether a new turn may be admitted. They are not
+  reservations: admitted and concurrent turns can finish beyond them.
+- Per-turn ceilings use provider-native units and response-boundary checks, so
+  they also can overshoot through work already in flight.
+- Nothing prunes automatically. The operator-only `prune` tool blanks old turn
+  text while retaining state, cost, usage, and timing.
+
+Read [Operations](docs/operations.md) for startup, backup, recovery, limits,
+logs, pruning, and troubleshooting.
+
+## Security model
+
+Ciacola listens only on loopback. Human stdio is the simplest trusted operator
+surface. Optional HTTP operator access uses a root bearer read from an inherited
+descriptor; the ordinary `/mcp` mount accepts only server-issued credentials
+for active agents. Provider-backed operator roles and delegated supervisor
+authority remain disabled.
+
+Provider children start from a cleared environment with a small baseline and
+exact configured passthrough names. This is direct-child credential hygiene,
+not isolation from another hostile process running as the same OS user. Use a
+separate account, VM, or container when workloads must distrust one another.
+
+Read [Security](docs/security.md) before enabling HTTP operator access,
+environment passthrough, schedules, webhooks, or unattended repository work.
+
+## How it fits together
+
+An agent exists while no process is running. A turn is one provider execution
+against that durable conversation. Ciacola records the turn first; the provider
+owns its session or thread; the ledger owns authority, admission, attribution,
+telemetry, and recovery. Recovery resumes known provider state and never
+pretends a repeated paid call is the same work.
+
+In-tree plugins use the same public plugin contract as external code. The
+repository worker is one plugin, not a second orchestration runtime.
+
+See [Architecture](docs/architecture.md) for the durable-conversation thesis,
+component boundaries, surfaces, and plugin model. Contributors should also
+read [CONTRIBUTING.md](CONTRIBUTING.md). Historical design evidence remains in
+[HANDOFF.md](HANDOFF.md), but it is not the operating manual.
+
+## Documentation
+
+- [Configuration reference](docs/configuration.md)
+- [Operations and recovery](docs/operations.md)
+- [Security boundaries](docs/security.md)
+- [Architecture](docs/architecture.md)
+- [Delegated supervision ADR](docs/adr/0001-process-isolated-delegated-supervision.md)
+- [Annotated example configuration](ciacola.example.toml)
+- [Contributing](CONTRIBUTING.md)
+
+Behavior-changing pull requests should update the relevant product document in
+the same change. Commands in the quickstart and operations guide are tested
+against the current source tree before release.
+
+## Evidence and limitations
+
+Ciacola has produced reviewed, merged work in its own backlog, `redis-tower`,
+`claude-wrapper`, and a private deterministic workflow fixture. Dogfood has
+covered provider resume across server restarts, exact-head PR publication,
+idempotent cleanup, native turn limits, interrupted telemetry, and fail-closed
+recovery.
+
+It is still pre-release. There is no packaged binary, stable public API,
+multi-user authorization model, secure provider-backed supervisor channel, or
+claim that provider tools are an OS sandbox. Follow the live
+[roadmap](https://github.com/joshrotenberg/ciacola/issues/59) and report
+dogfood failures as focused issues with reproducible evidence.
 
 ## License
 
-MIT or Apache-2.0, at your option.
+Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
+your option.
