@@ -7,7 +7,7 @@ use ciacola_agent::{
     AgentError, Cost, PartialTelemetry, ProviderKey, ResumeId, TokenUsage, TurnFailure,
     TurnOutcome, Usage,
 };
-use codex_wrapper::{JsonLineEvent, QueryResult};
+use codex_wrapper::{JsonLineEvent, QueryResult, TurnFailureKind};
 
 pub(crate) fn from_events(events: Vec<JsonLineEvent>, elapsed: Duration) -> TurnOutcome {
     let usage = usage_from(&events)
@@ -17,7 +17,12 @@ pub(crate) fn from_events(events: Vec<JsonLineEvent>, elapsed: Duration) -> Turn
         .iter()
         .rev()
         .find(|event| event.is_turn_failed())
-        .map(|event| TurnFailure::reported(failure_message(event)));
+        .map(|event| match event.turn_failure_kind() {
+            Some(TurnFailureKind::RolloutBudgetExhausted) => {
+                TurnFailure::limit(failure_message(event))
+            }
+            _ => TurnFailure::reported(failure_message(event)),
+        });
     let result = QueryResult::from_events(events);
 
     TurnOutcome {
@@ -233,6 +238,31 @@ mod tests {
                 cached_input: 0,
             })
         );
+    }
+
+    #[test]
+    fn rollout_budget_exhaustion_is_a_limit_with_missing_usage_left_honest() {
+        let outcome = from_events(
+            events(&[
+                r#"{"type":"thread.started","thread_id":"thread-limited"}"#,
+                r#"{"type":"item.completed","item":{"type":"agent_message","text":"partial reply"}}"#,
+                r#"{"type":"error","message":"shared rollout token budget exhausted"}"#,
+                r#"{"type":"turn.failed","error":{"message":"shared rollout token budget exhausted"}}"#,
+            ]),
+            Duration::from_secs(4),
+        );
+
+        assert_eq!(
+            outcome.failure.as_ref().map(|failure| failure.kind),
+            Some(ciacola_agent::FailureKind::Limit)
+        );
+        assert_eq!(outcome.reply, "partial reply");
+        assert_eq!(outcome.usage, Usage::Unreported);
+        assert_eq!(
+            outcome.resume,
+            Some(ResumeId::ProviderAssigned("thread-limited".into()))
+        );
+        assert_eq!(outcome.elapsed, Duration::from_secs(4));
     }
 
     #[test]

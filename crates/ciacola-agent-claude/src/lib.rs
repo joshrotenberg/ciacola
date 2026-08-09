@@ -20,7 +20,9 @@
 //! Claiming otherwise would let a turn that asked to be sandboxed run
 //! wide open under the name of a security feature this adapter does
 //! not have; see `ciacola_agent::capability` for why that distinction
-//! is drawn at the security line and nowhere else.
+//! is drawn at the authority boundary. Per-turn provider spend is a separate,
+//! non-security boundary that this adapter enforces with
+//! `--max-budget-usd`.
 //!
 //! # Cancellation and drop safety
 //!
@@ -56,8 +58,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use ciacola_agent::{
-    AgentError, BoxFut, Capabilities, PartialTelemetry, Provider, ProviderKey, ResumeId,
-    TokenUsage, TurnEvents, TurnIntent, TurnOutcome,
+    AgentError, BoxFut, CacheTreatment, Capabilities, CeilingCapability, EnforcementGranularity,
+    MeterId, PartialTelemetry, Provider, ProviderKey, ResumeId, TokenUsage, TurnEvents, TurnIntent,
+    TurnOutcome,
 };
 use claude_wrapper::{
     Claude, OutputFormat, QueryResult,
@@ -66,6 +69,19 @@ use claude_wrapper::{
 
 mod command;
 mod outcome;
+
+/// Claude's native `--max-budget-usd` meter, represented without floating
+/// point in Ciacola configuration and persistence.
+pub const MAX_BUDGET_MICRO_USD_METER: &str = "claude.max_budget.micro_usd.v1";
+
+/// The stable ceiling capability of the pinned Claude CLI contract.
+pub fn turn_ceiling_capability() -> CeilingCapability {
+    CeilingCapability {
+        meter: MeterId::new(MAX_BUDGET_MICRO_USD_METER),
+        granularity: EnforcementGranularity::ProviderResponseBoundary,
+        cache_treatment: CacheTreatment::NotApplicable,
+    }
+}
 
 /// The Claude backend, over `claude-wrapper`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -89,6 +105,7 @@ impl Provider for ClaudeProvider {
         caps.strict_mcp = true;
         caps.allowed_tools = true;
         caps.max_provider_turns = true;
+        caps.turn_ceiling = Some(turn_ceiling_capability());
         caps.effort = true;
         caps.reports_cost = true;
         caps.reports_token_usage = true;
@@ -101,7 +118,16 @@ impl Provider for ClaudeProvider {
         intent: &'a TurnIntent,
         events: &'a dyn TurnEvents,
     ) -> BoxFut<'a, Result<TurnOutcome, AgentError>> {
-        Box::pin(async move { run_turn(intent, events).await })
+        Box::pin(async move {
+            if let Some(blocking) = self.capabilities().validate(intent).blocking() {
+                return Err(AgentError::Unsupported {
+                    provider: self.key(),
+                    constraint: blocking.constraint,
+                    detail: blocking.detail.clone(),
+                });
+            }
+            run_turn(intent, events).await
+        })
     }
 
     fn owns_process(&self, ps_line: &str) -> bool {
@@ -354,6 +380,20 @@ mod tests {
         assert!(!ClaudeProvider.capabilities().sandbox);
     }
 
+    #[test]
+    fn native_budget_capability_is_micro_usd_at_a_response_boundary() {
+        let capability = ClaudeProvider
+            .capabilities()
+            .turn_ceiling
+            .expect("Claude enforces max-budget-usd");
+        assert_eq!(capability.meter.as_str(), MAX_BUDGET_MICRO_USD_METER);
+        assert_eq!(
+            capability.granularity,
+            EnforcementGranularity::ProviderResponseBoundary
+        );
+        assert_eq!(capability.cache_treatment, CacheTreatment::NotApplicable);
+    }
+
     /// The consequence of that declaration: a turn that asks to be
     /// sandboxed must be refused before it runs, not silently widened.
     #[test]
@@ -365,12 +405,12 @@ mod tests {
         assert_eq!(blocking.constraint, ciacola_agent::Constraint::Sandbox);
     }
 
-    /// Isolation, credential isolation, scoped/strict MCP, allowed
-    /// tools, client-assigned resume, and turn ceilings are all things
+    /// Isolation, credential isolation, scoped/strict MCP, allowed tools,
+    /// client-assigned resume, internal-turn hints, and spend ceilings are all things
     /// this adapter actually implements, so an intent that asks for
     /// them must not be blocked.
     #[test]
-    fn every_other_security_constraint_this_adapter_implements_passes_validation() {
+    fn every_other_supported_constraint_this_adapter_implements_passes_validation() {
         let mut intent = TurnIntent::new("go");
         intent.isolation = Isolation::Full;
         intent.config_home = Some("/tmp/claude-home".into());
@@ -378,6 +418,10 @@ mod tests {
         intent.allowed_tools = Some(vec!["Read".into()]);
         intent.resume = Some(ciacola_agent::ResumeId::ClientAssigned("agent-1".into()));
         intent.max_provider_turns = Some(20);
+        intent.turn_ceiling = Some(ciacola_agent::TurnCeiling {
+            capability: turn_ceiling_capability(),
+            limit: 25_000,
+        });
         intent.mcp = Some(ciacola_agent::McpScope {
             endpoints: vec![ciacola_agent::McpEndpoint {
                 name: "ciacola".into(),

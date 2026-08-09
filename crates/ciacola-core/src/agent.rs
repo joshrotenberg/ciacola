@@ -320,6 +320,10 @@ pub struct Exchange {
     /// away. `Err` from [`run_exchange`] means the process could not be
     /// run at all.
     pub error: Option<String>,
+    /// Typed reason a provider run ended badly. Kept beside `error` so a
+    /// limit remains machine-readable through persistence rather than being
+    /// inferred from provider prose.
+    pub failure_kind: Option<ciacola_agent::FailureKind>,
 }
 
 impl Exchange {
@@ -445,8 +449,26 @@ pub async fn run_exchange(
     text: &str,
     events: &dyn TurnEvents,
 ) -> Result<Exchange, FlatError> {
+    run_exchange_with_ceiling(providers, def, mcp, session, started, text, None, events).await
+}
+
+/// Execute with the exact per-turn ceiling snapshot admitted by the ledger.
+/// The public convenience path above remains unbounded for direct callers;
+/// product execution always calls this persisted-policy path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_exchange_with_ceiling(
+    providers: &ProviderRegistry,
+    def: &AgentDef,
+    mcp: Option<McpScope>,
+    session: Option<&str>,
+    started: bool,
+    text: &str,
+    turn_ceiling: Option<ciacola_agent::TurnCeiling>,
+    events: &dyn TurnEvents,
+) -> Result<Exchange, FlatError> {
     let provider = providers.get(&def.provider)?;
-    let intent = intent_for(def, mcp, session, started, text);
+    let mut intent = intent_for(def, mcp, session, started, text);
+    intent.turn_ceiling = turn_ceiling;
 
     // Fail closed on anything that would widen what this agent can
     // reach or see; say the rest out loud and carry on. Where that line
@@ -610,8 +632,10 @@ fn exchange_from(def: &AgentDef, outcome: TurnOutcome) -> Exchange {
     );
 
     let usage_complete = matches!(outcome.usage, Usage::Reported(_));
+    let failure_kind = outcome.failure.as_ref().map(|failure| failure.kind);
     Exchange {
         error: outcome.failure_message().map(str::to_string),
+        failure_kind,
         reply: outcome.reply,
         session: outcome.resume.as_ref().map(|r| r.value().to_string()),
         cost: outcome.cost,
@@ -639,6 +663,7 @@ fn partial_exchange(
     let partial = error.partial()?;
     Some(Exchange {
         error: Some(error.to_string()),
+        failure_kind: Some(ciacola_agent::FailureKind::Reported),
         reply: String::new(),
         session: partial.resume.as_ref().map(|r| r.value().to_string()),
         cost: partial.cost.unwrap_or(if capabilities.reports_cost {
@@ -847,6 +872,7 @@ mod migration_tests {
         assert_eq!(x.elapsed_ms, 323_000);
         assert_eq!(x.provider_turns, Some(60));
         assert_eq!(x.tokens().input, 900);
+        assert_eq!(x.failure_kind, Some(ciacola_agent::FailureKind::Limit));
         assert!(
             x.error.is_some(),
             "it still failed, and must read as failed"

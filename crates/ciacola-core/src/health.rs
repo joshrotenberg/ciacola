@@ -168,6 +168,19 @@ impl Health {
             "not_attempted": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND elapsed_state = 'not_attempted'").await,
             "legacy": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND elapsed_state = 'legacy'").await,
         });
+        let protection_states = json!({
+            "enforced": self.count("SELECT COUNT(*) FROM turns WHERE turn_protection_state = 'enforced'").await,
+            "unbounded": self.count("SELECT COUNT(*) FROM turns WHERE turn_protection_state = 'unbounded'").await,
+            "override_unavailable": self.count("SELECT COUNT(*) FROM turns WHERE turn_protection_state = 'override_unavailable'").await,
+            "legacy": self.count("SELECT COUNT(*) FROM turns WHERE turn_protection_state = 'legacy'").await,
+        });
+        let failure_kinds = json!({
+            "none": self.count("SELECT COUNT(*) FROM turns WHERE failure_kind = 'none'").await,
+            "limit": self.count("SELECT COUNT(*) FROM turns WHERE failure_kind = 'limit'").await,
+            "reported": self.count("SELECT COUNT(*) FROM turns WHERE failure_kind = 'reported'").await,
+            "not_attempted": self.count("SELECT COUNT(*) FROM turns WHERE failure_kind = 'not_attempted'").await,
+            "legacy": self.count("SELECT COUNT(*) FROM turns WHERE failure_kind = 'legacy'").await,
+        });
         json!({
             "db_bytes": self.db_bytes(),
             "providers": self.providers,
@@ -218,6 +231,8 @@ impl Health {
                 "cost_states": cost_states,
                 "usage_states": usage_states,
                 "elapsed_states": elapsed_states,
+                "turn_protection_states": protection_states,
+                "failure_kinds": failure_kinds,
             },
             "turn_text_bytes": self
                 .count(
@@ -381,6 +396,7 @@ mod tests {
                         provider_turns: Some(0),
                         elapsed_ms: 1,
                         error: None,
+                        failure_kind: None,
                     },
                 )
                 .await

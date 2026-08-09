@@ -11,10 +11,11 @@
 //!
 //! # Where the line between fail and warn falls
 //!
-//! At security, and nowhere else.
+//! At boundaries, and nowhere else.
 //!
 //! **Fail** ([`Severity::Fail`]) when dropping the constraint would
-//! widen what the agent can reach or see: isolation from ambient
+//! widen what the agent can reach or see, or exceed spend the caller
+//! authorized: isolation from ambient
 //! configuration, credential isolation, the filesystem/network sandbox,
 //! the scoped MCP endpoint list, and the allowed-tool grant. Each of
 //! those is the whole of some boundary. An agent handed the operator
@@ -25,17 +26,81 @@
 //! because a claimed sandbox was actually a permission prompt has done
 //! the thing the sandbox existed to prevent.
 //!
-//! **Warn** ([`Severity::Warn`]) when dropping the constraint costs
-//! accuracy or money but not authority: an effort level the backend
-//! does not have, a ceiling on provider-internal turns it does not
-//! count, a model name it will substitute. These degrade a run; they do
-//! not unbox it.
+//! **Warn** ([`Severity::Warn`]) when dropping the constraint only
+//! degrades a run: an effort level the backend does not have or a
+//! ceiling on provider-internal turns it does not count. A per-turn
+//! provider-work ceiling is different: it is explicit authorization to
+//! spend no further than that boundary, so dropping it fails even
+//! though [`Constraint::security`] correctly says it is not security.
 //!
-//! The rule is [`Constraint::security`], and it is a method rather than
-//! a comment so that adding a constraint forces the question.
+//! The authority rule is [`Constraint::security`], and
+//! [`Constraint::severity`] names the additional spend boundary.
+
+use serde::{Deserialize, Serialize};
 
 use crate::intent::TurnIntent;
 use crate::provider::ProviderKey;
+
+/// The stable name and semantics of the units a provider enforces.
+///
+/// This is deliberately an opaque persisted string rather than an enum. A
+/// provider upgrade can introduce a genuinely different meter without making
+/// old ledger rows unreadable; exact equality is the restart fence that keeps
+/// a queued turn from silently changing units before it runs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MeterId(String);
+
+impl MeterId {
+    /// A stable meter identifier owned by an adapter.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The persisted identifier.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Where a provider observes an enforced ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementGranularity {
+    /// The provider will not knowingly cross the configured value.
+    Exact,
+    /// The provider checks after complete model responses. Responses already
+    /// in flight can cross the configured value before work stops; providers
+    /// with concurrent root/subagent responses can therefore overshoot by
+    /// more than one response.
+    ProviderResponseBoundary,
+}
+
+/// How cached input contributes to a provider-native meter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheTreatment {
+    /// The meter is not token-based, so cache accounting does not apply.
+    NotApplicable,
+    /// Cached input contributes to the meter.
+    Included,
+    /// Cached input does not contribute to the meter.
+    Excluded,
+    /// Provider-reported opaque units take precedence; when they are absent,
+    /// the provider's token fallback excludes cached input.
+    ProviderDefinedWithExcludedFallback,
+}
+
+/// One enforceable provider-native ceiling, including its unit semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CeilingCapability {
+    /// Stable identifier for the provider-native unit.
+    pub meter: MeterId,
+    /// When enforcement observes the counter.
+    pub granularity: EnforcementGranularity,
+    /// Whether cached input contributes to the counter.
+    pub cache_treatment: CacheTreatment,
+}
 
 /// One thing a [`TurnIntent`] can ask for that a provider might not
 /// have.
@@ -61,6 +126,8 @@ pub enum Constraint {
     ClientAssignedResume,
     /// A ceiling on provider-internal turns.
     MaxProviderTurns,
+    /// An enforceable ceiling on provider work for this turn.
+    TurnCeiling,
     /// An effort level.
     Effort,
 }
@@ -69,9 +136,11 @@ impl Constraint {
     /// Whether dropping this constraint would widen what the agent can
     /// reach, see, or spend credentials on.
     ///
-    /// Security constraints fail the turn; the rest warn. Kept as code
-    /// so that a new variant cannot be added without answering the
-    /// question, which a doc comment would have let slide.
+    /// Security constraints fail the turn. Non-security constraints usually
+    /// warn; [`Constraint::TurnCeiling`] is the explicit spend-boundary
+    /// exception in [`Self::severity`]. Kept as code so that a new variant
+    /// cannot be added without answering the authority question, which a doc
+    /// comment would have let slide.
     pub fn security(&self) -> bool {
         match self {
             Constraint::Isolation
@@ -85,16 +154,20 @@ impl Constraint {
             // later, which is where ciacola started.
             Constraint::ClientAssignedResume
             | Constraint::MaxProviderTurns
+            | Constraint::TurnCeiling
             | Constraint::Effort => false,
         }
     }
 
     /// How to react to this constraint going unhonoured.
     pub fn severity(&self) -> Severity {
-        if self.security() {
-            Severity::Fail
-        } else {
-            Severity::Warn
+        match self {
+            // This is a spend boundary rather than an authority boundary, but
+            // silently dropping it would still run work the caller explicitly
+            // refused to authorize.
+            Constraint::TurnCeiling => Severity::Fail,
+            constraint if constraint.security() => Severity::Fail,
+            _ => Severity::Warn,
         }
     }
 }
@@ -102,8 +175,8 @@ impl Constraint {
 /// What to do about a constraint the provider cannot honour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
-    /// Refuse the turn. Running it would silently grant more than was
-    /// asked for.
+    /// Refuse the turn. Running it would silently grant more authority or
+    /// provider spend than was authorized.
     Fail,
     /// Say so on the way past. The run is worse than asked for, not
     /// wider.
@@ -176,6 +249,11 @@ pub struct Capabilities {
     pub allowed_tools: bool,
     /// Takes a ceiling on provider-internal turns.
     pub max_provider_turns: bool,
+    /// The provider-native per-turn ceiling this exact adapter/runtime can
+    /// enforce. `None` means it must not accept a [`TurnCeiling`].
+    ///
+    /// [`TurnCeiling`]: crate::intent::TurnCeiling
+    pub turn_ceiling: Option<CeilingCapability>,
     /// Takes an effort level.
     pub effort: bool,
     /// Reports money. `false` is the reason [`Cost::NotPriced`] exists:
@@ -204,6 +282,7 @@ impl Capabilities {
             strict_mcp: false,
             allowed_tools: false,
             max_provider_turns: false,
+            turn_ceiling: None,
             effort: false,
             reports_cost: false,
             reports_token_usage: false,
@@ -302,6 +381,23 @@ impl Capabilities {
                 format!("provider '{who}' takes no ceiling on internal turns"),
             );
         }
+        if let Some(requested) = &intent.turn_ceiling {
+            match &self.turn_ceiling {
+                None => miss(
+                    Constraint::TurnCeiling,
+                    format!("provider '{who}' cannot enforce a per-turn ceiling with this runtime"),
+                ),
+                Some(available) if available != &requested.capability => miss(
+                    Constraint::TurnCeiling,
+                    format!(
+                        "provider '{who}' now advertises ceiling capability '{}' but this turn was admitted with capability '{}'; meter granularity or cache semantics drifted, so execution is refused before launch",
+                        available.meter.as_str(),
+                        requested.capability.meter.as_str()
+                    ),
+                ),
+                Some(_) => {}
+            }
+        }
         if intent.effort.is_some() && !self.effort {
             miss(
                 Constraint::Effort,
@@ -345,6 +441,14 @@ mod tests {
         }
     }
 
+    /// A provider-work ceiling is a blocking spend boundary without
+    /// being mislabeled as an authority/security boundary.
+    #[test]
+    fn a_turn_ceiling_fails_but_is_not_security() {
+        assert!(!Constraint::TurnCeiling.security());
+        assert_eq!(Constraint::TurnCeiling.severity(), Severity::Fail);
+    }
+
     /// A turn asking to be sealed off must not run wide open just
     /// because the backend cannot seal it.
     #[test]
@@ -363,6 +467,41 @@ mod tests {
     fn inheriting_ambient_config_is_not_an_unsupported_request() {
         let intent = TurnIntent::new("go");
         assert!(poor().validate(&intent).unsupported.is_empty());
+    }
+
+    #[test]
+    fn a_ceiling_requires_the_exact_admitted_capability() {
+        let weighted = CeilingCapability {
+            meter: MeterId::new("codex.weighted.v1"),
+            granularity: EnforcementGranularity::ProviderResponseBoundary,
+            cache_treatment: CacheTreatment::Excluded,
+        };
+        let provider_units = CeilingCapability {
+            meter: MeterId::new("codex.provider-units.v1"),
+            granularity: EnforcementGranularity::ProviderResponseBoundary,
+            cache_treatment: CacheTreatment::ProviderDefinedWithExcludedFallback,
+        };
+        let mut intent = TurnIntent::new("go");
+        intent.turn_ceiling = Some(crate::TurnCeiling {
+            capability: weighted.clone(),
+            limit: 10_000,
+        });
+
+        assert_eq!(
+            poor().validate(&intent).blocking().map(|u| u.constraint),
+            Some(Constraint::TurnCeiling)
+        );
+
+        let mut exact = poor();
+        exact.turn_ceiling = Some(weighted);
+        assert!(exact.validate(&intent).blocking().is_none());
+
+        let mut drifted = poor();
+        drifted.turn_ceiling = Some(provider_units);
+        assert_eq!(
+            drifted.validate(&intent).blocking().map(|u| u.constraint),
+            Some(Constraint::TurnCeiling)
+        );
     }
 
     /// Inheriting the provider's tool policy and explicitly granting no
@@ -430,10 +569,11 @@ mod tests {
         );
     }
 
-    /// Effort and turn ceilings degrade the run without widening it, so
-    /// they are said out loud and the turn proceeds.
+    /// Effort and internal-turn hints degrade the run without widening an
+    /// authority or spend boundary, so they are said out loud and the turn
+    /// proceeds.
     #[test]
-    fn missing_effort_and_turn_ceilings_only_warn() {
+    fn missing_effort_and_internal_turn_hints_only_warn() {
         let mut intent = TurnIntent::new("go");
         intent.effort = Some(Effort::High);
         intent.max_provider_turns = Some(40);

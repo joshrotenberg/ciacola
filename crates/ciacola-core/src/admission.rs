@@ -15,7 +15,7 @@ use crate::ledger::Ledger;
 use crate::limits::{
     AdmissionAccounting, AdmissionOverride, AdmissionOverrideKind, AdmissionReport, AdmissionState,
     GlobalAdmissionStatus, Limits, ProviderAccounting, ProviderAdmissionStatus,
-    ROLLING_WINDOW_SECS,
+    ROLLING_WINDOW_SECS, TurnProtectionOverride, TurnProtectionSnapshot, TurnProtectionStatus,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -34,7 +34,8 @@ pub(crate) enum AdmissionDecision {
         seq: i64,
         status: Box<ProviderAdmissionStatus>,
         global: GlobalAdmissionStatus,
-        admission_override: Option<AdmissionOverride>,
+        admission_override: Option<Box<AdmissionOverride>>,
+        turn_protection_override: Option<TurnProtectionOverride>,
     },
     Busy {
         reason: String,
@@ -56,6 +57,10 @@ pub(crate) enum AdmissionDecision {
         provider: String,
         detail: String,
     },
+    ProtectionUnavailable {
+        provider: String,
+        detail: String,
+    },
 }
 
 impl Ledger {
@@ -72,7 +77,9 @@ impl Ledger {
         let active_agents = load_active_agent_counts(self.pool()).await?;
         let rows = load_window_rows(self.pool(), checked_unix - ROLLING_WINDOW_SECS).await?;
         let accounting = self.accounting_from_rows(checked_unix, rows, active_agents)?;
-        Ok(limits.evaluate(&accounting))
+        let mut report = limits.evaluate(&accounting);
+        self.resolve_turn_protection(&mut report)?;
+        Ok(report)
     }
 
     /// Decide and enqueue under one SQLite writer lock.
@@ -117,14 +124,16 @@ impl Ledger {
 
         let definition: AgentDef = serde_json::from_str(&definition)?;
         let provider = definition.provider.as_str().to_string();
-        self.providers()
+        let selected_provider = self
+            .providers()
             .get(&definition.provider)
             .map_err(|error| -> FlatError { error.to_string().into() })?;
 
         let active_agents = load_active_agent_counts(&mut *tx).await?;
         let rows = load_window_rows(&mut *tx, checked_unix - ROLLING_WINDOW_SECS).await?;
         let accounting = self.accounting_from_rows(checked_unix, rows, active_agents)?;
-        let report = limits.evaluate(&accounting);
+        let mut report = limits.evaluate(&accounting);
+        self.resolve_turn_protection(&mut report)?;
         let status = report
             .providers
             .iter()
@@ -151,6 +160,57 @@ impl Ledger {
                 limit_tokens: stop,
             });
         }
+
+        // Resolve and freeze the per-turn protection only after every known
+        // rolling stop. A supervised reason can acknowledge unavailable
+        // protection, but it can never cross a stop whose reached value is
+        // known.
+        let configured_ceiling = limits.provider(&provider).per_turn_ceiling;
+        let ceiling_capability = selected_provider.capabilities().turn_ceiling.clone();
+        let (turn_protection, turn_protection_override) = match (
+            configured_ceiling,
+            ceiling_capability,
+        ) {
+            (None, _) => (TurnProtectionSnapshot::unbounded(provider.clone()), None),
+            (Some(limit), Some(capability)) => (
+                TurnProtectionSnapshot::enforced(provider.clone(), limit, capability),
+                None,
+            ),
+            (Some(limit), None) => match authority {
+                AdmissionAuthority::Automatic => {
+                    tx.rollback().await?;
+                    return Ok(AdmissionDecision::ProtectionUnavailable {
+                        provider,
+                        detail: format!(
+                            "per-turn ceiling {limit} is configured, but the provider cannot enforce it; automatic work is refused"
+                        ),
+                    });
+                }
+                AdmissionAuthority::Supervised { reason } => {
+                    let reason = reason.trim();
+                    if reason.is_empty() {
+                        tx.rollback().await?;
+                        return Err(
+                            "a supervised unavailable-protection override requires a non-empty reason"
+                                .into(),
+                        );
+                    }
+                    let audit = TurnProtectionOverride {
+                        reason: reason.to_string(),
+                        source: source.to_string(),
+                        checked_unix,
+                    };
+                    (
+                        TurnProtectionSnapshot::override_unavailable(
+                            provider.clone(),
+                            limit,
+                            audit.clone(),
+                        ),
+                        Some(audit),
+                    )
+                }
+            },
+        };
 
         let admission_override = match status.state {
             AdmissionState::Unobservable | AdmissionState::Unguarded => match authority {
@@ -203,12 +263,14 @@ impl Ledger {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let turn_protection_json = serde_json::to_string(&turn_protection)?;
         let row: Option<(i64,)> = sqlx::query_as(
             "INSERT INTO turns
-                 (agent_id, seq, prompt, state, at_unix, provider, admission_override)
+                 (agent_id, seq, prompt, state, at_unix, provider, admission_override,
+                  turn_protection_state, turn_protection, failure_kind)
              SELECT ?1,
                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE agent_id = ?1),
-                    ?2, 'queued', ?3, ?4, ?5
+                    ?2, 'queued', ?3, ?4, ?5, ?6, ?7, 'none'
               WHERE EXISTS (SELECT 1 FROM agents WHERE agent_id = ?1 AND retired = 0)
                 AND NOT EXISTS (SELECT 1 FROM turns
                                 WHERE agent_id = ?1 AND state IN ('queued', 'running'))
@@ -219,6 +281,8 @@ impl Ledger {
         .bind(checked_unix)
         .bind(&provider)
         .bind(override_json)
+        .bind(turn_protection.state.as_str())
+        .bind(turn_protection_json)
         .fetch_optional(&mut *tx)
         .await?;
         let Some((seq,)) = row else {
@@ -232,7 +296,8 @@ impl Ledger {
             seq,
             status: Box::new(status),
             global: report.global,
-            admission_override,
+            admission_override: admission_override.map(Box::new),
+            turn_protection_override,
         })
     }
 
@@ -348,6 +413,40 @@ impl Ledger {
             providers,
         })
     }
+
+    fn resolve_turn_protection(&self, report: &mut AdmissionReport) -> Result<(), FlatError> {
+        for status in &mut report.providers {
+            let key = ciacola_agent::ProviderKey::new(status.accounting.provider.clone());
+            let capability = self
+                .providers()
+                .get(&key)
+                .ok()
+                .and_then(|provider| provider.capabilities().turn_ceiling.clone());
+            if status.per_turn_ceiling.is_none() {
+                status.turn_protection = TurnProtectionStatus::Unbounded;
+                // Showing available semantics even while unbounded makes the
+                // absence of policy legible without pretending the provider
+                // lacks a meter.
+                status.turn_ceiling_capability = capability;
+                status.automatic_allowed = status.state.automatic_allowed();
+                continue;
+            }
+            status.turn_protection = if capability.is_some() {
+                TurnProtectionStatus::Enforced
+            } else {
+                TurnProtectionStatus::Unavailable
+            };
+            status.turn_ceiling_capability = capability;
+            status.automatic_allowed = status.state.automatic_allowed()
+                && status.turn_protection == TurnProtectionStatus::Enforced;
+            if status.turn_protection == TurnProtectionStatus::Unavailable {
+                status.detail.get_or_insert_with(|| {
+                    "a per-turn ceiling is configured but this provider cannot enforce it".into()
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -452,6 +551,7 @@ mod tests {
         key: &'static str,
         reports_cost: bool,
         reports_usage: bool,
+        turn_ceiling: Option<ciacola_agent::CeilingCapability>,
     }
 
     impl Provider for FakeProvider {
@@ -463,6 +563,7 @@ mod tests {
             let mut capabilities = Capabilities::none(self.key());
             capabilities.reports_cost = self.reports_cost;
             capabilities.reports_token_usage = self.reports_usage;
+            capabilities.turn_ceiling = self.turn_ceiling.clone();
             capabilities
         }
 
@@ -485,12 +586,14 @@ mod tests {
                 key: "claude",
                 reports_cost: true,
                 reports_usage: true,
+                turn_ceiling: None,
             }))
             .and_then(|registry| {
                 registry.with(Arc::new(FakeProvider {
                     key: "codex",
                     reports_cost: false,
                     reports_usage: true,
+                    turn_ceiling: None,
                 }))
             })
             .expect("providers")
@@ -506,6 +609,49 @@ mod tests {
             .with_providers(providers())
     }
 
+    fn ceiling_capability(meter: &str) -> ciacola_agent::CeilingCapability {
+        ciacola_agent::CeilingCapability {
+            meter: ciacola_agent::MeterId::new(meter),
+            granularity: ciacola_agent::EnforcementGranularity::ProviderResponseBoundary,
+            cache_treatment: ciacola_agent::CacheTreatment::ProviderDefinedWithExcludedFallback,
+        }
+    }
+
+    async fn ledger_with_codex_ceiling(
+        capability: Option<ciacola_agent::CeilingCapability>,
+    ) -> Ledger {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let registry = ProviderRegistry::new()
+            .with(Arc::new(FakeProvider {
+                key: "codex",
+                reports_cost: false,
+                reports_usage: true,
+                turn_ceiling: capability,
+            }))
+            .expect("provider");
+        Ledger::setup(pool)
+            .await
+            .expect("ledger")
+            .with_providers(registry)
+    }
+
+    fn per_turn_limits(ceiling: u64) -> Limits {
+        Limits {
+            providers: [(
+                "codex".into(),
+                crate::limits::ProviderLimits {
+                    daily_stop_tokens: Some(1_000_000),
+                    per_turn_ceiling: Some(ceiling),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        }
+    }
+
     fn codex_limits(stop: u64) -> Limits {
         Limits {
             providers: [(
@@ -518,6 +664,141 @@ mod tests {
             .into(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn per_turn_protection_is_resolved_and_persisted_in_the_admission_transaction() {
+        let capability = ceiling_capability("codex_rollout_units_v1");
+        let ledger = ledger_with_codex_ceiling(Some(capability.clone())).await;
+        let agent = ledger
+            .create_agent(&AgentDef::new("codex", "s").provider("codex"), None)
+            .await
+            .expect("agent");
+        let decision = ledger
+            .admit_turn(
+                &per_turn_limits(321),
+                AdmissionAuthority::Automatic,
+                &agent,
+                "work",
+                "test",
+            )
+            .await
+            .expect("decision");
+        let AdmissionDecision::Admitted { seq, status, .. } = decision else {
+            panic!("expected admission")
+        };
+        assert_eq!(status.turn_protection, TurnProtectionStatus::Enforced);
+        assert_eq!(status.turn_ceiling_capability, Some(capability.clone()));
+        assert!(status.automatic_allowed);
+
+        let row = ledger.get_turn(&agent, seq).await.unwrap().unwrap();
+        assert_eq!(row.turn_protection_state, "enforced");
+        assert_eq!(row.failure_kind, "none");
+        let snapshot: TurnProtectionSnapshot =
+            serde_json::from_str(row.turn_protection.as_deref().expect("snapshot")).unwrap();
+        assert_eq!(snapshot.configured_limit, Some(321));
+        assert_eq!(snapshot.capability, Some(capability));
+        assert!(snapshot.unavailable_override.is_none());
+    }
+
+    #[tokio::test]
+    async fn unavailable_protection_blocks_automatic_without_a_row_and_supervised_audits_both_gaps()
+    {
+        let ledger = ledger_with_codex_ceiling(None).await;
+        let agent = ledger
+            .create_agent(&AgentDef::new("codex", "s").provider("codex"), None)
+            .await
+            .expect("agent");
+        let automatic = ledger
+            .admit_turn(
+                &per_turn_limits(123),
+                AdmissionAuthority::Automatic,
+                &agent,
+                "automatic",
+                "schedule",
+            )
+            .await
+            .expect("decision");
+        assert!(matches!(
+            automatic,
+            AdmissionDecision::ProtectionUnavailable { .. }
+        ));
+        assert!(ledger.conversation(&agent).await.unwrap().is_empty());
+
+        // Remove the rolling token stop too: this one supervised request
+        // acknowledges both the old rolling unguarded state and the separate
+        // unavailable per-turn protection, each in its own durable audit.
+        let limits = Limits {
+            providers: [(
+                "codex".into(),
+                crate::limits::ProviderLimits {
+                    per_turn_ceiling: Some(123),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let supervised = ledger
+            .admit_turn(
+                &limits,
+                AdmissionAuthority::Supervised {
+                    reason: "operator accepted both gaps",
+                },
+                &agent,
+                "supervised",
+                "send_supervised",
+            )
+            .await
+            .expect("decision");
+        let AdmissionDecision::Admitted {
+            seq,
+            admission_override: Some(rolling),
+            turn_protection_override: Some(protection),
+            ..
+        } = supervised
+        else {
+            panic!("expected both audits")
+        };
+        assert_eq!(rolling.reason, "operator accepted both gaps");
+        assert_eq!(protection.reason, "operator accepted both gaps");
+        let row = ledger.get_turn(&agent, seq).await.unwrap().unwrap();
+        assert_eq!(row.turn_protection_state, "override_unavailable");
+        let snapshot: TurnProtectionSnapshot =
+            serde_json::from_str(row.turn_protection.as_deref().expect("snapshot")).unwrap();
+        assert_eq!(snapshot.unavailable_override, Some(protection));
+        assert!(row.admission_override.is_some());
+    }
+
+    #[tokio::test]
+    async fn no_configured_ceiling_is_explicitly_unbounded() {
+        let ledger = ledger().await;
+        let agent = ledger
+            .create_agent(&AgentDef::new("claude", "s"), None)
+            .await
+            .expect("agent");
+        let decision = ledger
+            .admit_turn(
+                &Limits::default(),
+                AdmissionAuthority::Automatic,
+                &agent,
+                "work",
+                "test",
+            )
+            .await
+            .expect("decision");
+        let AdmissionDecision::Admitted { seq, status, .. } = decision else {
+            panic!("expected admission")
+        };
+        assert_eq!(status.turn_protection, TurnProtectionStatus::Unbounded);
+        let row = ledger.get_turn(&agent, seq).await.unwrap().unwrap();
+        assert_eq!(row.turn_protection_state, "unbounded");
+        let snapshot: TurnProtectionSnapshot =
+            serde_json::from_str(row.turn_protection.as_deref().expect("snapshot")).unwrap();
+        assert_eq!(
+            snapshot.state,
+            crate::limits::TurnProtectionState::Unbounded
+        );
     }
 
     #[tokio::test]
@@ -594,6 +875,7 @@ mod tests {
             provider_turns: None,
             elapsed_ms: 1,
             error: None,
+            failure_kind: None,
         };
         assert!(
             ledger
@@ -602,9 +884,15 @@ mod tests {
                 .expect("complete")
         );
 
+        let mut limits = codex_limits(100);
+        limits
+            .providers
+            .get_mut("codex")
+            .expect("codex limits")
+            .per_turn_ceiling = Some(7);
         let decision = ledger
             .admit_turn(
-                &codex_limits(100),
+                &limits,
                 AdmissionAuthority::Supervised {
                     reason: "cannot bypass",
                 },
@@ -650,6 +938,7 @@ mod tests {
             provider_turns: None,
             elapsed_ms: 1,
             error: Some("failed".into()),
+            failure_kind: Some(ciacola_agent::FailureKind::Reported),
         };
         assert!(
             missing_ledger
@@ -721,6 +1010,7 @@ mod tests {
             provider_turns: None,
             elapsed_ms: 1,
             error: Some("timed out".into()),
+            failure_kind: Some(ciacola_agent::FailureKind::Reported),
         };
         assert!(
             ledger
@@ -765,6 +1055,7 @@ mod tests {
             provider_turns: None,
             elapsed_ms: 1,
             error: Some("provider failure".into()),
+            failure_kind: Some(ciacola_agent::FailureKind::Reported),
         };
         assert!(
             ledger

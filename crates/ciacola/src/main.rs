@@ -137,6 +137,54 @@ fn publish_loopback_config(path: &Path, contents: &str) -> std::io::Result<()> {
         .map_err(|error| error.error)
 }
 
+fn provider_protection_summary(
+    configured: Option<u64>,
+    capability: Option<&ciacola_agent::CeilingCapability>,
+) -> String {
+    let capability_detail = |capability: &ciacola_agent::CeilingCapability| {
+        let cache = match capability.cache_treatment {
+            ciacola_agent::CacheTreatment::NotApplicable => "cache not applicable",
+            ciacola_agent::CacheTreatment::Included => "cached input included",
+            ciacola_agent::CacheTreatment::Excluded => "cached input excluded",
+            ciacola_agent::CacheTreatment::ProviderDefinedWithExcludedFallback => {
+                "provider-defined units; fallback excludes cached input"
+            }
+        };
+        let boundary = match capability.granularity {
+            ciacola_agent::EnforcementGranularity::Exact => "exact enforcement",
+            ciacola_agent::EnforcementGranularity::ProviderResponseBoundary => {
+                "response-boundary enforcement; in-flight work can overshoot"
+            }
+        };
+        format!("meter {}; {cache}; {boundary}", capability.meter.as_str())
+    };
+    let amount = |value: u64, capability: &ciacola_agent::CeilingCapability| {
+        if capability.meter.as_str().contains("micro_usd") {
+            format!("${:.4} ({value} micro-USD)", value as f64 / 1e6)
+        } else {
+            value.to_string()
+        }
+    };
+
+    match (configured, capability) {
+        (Some(value), Some(capability)) => format!(
+            "ENFORCED at {}; {}",
+            amount(value, capability),
+            capability_detail(capability)
+        ),
+        (Some(value), None) => format!(
+            "UNSUPPORTED: configured at {value} provider-native units; automatic work will be refused"
+        ),
+        (None, Some(capability)) => format!(
+            "UNBOUNDED: no ceiling configured; runtime supports {}",
+            capability_detail(capability)
+        ),
+        (None, None) => {
+            "UNBOUNDED: no ceiling configured; runtime declares no enforceable ceiling".into()
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Consume the human HTTP credential before Tokio creates worker threads
     // and before any provider child can inherit the server environment.
@@ -211,10 +259,13 @@ async fn run(
     // this registry and never learns what is behind it. A second
     // adapter is one more line here plus one more dependency, which is
     // the whole point of the seam.
-    let codex_provider = ciacola_agent_codex::CodexProvider::new();
-    match codex_provider.cli_version_status().await {
-        Ok(status) => eprintln!("[ciacola] codex CLI: {status:?}"),
-        Err(error) => eprintln!("[ciacola] warning: Codex provider unavailable: {error}"),
+    let mut codex_provider = ciacola_agent_codex::CodexProvider::new();
+    match codex_provider.detect_cli_capabilities().await {
+        Ok((version, status)) => eprintln!("[ciacola] codex CLI {version}: {status:?}"),
+        Err(error) => eprintln!(
+            "[ciacola] warning: Codex CLI probe failed: {error}; provider remains registered, \
+             but configured per-turn protection is unsupported"
+        ),
     }
     let providers = ciacola_agent::ProviderRegistry::new()
         .with(std::sync::Arc::new(ciacola_agent_claude::ClaudeProvider))
@@ -225,6 +276,17 @@ async fn run(
         .get(&declared_early.runtime.default_provider_key())
         .map_err(|error| -> ciacola_core::FlatError { error.to_string().into() })?;
     eprintln!("[ciacola] providers: {}", providers.keys().join(", "));
+    for key in providers.keys() {
+        let provider = providers
+            .get(&ciacola_agent::ProviderKey::new(key.clone()))
+            .map_err(|error| -> ciacola_core::FlatError { error.to_string().into() })?;
+        let capabilities = provider.capabilities();
+        let configured = declared_early.limits.provider(&key).per_turn_ceiling;
+        eprintln!(
+            "[ciacola] provider {key} per-turn protection: {}",
+            provider_protection_summary(configured, capabilities.turn_ceiling.as_ref())
+        );
+    }
 
     let ledger = Ledger::setup(pool.clone())
         .await?
@@ -572,6 +634,59 @@ mod tests {
             database.path,
             Path::new("/home/example/.local/share/ciacola/ciacola.db")
         );
+    }
+
+    fn protection_capability(
+        meter: &str,
+        cache_treatment: ciacola_agent::CacheTreatment,
+    ) -> ciacola_agent::CeilingCapability {
+        ciacola_agent::CeilingCapability {
+            meter: ciacola_agent::MeterId::new(meter),
+            granularity: ciacola_agent::EnforcementGranularity::ProviderResponseBoundary,
+            cache_treatment,
+        }
+    }
+
+    #[test]
+    fn startup_summary_distinguishes_unbounded_unsupported_and_enforced() {
+        let codex = protection_capability(
+            ciacola_agent_codex::WEIGHTED_ROLLOUT_METER,
+            ciacola_agent::CacheTreatment::Excluded,
+        );
+        let unbounded = provider_protection_summary(None, Some(&codex));
+        assert!(unbounded.contains("UNBOUNDED"), "{unbounded}");
+        assert!(
+            unbounded.contains(ciacola_agent_codex::WEIGHTED_ROLLOUT_METER),
+            "{unbounded}"
+        );
+        assert!(unbounded.contains("cached input excluded"), "{unbounded}");
+        assert!(
+            unbounded.contains("in-flight work can overshoot"),
+            "{unbounded}"
+        );
+
+        let unsupported = provider_protection_summary(Some(250_000), None);
+        assert!(unsupported.contains("UNSUPPORTED"), "{unsupported}");
+        assert!(
+            unsupported.contains("automatic work will be refused"),
+            "{unsupported}"
+        );
+
+        let enforced = provider_protection_summary(Some(250_000), Some(&codex));
+        assert!(enforced.contains("ENFORCED"), "{enforced}");
+        assert!(enforced.contains("250000"), "{enforced}");
+    }
+
+    #[test]
+    fn startup_summary_renders_claude_ceiling_as_micro_usd() {
+        let claude = protection_capability(
+            ciacola_agent_claude::MAX_BUDGET_MICRO_USD_METER,
+            ciacola_agent::CacheTreatment::NotApplicable,
+        );
+        let summary = provider_protection_summary(Some(2_000_000), Some(&claude));
+        assert!(summary.contains("$2.0000"), "{summary}");
+        assert!(summary.contains("2000000 micro-USD"), "{summary}");
+        assert!(summary.contains("cache not applicable"), "{summary}");
     }
 
     #[test]

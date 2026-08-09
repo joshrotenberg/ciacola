@@ -136,10 +136,12 @@ fn submission_result(agent_id: &str, outcome: crate::plugin::Submission) -> Call
         Submission::Submitted {
             seq,
             admission_override,
+            turn_protection_override,
         } => CallToolResult::json(json!({
             "agent_id": agent_id,
             "seq": seq,
             "admission_override": admission_override,
+            "turn_protection_override": turn_protection_override,
         })),
         Submission::Busy { reason } => CallToolResult::error(reason),
         Submission::OverBudget {
@@ -161,6 +163,9 @@ fn submission_result(agent_id: &str, outcome: crate::plugin::Submission) -> Call
         )),
         Submission::Unguarded { provider, reason } => CallToolResult::error(format!(
             "{provider} automatic work is unguarded: {reason}. Configure [limits.providers.{provider}].daily_stop_tokens, or use send_supervised from interactive stdio or authenticated human HTTP with a reason for a one-off run."
+        )),
+        Submission::ProtectionUnavailable { provider, reason } => CallToolResult::error(format!(
+            "{provider} per-turn protection is unavailable: {reason}. Automatic work fails closed; use send_supervised from interactive stdio or authenticated human HTTP with a reason for a one-off run."
         )),
         Submission::Failed { reason } => CallToolResult::error(reason),
     }
@@ -214,6 +219,13 @@ fn turn_json(turn: &TurnRow) -> serde_json::Value {
             })
         })
     });
+    let turn_protection = turn.turn_protection.as_deref().map(|raw| {
+        serde_json::from_str(raw).unwrap_or_else(|_| {
+            json!({
+                "invalid_persisted_json": raw,
+            })
+        })
+    });
     json!({
         "agent_id": turn.agent_id,
         "seq": turn.seq,
@@ -235,6 +247,10 @@ fn turn_json(turn: &TurnRow) -> serde_json::Value {
         "claimed_unix_ms": turn.claimed_unix_ms,
         "settled_unix": turn.settled_unix,
         "admission_override": admission_override,
+        "turn_protection_state": turn.turn_protection_state,
+        "turn_protection": turn_protection,
+        "failure_kind": turn.failure_kind,
+        "provider_session": turn.provider_session,
     })
 }
 
@@ -813,6 +829,13 @@ mod telemetry_serialization_tests {
             provider: "claude".into(),
             settled_unix: Some(1),
             admission_override: None,
+            turn_protection_state: "unbounded".into(),
+            turn_protection: Some(
+                serde_json::to_string(&crate::limits::TurnProtectionSnapshot::unbounded("claude"))
+                    .expect("snapshot"),
+            ),
+            failure_kind: "reported".into(),
+            provider_session: None,
         }
     }
 

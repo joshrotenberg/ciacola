@@ -173,6 +173,16 @@ async fn receive(
                 format!("{provider} automatic admission refused: {reason}\n"),
             )
         }
+        ciacola_core::plugin::Submission::ProtectionUnavailable { provider, reason } => {
+            stats.rejects += 1;
+            stats.last_detail = Some(format!(
+                "{provider} per-turn protection unavailable: {reason}"
+            ));
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("{provider} per-turn protection unavailable: {reason}\n"),
+            )
+        }
         ciacola_core::plugin::Submission::Failed { reason } => {
             stats.rejects += 1;
             stats.last_detail = Some(format!("rejected: {reason}"));

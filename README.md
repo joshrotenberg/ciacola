@@ -76,6 +76,16 @@ real token usage, but not a monetary price, so the ledger records those turns
 as unpriced rather than inventing a dollar value. See `ciacola.example.toml`
 for the complete configuration surface.
 
+The same rule applies to per-turn ceilings: the contract is shared, but the
+unit is provider-native and versioned. Claude enforces micro-USD through its
+native maximum-budget setting. Supported Codex CLIs enforce native rollout
+units; depending on the CLI version, those are either weighted non-cached
+input plus output or provider-supplied rollout units with that calculation as
+a fallback. Neither adapter claims an exact portable-token boundary. Both
+providers observe the ceiling at response boundaries, so work already in
+flight can cross the configured value. Codex root and subagent responses may
+be concurrent, so this is not an upper bound of exactly one response.
+
 ## Running it
 
 For a durable server, copy the annotated config and start it:
@@ -133,18 +143,42 @@ shared between provider processes and is tracked separately.
 ledger defaults to `$XDG_DATA_HOME/ciacola/ciacola.db`, or to
 `$HOME/.local/share/ciacola/ciacola.db` when `XDG_DATA_HOME` is unset.
 Set `CIACOLA_DB` to override it. The resolved path is printed at startup.
-Before adding schedules, configure an admission stop the selected backend can
-actually report. Priced providers use `daily_stop_usd`; unpriced providers
-such as Codex need `[limits.providers.codex].daily_stop_tokens`. The rolling
-token total is input + output, with cached input already included in input.
-USD and token stops are independent, and Ciacola carries no provider price
-table. An interactive one-off run can acknowledge missing coverage with
-`send_supervised` plus a persisted reason, but no override crosses a known
-stop. Admission is not a reservation: a turn already admitted can finish
-over the threshold, and concurrent turns multiply that exposure. Per-turn
-provider ceilings are tracked in [issue #78](https://github.com/joshrotenberg/ciacola/issues/78).
-See `ciacola.example.toml` for the annotated settings and
-`HANDOFF.md` for deeper design context.
+Before adding schedules, configure both limit planes for the selected
+backend:
+
+- The rolling 24-hour admission breakers decide whether another turn may be
+  queued. Priced providers use `daily_stop_usd`; unpriced providers such as
+  Codex also need `[limits.providers.codex].daily_stop_tokens`. The rolling
+  token total is reported input + output, with cached input already included
+  in input. USD and token stops are independent, and Ciacola carries no
+  provider price table.
+- `[limits.providers.<provider>].per_turn_ceiling` bounds each admitted
+  provider execution in the provider's declared unit. The effective value,
+  meter, cache treatment, and enforcement granularity are copied onto the
+  queued turn before dispatch. Recovery and config changes therefore cannot
+  silently widen it, and the same ceiling is reapplied whether the turn opens
+  or resumes a provider conversation.
+
+Omitting `per_turn_ceiling` is an explicit unbounded default: it does not
+block automatic work that otherwise passes admission, and the board labels it
+`UNBOUNDED`. Configuring a ceiling that the detected provider/CLI cannot honor
+labels it `UNSUPPORTED` and refuses automatic work before provider side
+effects. A human may use `send_supervised` with a persisted reason to override
+only that unavailable protection (or incomplete rolling telemetry); no
+override crosses a known rolling stop.
+
+The two planes solve different problems. Admission is not a reservation: an
+already-admitted turn can finish beyond the rolling threshold, and concurrent
+turns multiply that exposure. A per-turn ceiling narrows one execution, but a
+response-boundary provider can still overshoot through work already in flight;
+Codex root/subagent concurrency can multiply that soft-boundary overshoot, and
+concurrent Ciacola turns each receive their own ceiling. Codex budget failures
+currently omit a terminal usage object
+([openai/codex#37676](https://github.com/openai/codex/issues/37676)), so Ciacola
+records usage as unreported—or preserves an earlier partial snapshot—rather
+than inventing a measurement. See
+`ciacola.example.toml` for the annotated settings and `HANDOFF.md` for deeper
+design context.
 
 Ciacola is a single-operator, laptop-local product, not a multi-tenant
 security boundary. The loopback listener and bearer checks reject callers

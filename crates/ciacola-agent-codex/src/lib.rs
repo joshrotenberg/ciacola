@@ -6,6 +6,11 @@
 //! parity: thread ids are persisted from the live JSONL stream, monetary cost
 //! is always [`ciacola_agent::Cost::NotPriced`], and a Claude-style tool grant
 //! is refused before launch.
+//!
+//! Codex's rollout meter changes semantics across supported CLI versions, so
+//! [`CodexProvider::detect_cli_capabilities`] freezes a version-specific meter
+//! at startup. An unprobed or untested CLI advertises no ceiling enforcement;
+//! it never treats a version-sensitive guess as protection.
 
 #![warn(missing_docs)]
 
@@ -15,13 +20,26 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ciacola_agent::{
-    AgentError, BoxFut, Capabilities, Provider, ProviderKey, ResumeId, TurnEvents, TurnIntent,
-    TurnOutcome,
+    AgentError, BoxFut, CacheTreatment, Capabilities, CeilingCapability, EnforcementGranularity,
+    MeterId, Provider, ProviderKey, ResumeId, TurnEvents, TurnIntent, TurnOutcome,
 };
-use codex_wrapper::{CliVersionStatus, Codex, JsonLineEvent};
+use codex_wrapper::{
+    CliVersion, CliVersionStatus, Codex, JsonLineEvent, TESTED_CLI_VERSION_MAX,
+    TESTED_CLI_VERSION_MIN,
+};
 
 mod command;
 mod outcome;
+
+/// Native meter used by Codex 0.145 and 0.146: generated output plus
+/// non-cached input, with both weights fixed to one by this adapter.
+pub const WEIGHTED_ROLLOUT_METER: &str =
+    "codex.rollout_budget.weighted_non_cached_input_plus_output.v1";
+
+/// Native meter used by Codex 0.147: provider-reported opaque rollout units
+/// when present, otherwise the same weighted non-cached-input fallback.
+pub const PROVIDER_ROLLOUT_METER: &str =
+    "codex.rollout_budget.provider_units_or_weighted_fallback.v1";
 
 /// The Codex backend.
 #[derive(Debug, Clone, Default)]
@@ -29,12 +47,37 @@ pub struct CodexProvider {
     binary: Option<PathBuf>,
     binary_args: Vec<String>,
     timeout: Option<Duration>,
+    turn_ceiling: Option<CeilingCapability>,
 }
 
 impl CodexProvider {
     /// Use the Codex binary discovered on `PATH`.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Detect the installed CLI version once and freeze the matching ceiling
+    /// capability onto this provider object.
+    ///
+    /// Only wrapper-tested CLI versions advertise enforcement. A future or
+    /// older CLI remains usable for uncapped/supervised work, but advertises
+    /// no per-turn ceiling because its meter or config contract may have
+    /// drifted. Call this before inserting the provider into the registry;
+    /// [`Provider::capabilities`] is then a cheap, process-stable declaration.
+    pub async fn detect_cli_capabilities(
+        &mut self,
+    ) -> Result<(CliVersion, CliVersionStatus), AgentError> {
+        // A failed re-probe must fail closed rather than retaining a claim
+        // made by an earlier binary/version.
+        self.turn_ceiling = None;
+        let codex = self.client(None, std::iter::empty())?;
+        let version = codex
+            .cli_version()
+            .await
+            .map_err(|error| outcome::classify_failure(error, Duration::ZERO, &[]))?;
+        let status = version.status_within(&TESTED_CLI_VERSION_MIN, &TESTED_CLI_VERSION_MAX);
+        self.turn_ceiling = capability_for_cli_version(version, status);
+        Ok((version, status))
     }
 
     /// Report whether the installed CLI is inside the wrapper's tested range.
@@ -113,6 +156,7 @@ impl Provider for CodexProvider {
         capabilities.strict_mcp = true;
         capabilities.allowed_tools = false;
         capabilities.max_provider_turns = false;
+        capabilities.turn_ceiling = self.turn_ceiling.clone();
         capabilities.effort = true;
         capabilities.reports_cost = false;
         capabilities.reports_token_usage = true;
@@ -144,6 +188,13 @@ impl CodexProvider {
         intent: &TurnIntent,
         sink: &dyn TurnEvents,
     ) -> Result<TurnOutcome, AgentError> {
+        if let Some(blocking) = self.capabilities().validate(intent).blocking() {
+            return Err(AgentError::Unsupported {
+                provider: self.key(),
+                constraint: blocking.constraint,
+                detail: blocking.detail.clone(),
+            });
+        }
         let prepared = command::build(intent)?;
         let codex = self.client(Some(intent), prepared.env)?;
         let collected = Arc::new(Mutex::new(Vec::<JsonLineEvent>::new()));
@@ -194,6 +245,28 @@ impl CodexProvider {
     }
 }
 
+fn capability_for_cli_version(
+    version: CliVersion,
+    status: CliVersionStatus,
+) -> Option<CeilingCapability> {
+    if !status.is_tested() || version.major != 0 {
+        return None;
+    }
+    let (meter, cache_treatment) = match version.minor {
+        145 | 146 => (WEIGHTED_ROLLOUT_METER, CacheTreatment::Excluded),
+        147 => (
+            PROVIDER_ROLLOUT_METER,
+            CacheTreatment::ProviderDefinedWithExcludedFallback,
+        ),
+        _ => return None,
+    };
+    Some(CeilingCapability {
+        meter: MeterId::new(meter),
+        granularity: EnforcementGranularity::ProviderResponseBoundary,
+        cache_treatment,
+    })
+}
+
 async fn drive_stream<F>(
     stream: F,
     mut resume_rx: tokio::sync::mpsc::UnboundedReceiver<ResumeId>,
@@ -237,6 +310,7 @@ mod tests {
                 .chain(args)
                 .collect(),
             timeout: Some(Duration::from_secs(3)),
+            turn_ceiling: None,
         }
     }
 
@@ -255,6 +329,15 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
+    }
+
+    fn version_fixture(version: &str) -> CodexProvider {
+        CodexProvider {
+            binary: Some(PathBuf::from("/bin/bash")),
+            binary_args: vec!["-c".into(), format!("printf '%s\\n' 'codex-cli {version}'")],
+            timeout: Some(Duration::from_secs(3)),
+            turn_ceiling: None,
+        }
     }
 
     #[derive(Default)]
@@ -296,6 +379,10 @@ mod tests {
         assert!(!capabilities.reports_cost);
         assert!(!capabilities.allowed_tools);
         assert!(!capabilities.client_assigned_resume);
+        assert!(
+            capabilities.turn_ceiling.is_none(),
+            "an unprobed CLI must not claim a version-sensitive meter"
+        );
 
         let mut intent = TurnIntent::new("go");
         intent.allowed_tools = Some(vec!["Read".into()]);
@@ -306,6 +393,90 @@ mod tests {
                 .map(|unsupported| unsupported.constraint),
             Some(Constraint::AllowedTools)
         );
+    }
+
+    #[test]
+    fn tested_cli_versions_are_fenced_by_meter_semantics() {
+        let tested = CliVersionStatus::Tested;
+        let weighted_145 = capability_for_cli_version(CliVersion::new(0, 145, 0), tested)
+            .expect("0.145 is supported");
+        let weighted_146 = capability_for_cli_version(CliVersion::new(0, 146, 9), tested)
+            .expect("0.146 is supported");
+        let provider_147 = capability_for_cli_version(CliVersion::new(0, 147, 0), tested)
+            .expect("0.147 is supported");
+
+        assert_eq!(weighted_145, weighted_146);
+        assert_eq!(weighted_145.meter.as_str(), WEIGHTED_ROLLOUT_METER);
+        assert_eq!(weighted_145.cache_treatment, CacheTreatment::Excluded);
+        assert_eq!(provider_147.meter.as_str(), PROVIDER_ROLLOUT_METER);
+        assert_eq!(
+            provider_147.cache_treatment,
+            CacheTreatment::ProviderDefinedWithExcludedFallback
+        );
+        assert_ne!(weighted_145, provider_147);
+    }
+
+    #[test]
+    fn an_untested_cli_never_advertises_rollout_enforcement() {
+        let newer = CliVersion::new(0, 148, 0);
+        let status = CliVersionStatus::NewerUntested {
+            found: newer,
+            tested_max: TESTED_CLI_VERSION_MAX,
+        };
+        assert_eq!(capability_for_cli_version(newer, status), None);
+    }
+
+    #[tokio::test]
+    async fn startup_detection_freezes_the_tested_meter_on_the_provider() {
+        let mut provider = version_fixture("0.146.2");
+        assert!(provider.capabilities().turn_ceiling.is_none());
+
+        let (version, status) = provider
+            .detect_cli_capabilities()
+            .await
+            .expect("parse fake version");
+
+        assert_eq!(version, CliVersion::new(0, 146, 2));
+        assert_eq!(status, CliVersionStatus::Tested);
+        assert_eq!(
+            provider
+                .capabilities()
+                .turn_ceiling
+                .expect("detected capability")
+                .meter
+                .as_str(),
+            WEIGHTED_ROLLOUT_METER
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_detection_leaves_an_untested_runtime_unenforced() {
+        let mut provider = version_fixture("0.148.0");
+        let (_, status) = provider
+            .detect_cli_capabilities()
+            .await
+            .expect("parse fake version");
+
+        assert!(matches!(status, CliVersionStatus::NewerUntested { .. }));
+        assert!(provider.capabilities().turn_ceiling.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_reprobe_clears_any_earlier_enforcement_claim() {
+        let mut provider = CodexProvider {
+            binary: Some(PathBuf::from("/definitely/not/a/codex-binary")),
+            turn_ceiling: capability_for_cli_version(
+                CliVersion::new(0, 146, 0),
+                CliVersionStatus::Tested,
+            ),
+            ..Default::default()
+        };
+
+        provider
+            .detect_cli_capabilities()
+            .await
+            .expect_err("missing binary cannot be detected");
+        assert!(provider.capabilities().turn_ceiling.is_none());
     }
 
     #[test]

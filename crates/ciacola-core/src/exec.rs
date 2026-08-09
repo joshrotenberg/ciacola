@@ -27,7 +27,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 use tower_mcp::LogLevel;
 
-use crate::agent::run_exchange;
+use crate::agent::run_exchange_with_ceiling;
 use crate::ledger::Ledger;
 use crate::notify::Notifier;
 
@@ -83,7 +83,8 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
         notify.turn(LogLevel::Error, agent_id, seq, state, &error);
     };
 
-    let (def, mcp, session, started, prompt) = match load(ledger, agent_id, seq).await {
+    let (def, mcp, session, started, prompt, turn_ceiling) = match load(ledger, agent_id, seq).await
+    {
         Ok(loaded) => loaded,
         Err(e) => {
             return abort_before_provider(ledger, notify, agent_id, seq, &e.to_string()).await;
@@ -91,13 +92,14 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
     };
 
     let events = SessionSink::new(ledger.clone(), agent_id.to_string(), seq);
-    let result = run_exchange(
+    let result = run_exchange_with_ceiling(
         ledger.providers(),
         &def,
         mcp,
         session.as_deref(),
         started,
         &prompt,
+        turn_ceiling,
         &events,
     )
     .await;
@@ -339,6 +341,7 @@ async fn load(
         Option<String>,
         bool,
         String,
+        Option<ciacola_agent::TurnCeiling>,
     ),
     crate::agent::FlatError,
 > {
@@ -350,6 +353,46 @@ async fn load(
         .get_turn(agent_id, seq)
         .await?
         .ok_or_else(|| format!("no turn {agent_id}/{seq}"))?;
+
+    if turn.provider != agent.def.provider.as_str() {
+        return Err(format!(
+            "turn provider '{}' no longer matches agent provider '{}'; resend the turn so current policy can be admitted and persisted",
+            turn.provider, agent.def.provider
+        )
+        .into());
+    }
+    if turn.turn_protection_state == "legacy" {
+        return Err(
+            "legacy queued turn has no enforceable per-turn protection provenance; resend the turn so current policy can be admitted and persisted"
+                .into(),
+        );
+    }
+    let raw_protection = turn.turn_protection.as_deref().ok_or(
+        "queued turn is missing its per-turn protection snapshot; resend the turn so current policy can be admitted and persisted",
+    )?;
+    let protection: crate::limits::TurnProtectionSnapshot = serde_json::from_str(raw_protection)
+        .map_err(|error| {
+            format!(
+                "queued turn has a corrupt per-turn protection snapshot ({error}); resend the turn so current policy can be admitted and persisted"
+            )
+        })?;
+    let live_capability = if protection.state == crate::limits::TurnProtectionState::Unbounded {
+        None
+    } else {
+        ledger
+            .providers()
+            .get(&agent.def.provider)?
+            .capabilities()
+            .turn_ceiling
+            .clone()
+    };
+    let turn_ceiling = protection
+        .validate_for_execution(
+            &turn.turn_protection_state,
+            &turn.provider,
+            live_capability.as_ref(),
+        )
+        .map_err(|error| -> crate::agent::FlatError { error.into() })?;
 
     // Rotate when this turn would exceed the policy for the current
     // session. Dropping the session is the whole mechanism; the
@@ -390,9 +433,17 @@ async fn load(
             Some(next),
             false,
             format!("{preamble}{}", turn.prompt),
+            turn_ceiling,
         ));
     }
-    Ok((agent.def, mcp, agent.session, started, turn.prompt))
+    Ok((
+        agent.def,
+        mcp,
+        agent.session,
+        started,
+        turn.prompt,
+        turn_ceiling,
+    ))
 }
 
 pub(crate) type Kills = Arc<Mutex<HashMap<(String, i64), CancellationToken>>>;
@@ -620,6 +671,7 @@ mod config_injection_tests {
 
     struct FakeProvider {
         seen: Arc<Mutex<Option<ciacola_agent::TurnIntent>>>,
+        turn_ceiling: Option<ciacola_agent::CeilingCapability>,
     }
 
     impl ciacola_agent::Provider for FakeProvider {
@@ -635,6 +687,7 @@ mod config_injection_tests {
             capabilities.reports_cost = true;
             capabilities.reports_token_usage = true;
             capabilities.reports_provider_turns = true;
+            capabilities.turn_ceiling = self.turn_ceiling.clone();
             capabilities
         }
 
@@ -804,11 +857,48 @@ mod config_injection_tests {
             .unwrap_or_else(|| panic!("no endpoint '{name}'"))
     }
 
+    fn fake_ceiling(meter: &str) -> ciacola_agent::CeilingCapability {
+        ciacola_agent::CeilingCapability {
+            meter: ciacola_agent::MeterId::new(meter),
+            granularity: ciacola_agent::EnforcementGranularity::ProviderResponseBoundary,
+            cache_treatment: ciacola_agent::CacheTreatment::Included,
+        }
+    }
+
+    fn fake_registry(
+        seen: Arc<Mutex<Option<ciacola_agent::TurnIntent>>>,
+        meter: &str,
+    ) -> ciacola_agent::ProviderRegistry {
+        ciacola_agent::ProviderRegistry::new()
+            .with(Arc::new(FakeProvider {
+                seen,
+                turn_ceiling: Some(fake_ceiling(meter)),
+            }))
+            .expect("unique provider")
+    }
+
+    fn fake_limits(limit: u64) -> crate::limits::Limits {
+        crate::limits::Limits {
+            providers: [(
+                "fake".into(),
+                crate::limits::ProviderLimits {
+                    per_turn_ceiling: Some(limit),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        }
+    }
+
     async fn claimed_fake_turn(
         seen: Arc<Mutex<Option<ciacola_agent::TurnIntent>>>,
     ) -> (Ledger, String, i64, Notifier) {
         let providers = ciacola_agent::ProviderRegistry::new()
-            .with(Arc::new(FakeProvider { seen }))
+            .with(Arc::new(FakeProvider {
+                seen,
+                turn_ceiling: Some(fake_ceiling("fake_units_v1")),
+            }))
             .expect("unique provider");
         let pool = sqlx::SqlitePool::connect("sqlite::memory:")
             .await
@@ -838,7 +928,10 @@ mod config_injection_tests {
     async fn a_claimed_turn_runs_through_the_selected_provider_and_settles() {
         let seen = Arc::new(Mutex::new(None));
         let providers = ciacola_agent::ProviderRegistry::new()
-            .with(Arc::new(FakeProvider { seen: seen.clone() }))
+            .with(Arc::new(FakeProvider {
+                seen: seen.clone(),
+                turn_ceiling: Some(fake_ceiling("fake_units_v1")),
+            }))
             .expect("unique provider");
         let pool = sqlx::SqlitePool::connect("sqlite::memory:")
             .await
@@ -903,6 +996,175 @@ mod config_injection_tests {
         assert_eq!(agent.session.as_deref(), Some("fake-session"));
         assert_eq!(agent.session_started_seq, seq);
         assert_eq!(agent.cost_micro_usd, 321);
+        assert_eq!(turn.failure_kind, "none");
+        assert_eq!(turn.provider_session.as_deref(), Some("fake-session"));
+    }
+
+    #[tokio::test]
+    async fn persisted_ceiling_survives_restart_and_is_applied_to_open_and_resume() {
+        let seen = Arc::new(Mutex::new(None));
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool.clone())
+            .await
+            .expect("ledger")
+            .with_providers(fake_registry(seen.clone(), "fake_units_v1"));
+        let agent_id = ledger
+            .create_agent(
+                &crate::agent::AgentDef::new("a", "system").provider("fake"),
+                None,
+            )
+            .await
+            .expect("agent");
+        let first = match ledger
+            .admit_turn(
+                &fake_limits(77),
+                crate::admission::AdmissionAuthority::Automatic,
+                &agent_id,
+                "first",
+                "test",
+            )
+            .await
+            .expect("admission")
+        {
+            crate::admission::AdmissionDecision::Admitted { seq, .. } => seq,
+            decision => panic!("unexpected admission: {decision:?}"),
+        };
+
+        // Reopening with the same semantic adapter is enough to prove the
+        // executor reads the row rather than an in-memory admission object.
+        let reopened = Ledger::setup(pool.clone())
+            .await
+            .expect("reopen")
+            .with_providers(fake_registry(seen.clone(), "fake_units_v1"));
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+        run_turn(&reopened, &Notifier(tx), &agent_id, first).await;
+        let opening = seen.lock().expect("seen").take().expect("opening intent");
+        assert_eq!(opening.turn_ceiling.as_ref().map(|c| c.limit), Some(77));
+        assert!(matches!(
+            opening.resume,
+            Some(ciacola_agent::ResumeId::ClientAssigned(_))
+        ));
+
+        let second = match reopened
+            .admit_turn(
+                &fake_limits(33),
+                crate::admission::AdmissionAuthority::Automatic,
+                &agent_id,
+                "second",
+                "test",
+            )
+            .await
+            .expect("admission")
+        {
+            crate::admission::AdmissionDecision::Admitted { seq, .. } => seq,
+            decision => panic!("unexpected admission: {decision:?}"),
+        };
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+        run_turn(&reopened, &Notifier(tx), &agent_id, second).await;
+        let resumed = seen.lock().expect("seen").take().expect("resume intent");
+        assert_eq!(resumed.turn_ceiling.as_ref().map(|c| c.limit), Some(33));
+        assert!(matches!(
+            resumed.resume,
+            Some(ciacola_agent::ResumeId::ProviderAssigned(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn capability_drift_fails_known_zero_without_calling_the_provider() {
+        let seen = Arc::new(Mutex::new(None));
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let admitting = Ledger::setup(pool.clone())
+            .await
+            .expect("ledger")
+            .with_providers(fake_registry(seen.clone(), "fake_units_v1"));
+        let agent_id = admitting
+            .create_agent(
+                &crate::agent::AgentDef::new("a", "system").provider("fake"),
+                None,
+            )
+            .await
+            .expect("agent");
+        let seq = match admitting
+            .admit_turn(
+                &fake_limits(55),
+                crate::admission::AdmissionAuthority::Automatic,
+                &agent_id,
+                "work",
+                "test",
+            )
+            .await
+            .expect("admission")
+        {
+            crate::admission::AdmissionDecision::Admitted { seq, .. } => seq,
+            decision => panic!("unexpected admission: {decision:?}"),
+        };
+        let drifted = Ledger::setup(pool)
+            .await
+            .expect("reopen")
+            .with_providers(fake_registry(seen.clone(), "fake_units_v2"));
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+        run_turn(&drifted, &Notifier(tx), &agent_id, seq).await;
+
+        assert!(seen.lock().expect("seen").is_none());
+        let turn = drifted.get_turn(&agent_id, seq).await.unwrap().unwrap();
+        assert_eq!(turn.state, "failed");
+        assert_eq!(turn.failure_kind, "not_attempted");
+        assert_eq!(turn.elapsed_state, "not_attempted");
+        assert_eq!(turn.reported_cost_micro_usd(), Some(0));
+        assert_eq!(turn.reported_tokens(), Some((0, 0, 0)));
+        assert!(turn.error.as_deref().is_some_and(|e| e.contains("resend")));
+    }
+
+    #[tokio::test]
+    async fn legacy_and_corrupt_protection_rows_never_call_the_provider() {
+        for corrupt in [false, true] {
+            let seen = Arc::new(Mutex::new(None));
+            let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+                .await
+                .expect("pool");
+            let ledger = Ledger::setup(pool)
+                .await
+                .expect("ledger")
+                .with_providers(fake_registry(seen.clone(), "fake_units_v1"));
+            let agent_id = ledger
+                .create_agent(
+                    &crate::agent::AgentDef::new("a", "system").provider("fake"),
+                    None,
+                )
+                .await
+                .expect("agent");
+            let seq = ledger.enqueue_turn(&agent_id, "work").await.expect("turn");
+            if corrupt {
+                sqlx::query(
+                    "UPDATE turns SET turn_protection_state = 'enforced', turn_protection = '{broken' WHERE agent_id = ?1 AND seq = ?2",
+                )
+                .bind(&agent_id)
+                .bind(seq)
+                .execute(ledger.pool())
+                .await
+                .expect("corrupt");
+            } else {
+                sqlx::query(
+                    "UPDATE turns SET turn_protection_state = 'legacy', turn_protection = NULL WHERE agent_id = ?1 AND seq = ?2",
+                )
+                .bind(&agent_id)
+                .bind(seq)
+                .execute(ledger.pool())
+                .await
+                .expect("legacy");
+            }
+            let (tx, _rx) = tower_mcp::context::notification_channel(8);
+            run_turn(&ledger, &Notifier(tx), &agent_id, seq).await;
+            assert!(seen.lock().expect("seen").is_none());
+            let turn = ledger.get_turn(&agent_id, seq).await.unwrap().unwrap();
+            assert_eq!(turn.failure_kind, "not_attempted");
+            assert_eq!(turn.elapsed_state, "not_attempted");
+            assert!(turn.error.as_deref().is_some_and(|e| e.contains("resend")));
+        }
     }
 
     /// HandExecutor and PollingExecutor both enter the provider through
@@ -1281,7 +1543,7 @@ mod config_injection_tests {
             .enqueue_turn(&agent_id, "continue")
             .await
             .expect("second turn");
-        let (def, mcp, session, started, prompt) =
+        let (def, mcp, session, started, prompt, _turn_ceiling) =
             load(&ledger, &agent_id, second).await.expect("load second");
         let intent = crate::agent::intent_for(&def, mcp, session.as_deref(), started, &prompt);
 
@@ -1318,7 +1580,7 @@ mod config_injection_tests {
             .expect("preassigned session");
 
         let first = ledger.enqueue_turn(&agent_id, "first").await.expect("turn");
-        let (def, mcp, session, started, prompt) =
+        let (def, mcp, session, started, prompt, _turn_ceiling) =
             load(&ledger, &agent_id, first).await.expect("load first");
         let intent = crate::agent::intent_for(&def, mcp, session.as_deref(), started, &prompt);
 

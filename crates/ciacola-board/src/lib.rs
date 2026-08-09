@@ -39,7 +39,10 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use ciacola_core::ledger::{Ledger, TurnRow};
-use ciacola_core::limits::{AdmissionReport, AdmissionState, ProviderAdmissionStatus};
+use ciacola_core::limits::{
+    AdmissionReport, AdmissionState, ProviderAdmissionStatus, TurnProtectionSnapshot,
+    TurnProtectionState, TurnProtectionStatus,
+};
 use ciacola_core::plugin::PluginHost;
 use ciacola_core::render::{ago, chip, esc, human_count, page_with, usd};
 
@@ -105,6 +108,61 @@ fn optional_count(value: Option<u64>) -> String {
 
 fn optional_usd(value: Option<u64>) -> String {
     value.map(usd_u64).unwrap_or_else(|| "&mdash;".into())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapabilityDisplay {
+    meter: String,
+    cache: String,
+    granularity: String,
+}
+
+fn capability_display(value: &serde_json::Value) -> CapabilityDisplay {
+    let meter = value
+        .get("meter")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("meter unavailable")
+        .to_string();
+    let cache = match value
+        .get("cache_treatment")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("not_applicable") => "not applicable",
+        Some("included") => "cached input included",
+        Some("excluded") => "cached input excluded",
+        Some("provider_defined_with_excluded_fallback") => {
+            "provider-defined; fallback excludes cached input"
+        }
+        Some(other) => other,
+        None => "cache semantics unavailable",
+    }
+    .to_string();
+    let granularity = match value.get("granularity").and_then(serde_json::Value::as_str) {
+        Some("exact") => "exact",
+        Some("provider_response_boundary") => "response boundary; in-flight work can overshoot",
+        Some(other) => other,
+        None => "enforcement boundary unavailable",
+    }
+    .to_string();
+    CapabilityDisplay {
+        meter,
+        cache,
+        granularity,
+    }
+}
+
+fn ceiling_amount(limit: Option<u64>, capability: Option<&CapabilityDisplay>) -> String {
+    let Some(limit) = limit else {
+        return "&mdash;".into();
+    };
+    match capability.map(|capability| capability.meter.as_str()) {
+        Some(meter) if meter.contains("micro_usd") => format!(
+            "{} <span class=\"dim\">({limit} micro-USD)</span>",
+            usd_u64(limit)
+        ),
+        Some(_) => limit.to_string(),
+        None => format!("{limit} <span class=\"dim\">provider units; meter unavailable</span>"),
+    }
 }
 
 fn telemetry_gaps(status: &ProviderAdmissionStatus) -> String {
@@ -193,6 +251,23 @@ fn admission_state(status: &ProviderAdmissionStatus) -> String {
     }
 }
 
+fn protection_state(status: &ProviderAdmissionStatus) -> String {
+    let inactive = status.accounting.active_agents == 0;
+    if inactive {
+        let if_selected = match status.turn_protection {
+            TurnProtectionStatus::Enforced => "enforced",
+            TurnProtectionStatus::Unbounded => "unbounded",
+            TurnProtectionStatus::Unavailable => "unsupported",
+        };
+        return format!("INACTIVE <span class=\"dim\">{if_selected} if selected</span>");
+    }
+    match status.turn_protection {
+        TurnProtectionStatus::Enforced => "<b style=\"color:#3fb950\">ENFORCED</b>".into(),
+        TurnProtectionStatus::Unbounded => "<b style=\"color:#d29922\">UNBOUNDED</b>".into(),
+        TurnProtectionStatus::Unavailable => "<b style=\"color:#f85149\">UNSUPPORTED</b>".into(),
+    }
+}
+
 fn global_admission_state(state: AdmissionState) -> String {
     match state {
         AdmissionState::Stopped => "<b style=\"color:#f85149\">STOPPED</b>".into(),
@@ -216,15 +291,16 @@ fn admission_section(report: Result<AdmissionReport, ciacola_core::FlatError>) -
     };
 
     let mut html = format!(
-        "<h2>admission <span class=\"dim\">rolling 24h</span></h2>\
-         <p class=\"dim\">USD admission: <b>{spend}</b> reported &middot; warn {warn} &middot; \
-         stop {stop} &middot; cost telemetry gaps {gaps} &middot; state {state}</p>\
+        "<h2>rolling admission <span class=\"dim\">24h; future submissions only</span></h2>\
+         <p class=\"dim\">Reported USD: <b>{spend}</b> &middot; warn {warn} &middot; \
+         stop {stop} &middot; cost telemetry gaps {gaps} &middot; state {state}. \
+         Already-admitted and concurrent turns are not reserved against these thresholds.</p>\
          <table><tr><th>provider</th><th class=\"num\">active agents</th>\
          <th class=\"num\">reported total</th>\
          <th class=\"num\">input</th><th class=\"num\">output</th>\
          <th class=\"num\">cached <span class=\"dim\">(included in input)</span></th>\
          <th class=\"num\">warn</th><th class=\"num\">stop</th>\
-         <th>telemetry gaps</th><th>state</th><th>automatic</th></tr>",
+         <th>telemetry gaps</th><th>rolling state</th></tr>",
         spend = usd_u64(report.global.reported_spend_micro_usd),
         warn = optional_usd(report.global.daily_warn_micro_usd),
         stop = optional_usd(report.global.daily_stop_micro_usd),
@@ -239,7 +315,7 @@ fn admission_section(report: Result<AdmissionReport, ciacola_core::FlatError>) -
              <td class=\"num\">{input}</td><td class=\"num\">{output}</td>\
              <td class=\"num\">{cached}</td><td class=\"num\">{warn}</td>\
              <td class=\"num\">{stop}</td><td class=\"dim\">{gaps}</td>\
-             <td>{state}</td><td>{automatic}</td></tr>",
+             <td>{state}</td></tr>",
             provider = esc(&accounting.provider),
             active = human_u64_count(accounting.active_agents),
             total = human_u64_count(accounting.total_tokens()),
@@ -250,7 +326,52 @@ fn admission_section(report: Result<AdmissionReport, ciacola_core::FlatError>) -
             stop = optional_count(status.daily_stop_tokens),
             gaps = telemetry_gaps(status),
             state = admission_state(status),
-            automatic = if accounting.active_agents == 0 {
+        ));
+    }
+    html.push_str(
+        "</table><h2>per-turn protection <span class=\"dim\">one provider execution</span></h2>\
+         <p class=\"dim\">Provider-enforced independently of rolling admission. \
+         Response-boundary enforcement can overshoot through in-flight work; the effective \
+         capability is snapshotted before dispatch and reapplied on open and resume.</p>\
+         <table><tr><th>provider</th><th class=\"num\">active agents</th>\
+         <th>protection</th><th>configured</th><th>effective</th><th>declared meter</th>\
+         <th>cache treatment</th><th>enforcement</th><th>automatic<br><span class=\"dim\">combined</span></th></tr>",
+    );
+    for status in &report.providers {
+        let capability = status
+            .turn_ceiling_capability
+            .as_ref()
+            .and_then(|capability| serde_json::to_value(capability).ok())
+            .map(|value| capability_display(&value));
+        let configured = ceiling_amount(status.per_turn_ceiling, capability.as_ref());
+        let effective = if status.turn_protection == TurnProtectionStatus::Enforced {
+            configured.clone()
+        } else {
+            "&mdash;".into()
+        };
+        html.push_str(&format!(
+            "<tr><td>{provider}</td><td class=\"num\">{active}</td>\
+             <td>{protection}</td><td>{configured}</td><td>{effective}</td>\
+             <td class=\"mono dim\">{meter}</td><td class=\"dim\">{cache}</td>\
+             <td class=\"dim\">{granularity}</td><td>{automatic}</td></tr>",
+            provider = esc(&status.accounting.provider),
+            active = human_u64_count(status.accounting.active_agents),
+            protection = protection_state(status),
+            configured = configured,
+            effective = effective,
+            meter = capability
+                .as_ref()
+                .map(|capability| esc(&capability.meter))
+                .unwrap_or_else(|| "&mdash;".into()),
+            cache = capability
+                .as_ref()
+                .map(|capability| esc(&capability.cache))
+                .unwrap_or_else(|| "not declared by runtime".into()),
+            granularity = capability
+                .as_ref()
+                .map(|capability| esc(&capability.granularity))
+                .unwrap_or_else(|| "not declared by runtime".into()),
+            automatic = if status.accounting.active_agents == 0 {
                 "<span class=\"dim\">n/a</span>"
             } else if status.automatic_allowed {
                 "yes"
@@ -330,7 +451,7 @@ async fn overview_body(state: &BoardState) -> String {
                      <td class=\"dim\">{err}</td></tr>",
                     id = esc(&agent.agent_id),
                     name = esc(&agent.name),
-                    chip = chip(&turn.state),
+                    chip = turn_state_chip(&turn),
                     err = esc(turn.error.as_deref().unwrap_or("")),
                 ));
             }
@@ -459,10 +580,12 @@ fn turn_cost(turn: &TurnRow) -> String {
 
 fn turn_usage(turn: &TurnRow) -> String {
     match turn.reported_tokens() {
-        Some((input, output, _cached)) if turn.usage_complete => {
-            format!("{input} in / {output} out")
+        Some((input, output, cached)) if turn.usage_complete => {
+            format!("{input} in / {output} out / {cached} cached (included in input)")
         }
-        Some((input, output, _cached)) => format!("{input} in / {output} out (partial)"),
+        Some((input, output, cached)) => {
+            format!("{input} in / {output} out / {cached} cached (included in input; partial)")
+        }
         None => match turn.usage_state.as_str() {
             "not_tracked" => "tokens not tracked".into(),
             "unreported" => "tokens unreported".into(),
@@ -470,6 +593,94 @@ fn turn_usage(turn: &TurnRow) -> String {
             state => format!("tokens {state}"),
         },
     }
+}
+
+fn turn_state_chip(turn: &TurnRow) -> String {
+    if turn.state == "failed" && turn.failure_kind == "limit" {
+        return concat!(
+            "<span class=\"chip\" style=\"border-color:#f85149;color:#f85149\">",
+            "FAILED &middot; LIMIT</span>"
+        )
+        .into();
+    }
+    chip(&turn.state)
+}
+
+fn protection_snapshot_html(turn: &TurnRow) -> String {
+    let snapshot = turn
+        .turn_protection
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<TurnProtectionSnapshot>(raw).ok());
+    let Some(snapshot) = snapshot else {
+        return if turn.turn_protection_state == "legacy" {
+            "<h3>per-turn protection</h3><p class=\"dim\"><b>LEGACY</b> &middot; \
+             no durable protection snapshot exists for this pre-feature row</p>"
+                .into()
+        } else {
+            format!(
+                "<h3>per-turn protection</h3><p class=\"msg err\">snapshot missing or invalid; \
+                 queryable state is {}</p>",
+                esc(&turn.turn_protection_state)
+            )
+        };
+    };
+    let capability = snapshot
+        .capability
+        .as_ref()
+        .and_then(|capability| serde_json::to_value(capability).ok())
+        .map(|value| capability_display(&value));
+    let configured = ceiling_amount(snapshot.configured_limit, capability.as_ref());
+    let effective = if snapshot.state == TurnProtectionState::Enforced {
+        configured.clone()
+    } else {
+        "&mdash;".into()
+    };
+    let state = match snapshot.state {
+        TurnProtectionState::Enforced => "<b style=\"color:#3fb950\">ENFORCED</b>".to_string(),
+        TurnProtectionState::Unbounded => "<b style=\"color:#d29922\">UNBOUNDED</b>".to_string(),
+        TurnProtectionState::OverrideUnavailable => {
+            "<b style=\"color:#d29922\">OVERRIDDEN</b>".to_string()
+        }
+        TurnProtectionState::Legacy => "<b class=\"dim\">LEGACY</b>".to_string(),
+    };
+    let audit = snapshot
+        .unavailable_override
+        .as_ref()
+        .map(|audit| {
+            format!(
+                "{} <span class=\"dim\">via {} at unix {}</span>",
+                esc(&audit.reason),
+                esc(&audit.source),
+                audit.checked_unix
+            )
+        })
+        .unwrap_or_else(|| "&mdash;".into());
+    format!(
+        "<h3>per-turn protection <span class=\"dim\">durable snapshot v{version}</span></h3>\
+         <table><tr><th>provider</th><th>state</th><th>configured</th><th>effective</th>\
+         <th>meter</th><th>cache treatment</th><th>enforcement</th><th>override audit</th></tr>\
+         <tr><td>{provider}</td><td>{state}</td><td>{configured}</td><td>{effective}</td>\
+         <td class=\"mono dim\">{meter}</td><td class=\"dim\">{cache}</td>\
+         <td class=\"dim\">{granularity}</td><td>{audit}</td></tr></table>",
+        version = snapshot.version,
+        provider = esc(&snapshot.provider),
+        state = state,
+        configured = configured,
+        effective = effective,
+        meter = capability
+            .as_ref()
+            .map(|capability| esc(&capability.meter))
+            .unwrap_or_else(|| "&mdash;".into()),
+        cache = capability
+            .as_ref()
+            .map(|capability| esc(&capability.cache))
+            .unwrap_or_else(|| "not applicable".into()),
+        granularity = capability
+            .as_ref()
+            .map(|capability| esc(&capability.granularity))
+            .unwrap_or_else(|| "not enforced".into()),
+        audit = audit,
+    )
 }
 
 fn turn_elapsed(turn: &TurnRow) -> String {
@@ -487,12 +698,14 @@ fn turn_elapsed(turn: &TurnRow) -> String {
 fn turn_html(turn: &TurnRow) -> String {
     let mut out = format!(
         "<h2>turn {} {} <span class=\"dim\">{} · {} · {}</span></h2>\
+         <p class=\"dim mono\">provider session {}</p>\
          <div class=\"msg them\">{}</div>",
         turn.seq,
-        chip(&turn.state),
+        turn_state_chip(turn),
         turn_cost(turn),
         turn_elapsed(turn),
         turn_usage(turn),
+        esc(turn.provider_session.as_deref().unwrap_or("not reported")),
         esc(&turn.prompt),
     );
     if let Some(reply) = &turn.reply {
@@ -501,6 +714,7 @@ fn turn_html(turn: &TurnRow) -> String {
     if let Some(error) = &turn.error {
         out.push_str(&format!("<div class=\"msg err\">{}</div>", esc(error)));
     }
+    out.push_str(&protection_snapshot_html(turn));
     if let Some(admission_override) = &turn.admission_override {
         let detail = serde_json::from_str::<serde_json::Value>(admission_override)
             .ok()
@@ -625,6 +839,9 @@ mod tests {
             },
             daily_warn_tokens: Some(75),
             daily_stop_tokens: Some(100),
+            per_turn_ceiling: None,
+            turn_protection: TurnProtectionStatus::Unbounded,
+            turn_ceiling_capability: None,
             state,
             automatic_allowed,
             detail: None,
@@ -683,7 +900,27 @@ mod tests {
             provider: "claude".into(),
             settled_unix: Some(1),
             admission_override: None,
+            turn_protection_state: "unbounded".into(),
+            turn_protection: Some(
+                serde_json::to_string(&TurnProtectionSnapshot::unbounded("claude"))
+                    .expect("snapshot"),
+            ),
+            failure_kind: "none".into(),
+            provider_session: Some("session-turn-1".into()),
         }
+    }
+
+    fn codex_capability_value() -> serde_json::Value {
+        serde_json::json!({
+            "meter": "codex.rollout_budget.weighted_non_cached_input_plus_output.v1",
+            "granularity": "provider_response_boundary",
+            "cache_treatment": "excluded"
+        })
+    }
+
+    fn set_codex_capability(status: &mut ProviderAdmissionStatus) {
+        status.turn_ceiling_capability =
+            Some(serde_json::from_value(codex_capability_value()).expect("ceiling capability"));
     }
 
     #[test]
@@ -711,6 +948,67 @@ mod tests {
 
         row.elapsed_state = "legacy".into();
         assert!(turn_html(&row).contains("1.0s legacy"));
+    }
+
+    #[test]
+    fn limited_turn_shows_snapshot_session_and_missing_usage_honestly() {
+        let mut row = turn("not_priced", "unreported");
+        row.state = "failed".into();
+        row.failure_kind = "limit".into();
+        row.error = Some("shared rollout budget exhausted".into());
+        row.turn_protection_state = "enforced".into();
+        row.turn_protection = Some(
+            serde_json::json!({
+                "version": 1,
+                "provider": "codex",
+                "state": "enforced",
+                "configured_limit": 250000,
+                "capability": codex_capability_value(),
+                "unavailable_override": null
+            })
+            .to_string(),
+        );
+        row.provider_session = Some("thread-limit-123".into());
+
+        let html = turn_html(&row);
+        assert!(html.contains("FAILED &middot; LIMIT"), "{html}");
+        assert!(html.contains("provider session thread-limit-123"), "{html}");
+        assert!(html.contains("tokens unreported"), "{html}");
+        assert!(html.contains("ENFORCED"), "{html}");
+        assert!(html.contains("250000"), "{html}");
+        assert!(
+            html.contains("codex.rollout_budget.weighted_non_cached_input_plus_output.v1"),
+            "{html}"
+        );
+        assert!(html.contains("cached input excluded"), "{html}");
+        assert!(html.contains("in-flight work can overshoot"), "{html}");
+    }
+
+    #[test]
+    fn unavailable_protection_override_renders_its_durable_audit() {
+        let mut row = turn("reported", "reported");
+        row.turn_protection_state = "override_unavailable".into();
+        row.turn_protection = Some(
+            serde_json::json!({
+                "version": 1,
+                "provider": "codex",
+                "state": "override_unavailable",
+                "configured_limit": 250000,
+                "capability": null,
+                "unavailable_override": {
+                    "reason": "one supervised proof",
+                    "source": "operator-http",
+                    "checked_unix": 12345
+                }
+            })
+            .to_string(),
+        );
+
+        let html = turn_html(&row);
+        assert!(html.contains("OVERRIDDEN"), "{html}");
+        assert!(html.contains("one supervised proof"), "{html}");
+        assert!(html.contains("via operator-http at unix 12345"), "{html}");
+        assert!(html.contains("meter unavailable"), "{html}");
     }
 
     #[test]
@@ -743,11 +1041,43 @@ mod tests {
         report.global.state = AdmissionState::Warning;
 
         let html = admission_section(Ok(report));
-        assert!(html.contains("USD admission: <b>$12.5000</b> reported"));
+        assert!(html.contains("Reported USD: <b>$12.5000</b>"));
         assert!(html.contains("warn $10.0000"));
         assert!(html.contains("stop $20.0000"));
         assert!(html.contains("cost telemetry gaps 2"));
         assert!(html.contains("state <b style=\"color:#d29922\">WARNING</b>"));
+    }
+
+    #[test]
+    fn board_separates_rolling_admission_from_live_per_turn_protection() {
+        let mut enforced = admission_status("codex", AdmissionState::Ok, true);
+        enforced.per_turn_ceiling = Some(250_000);
+        enforced.turn_protection = TurnProtectionStatus::Enforced;
+        set_codex_capability(&mut enforced);
+
+        let mut unsupported = admission_status("future", AdmissionState::Ok, false);
+        unsupported.per_turn_ceiling = Some(99);
+        unsupported.turn_protection = TurnProtectionStatus::Unavailable;
+
+        let mut unbounded = admission_status("claude", AdmissionState::Ok, true);
+        unbounded.turn_protection = TurnProtectionStatus::Unbounded;
+
+        let html = admission_section(Ok(admission_report(vec![enforced, unsupported, unbounded])));
+        assert!(html.contains("rolling admission"), "{html}");
+        assert!(html.contains("per-turn protection"), "{html}");
+        assert!(html.contains("ENFORCED"), "{html}");
+        assert!(html.contains("UNSUPPORTED"), "{html}");
+        assert!(html.contains("UNBOUNDED"), "{html}");
+        assert!(html.contains("configured"), "{html}");
+        assert!(html.contains("effective"), "{html}");
+        assert!(html.contains("250000"), "{html}");
+        assert!(
+            html.contains("codex.rollout_budget.weighted_non_cached_input_plus_output.v1"),
+            "{html}"
+        );
+        assert!(html.contains("cached input excluded"), "{html}");
+        assert!(html.contains("in-flight work can overshoot"), "{html}");
+        assert!(html.contains("combined"), "{html}");
     }
 
     #[test]
@@ -778,11 +1108,18 @@ mod tests {
     fn unused_registered_provider_is_neutral_until_an_agent_selects_it() {
         let mut unused = admission_status("codex", AdmissionState::Unguarded, false);
         unused.accounting.active_agents = 0;
+        unused.per_turn_ceiling = Some(250_000);
+        unused.turn_protection = TurnProtectionStatus::Unavailable;
         let html = admission_section(Ok(admission_report(vec![unused])));
         assert!(html.contains("INACTIVE"), "{html}");
         assert!(html.contains("unguarded if selected"), "{html}");
+        assert!(html.contains("unsupported if selected"), "{html}");
         assert!(html.contains("<span class=\"dim\">n/a</span>"), "{html}");
         assert!(!html.contains("AUTO BLOCKED"), "{html}");
+        assert!(
+            !html.contains("<b style=\"color:#f85149\">UNSUPPORTED</b>"),
+            "{html}"
+        );
     }
 
     #[test]
