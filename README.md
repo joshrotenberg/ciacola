@@ -271,6 +271,33 @@ running as the same OS user may still inspect another process on platforms or
 provider modes without an OS sandbox. Use a separate OS account or stronger
 containment for mutually untrusted local workloads.
 
+## Workflow fixture
+
+Destructive and failure-path repository dogfood uses the private
+[`joshrotenberg/ciacola-fixture`](https://github.com/joshrotenberg/ciacola-fixture)
+repository rather than a real project. Its `develop` default branch, tiny
+one-line fixture, deterministic pass/fail/delay switches, CI workflow, labeled
+issues, and scenario catalog cover cloning, assignment, publication, cleanup,
+conflicts, drift, restart, permissions, and provider parity. Access is limited
+to approved fixture maintainers. The repository is allowlisted only in local
+dogfood configuration; no fixture credential or allowlist is committed here.
+
+The initial real-server proof ([#58](https://github.com/joshrotenberg/ciacola/issues/58))
+ran fixture issue
+[#2](https://github.com/joshrotenberg/ciacola-fixture/issues/2) through an
+isolated `fix/{slug}` worktree and Codex turn. An intentional server
+interruption left the first turn without a resume id; restart settled it as an
+orphan, automatic resend failed closed on incomplete rolling-token telemetry,
+and an audited supervised resend under the same native per-turn ceiling
+completed the requested commit. Ciacola then pushed the exact approved OID,
+opened private draft PR
+[#7](https://github.com/joshrotenberg/ciacola-fixture/pull/7), observed all
+fixture checks pass, reconciled the merged PR, retired the agent, and removed
+the managed worktree and branch. Replaying `open_pr` returned that same merged
+PR with `created = false`; replaying `finish_issue` returned the same completed
+cleanup result. This proves both a happy path and a fail-closed recovery path
+without granting write access to an unrelated repository or operator checkout.
+
 ## License
 
 MIT or Apache-2.0, at your option.
