@@ -157,10 +157,10 @@ fn submission_result(agent_id: &str, outcome: crate::plugin::Submission) -> Call
             "over {provider} daily token limit: {used_tokens} input + output tokens reported, limit {limit_tokens}. Running turns finish; new ones resume when the rolling day falls below."
         )),
         Submission::Unobservable { provider, reason } => CallToolResult::error(format!(
-            "{provider} admission telemetry is incomplete: {reason}. Automatic work fails closed; use send_supervised from the interactive stdio server with a reason for a one-off run."
+            "{provider} admission telemetry is incomplete: {reason}. Automatic work fails closed; use send_supervised from interactive stdio or authenticated human HTTP with a reason for a one-off run."
         )),
         Submission::Unguarded { provider, reason } => CallToolResult::error(format!(
-            "{provider} automatic work is unguarded: {reason}. Configure [limits.providers.{provider}].daily_stop_tokens, or use send_supervised from the interactive stdio server with a reason for a one-off run."
+            "{provider} automatic work is unguarded: {reason}. Configure [limits.providers.{provider}].daily_stop_tokens, or use send_supervised from interactive stdio or authenticated human HTTP with a reason for a one-off run."
         )),
         Submission::Failed { reason } => CallToolResult::error(reason),
     }
@@ -421,9 +421,10 @@ pub fn router_with_limits(
     router_with_admission_profile(ledger, exec, notify, include_kill, limits, false)
 }
 
-/// The human's stdio surface. This is intentionally distinct from the
-/// operator HTTP tool set: supervisor agents use `/mcp-operator`, so
-/// tool authority alone is not proof that a person is present.
+/// The human's stdio surface. This is intentionally distinct from automatic
+/// transports: the process boundary establishes that a person launched this
+/// interactive session, so missing-metering overrides may be offered here.
+/// Human HTTP receives the same tools behind separate root-bearer middleware.
 pub fn router_interactive_with_limits(
     ledger: Ledger,
     exec: Arc<dyn TurnExecutor>,
@@ -1146,7 +1147,7 @@ mod identity_tests {
             )
             .await;
         assert!(
-            rendered(&out).contains("may not spawn it"),
+            rendered(&out).contains("provider-backed agents cannot hold"),
             "must refuse: {}",
             rendered(&out)
         );
@@ -1199,10 +1200,10 @@ mod identity_tests {
         assert_eq!(l.list_agents().await.expect("list").len(), 1);
     }
 
-    /// Missing identity on the agent mount is not operator authority. The
-    /// known anonymous-operator gap belongs to the operator mount alone.
+    /// A human operator cannot copy the root HTTP capability into a provider
+    /// role. The role is refused even on the interactive operator profile.
     #[tokio::test]
-    async fn an_anonymous_agent_surface_caller_cannot_spawn_an_operator_role() {
+    async fn a_human_operator_cannot_spawn_a_provider_operator_role() {
         let l = ledger().await;
         let role = crate::roles::Role {
             name: "boss".into(),
@@ -1224,7 +1225,7 @@ mod identity_tests {
         };
         let roles = crate::roles::Roles::new(vec![role], "agent.json")
             .with_operator_mcp_config("operator.json");
-        let spawn_role = crate::roles::tools_with_depth(roles, l.clone(), 3, false)
+        let spawn_role = crate::roles::tools_with_depth(roles, l.clone(), 3, true)
             .into_iter()
             .find(|t| t.definition().name == "spawn_role")
             .expect("spawn_role");
@@ -1234,7 +1235,7 @@ mod identity_tests {
                 serde_json::json!({"role": "boss", "arguments": {}}),
             )
             .await;
-        assert!(rendered(&out).contains("may not spawn it"));
+        assert!(rendered(&out).contains("provider-backed agents cannot hold"));
         assert!(l.list_agents().await.expect("list").is_empty());
     }
 }

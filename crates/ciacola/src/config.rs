@@ -140,6 +140,7 @@ fn validate(config: &Config) -> Result<(), FlatError> {
             )
             .into());
         }
+        validate_role_surface(role)?;
         validate_sandbox(&format!("role '{}'", role.name), role.sandbox.as_deref())?;
     }
     for agent in &config.agents {
@@ -153,6 +154,28 @@ fn validate(config: &Config) -> Result<(), FlatError> {
         validate_sandbox(&format!("agent '{}'", agent.name), agent.sandbox.as_deref())?;
     }
     Ok(())
+}
+
+fn validate_role_surface(role: &Role) -> Result<(), FlatError> {
+    let Some(surface) = role.surface.as_deref() else {
+        return Ok(());
+    };
+    if !role.loopback {
+        return Err(format!("role '{}': surface requires loopback = true", role.name).into());
+    }
+    match surface {
+        "agent" => Ok(()),
+        "operator" => Err(format!(
+            "role '{}': provider-backed operator roles are disabled; use stdio or authenticated human HTTP",
+            role.name
+        )
+        .into()),
+        other => Err(format!(
+            "role '{}': unknown loopback surface '{other}'; expected agent",
+            role.name
+        )
+        .into()),
+    }
 }
 
 fn validate_sandbox(owner: &str, sandbox: Option<&str>) -> Result<(), FlatError> {
@@ -178,6 +201,13 @@ fn role_definition(
             let role = roles
                 .get(role_name)
                 .ok_or_else(|| format!("agent '{}': no role '{role_name}'", declared.name))?;
+            if role.surface.as_deref() == Some("operator") {
+                return Err(format!(
+                    "agent '{}': role '{}' requests the human-only operator surface",
+                    declared.name, role.name
+                )
+                .into());
+            }
             let missing: Vec<&str> = role
                 .arguments
                 .iter()
@@ -422,6 +452,22 @@ mod tests {
         )
         .expect_err("a typo must not remove containment");
         assert!(sandbox.to_string().contains("unknown sandbox"));
+
+        let operator = parse(
+            r#"
+                [[roles]]
+                name = "manager"
+                description = "manager"
+                loopback = true
+                surface = "operator"
+                system_prompt = "manage"
+            "#,
+        )
+        .expect_err("a provider role cannot receive the human root surface");
+        assert!(
+            operator.to_string().contains("authenticated human HTTP"),
+            "{operator}"
+        );
     }
 
     #[test]
@@ -465,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_role_arguments_render_and_keep_operator_authority() {
+    fn persistent_role_arguments_render_on_the_agent_surface() {
         let config: Config = toml::from_str(
             r#"
                 [[agents]]
@@ -482,14 +528,13 @@ mod tests {
                 description = "manager"
                 working_dir = "{{checkout}}"
                 loopback = true
-                surface = "operator"
+                surface = "agent"
                 arguments = ["checkout"]
                 system_prompt = "Manage {{checkout}}"
             "#,
         )
         .expect("shipped role");
-        let roles = Roles::with_runtime(vec![role], "agent.json", Default::default())
-            .with_operator_mcp_config("operator.json");
+        let roles = Roles::with_runtime(vec![role], "agent.json", Default::default());
 
         let def =
             role_definition(&config, &config.agents[0], &roles, "agent.json").expect("definition");
@@ -500,7 +545,34 @@ mod tests {
             def.working_dir.as_deref(),
             Some(std::path::Path::new("/tmp/repo"))
         );
-        assert_eq!(def.mcp_config.as_deref(), Some("operator.json"));
+        assert_eq!(def.mcp_config.as_deref(), Some("agent.json"));
+    }
+
+    #[test]
+    fn persistent_shipped_operator_role_is_refused_before_agent_creation() {
+        let config: Config = toml::from_str(
+            r#"
+                [[agents]]
+                name = "repo-manager"
+                role = "manager"
+            "#,
+        )
+        .expect("config");
+        let role: Role = toml::from_str(
+            r#"
+                name = "manager"
+                description = "manager"
+                loopback = true
+                surface = "operator"
+                system_prompt = "Manage"
+            "#,
+        )
+        .expect("shipped role");
+        let roles = Roles::new(vec![role], "agent.json");
+
+        let error = role_definition(&config, &config.agents[0], &roles, "agent.json")
+            .expect_err("provider-backed operator authority must not enter the ledger");
+        assert!(error.to_string().contains("human-only"), "{error}");
     }
 
     #[test]

@@ -1,13 +1,15 @@
 # ciacola: handoff
 
-What this is, how to run it, what is known-broken, and what to do next.
-Written at the moment the design spike became a project, so that
+Historical design orientation, retained for the reasoning it records. Current
+startup and product guidance lives in `README.md` and
+`ciacola.example.toml`. This was written when the design spike became a
+project, so that
 whoever picks it up (including a later you, or an agent) does not have
 to reconstruct the reasoning from the code.
 
-The long-form record of how every decision was reached, with the
-measurements behind them, is `../apalis-agents/spike/FINDINGS.md`. That
-file is the reasoning; this one is the orientation.
+The original Apalis-based work lives in `../apalis-agent`. The current server
+keeps the small executor seam that survived that experiment, without an
+Apalis implementation in this workspace.
 
 ## The one sentence
 
@@ -19,10 +21,9 @@ resume rather than retry.
 That last clause is why there is no work queue at the centre. A queue's
 durability buys re-execution, which is exactly what paid agent work
 must never do. This was tested rather than assumed: an identical server
-was built on apalis and on a hand-rolled executor, both were killed
-mid-run, and neither self-healed without the ledger. `ciacola-apalis`
-survives as the alternative implementation that keeps the
-`TurnExecutor` seam honest.
+was built on Apalis and on a hand-rolled executor, both were killed
+mid-run, and neither self-healed without the ledger. The production server
+now uses the hand-rolled channel or polling executor behind `TurnExecutor`.
 
 ## Running it
 
@@ -32,29 +33,30 @@ mkdir -p "$HOME/.local/share/ciacola"
 CIACOLA_DB="$HOME/.local/share/ciacola/ciacola.db" cargo run -p ciacola
 ```
 
-The temporary database default is for a smoke test only. A real server
-must set `CIACOLA_DB`, or its durable conversations will be left in a
-different temp ledger after an OS cleanup or path change. Before adding
-a scheduled agent, uncomment and choose both spend circuit breakers in
-`ciacola.toml`; unattended work with `no spend limit` in the startup
-banner is an explicit unsafe mode.
+The default database is durable under `$XDG_DATA_HOME/ciacola`, or
+`$HOME/.local/share/ciacola` when XDG is unset. `CIACOLA_DB` selects an
+explicit location. Before adding a scheduled agent, configure an observable
+admission stop in `ciacola.toml`; an admitted turn can still overshoot it.
 
 | variable | meaning |
 |---|---|
-| `CIACOLA_DB` | ledger path, default a temp file |
+| `CIACOLA_DB` | ledger path; default the user data directory |
 | `CIACOLA_CONFIG` | config file; default `ciacola.toml` when present, otherwise empty |
 | `CIACOLA_HTTP` | port for the board and the agents' MCP endpoint |
 | `CIACOLA_CONCURRENCY` | turns in flight, default 4 |
 | `CIACOLA_NO_RECOVER` | skip startup recovery |
+| `CIACOLA_OPERATOR_TOKEN_FD` | inherited descriptor containing the human HTTP root bearer |
 | `RUST_LOG` | tracing filter, default `warn` |
 
-Three surfaces, one process:
+Four surfaces, one process:
 
 - **stdio MCP** for the operator: every verb including the destructive
   ones (`kill`, `prune`, `resolve_finding`, `open_pr`, the schedule
   tools).
 - **HTTP MCP at `/mcp`** for the agents themselves, which is what makes
   recursion work. Same router, fewer tools.
+- **Authenticated HTTP MCP at `/mcp-operator`** for a human holding the root
+  bearer. Provider-backed agent credentials are refused.
 - **The board at `/board`**, plain HTML, auto-refreshing.
 
 `ciacola.example.toml` is annotated and is the fastest way to see what
@@ -73,13 +75,12 @@ ciacola-git         live git state; stores nothing at all
 ciacola-webhook     inbound HTTP that pokes an agent
 ciacola-tuning      what each model has actually cost and achieved
 ciacola-repo-worker issue to pull request, in the system's own clone
-ciacola-apalis      the other TurnExecutor
 ciacola             config, the plugin list, main
 ```
 
 `PluginContext` is the precise statement of what core is: pool, ledger,
-executor, notifier, db path, loopback MCP config, limits, runtime, roles. If a
-plugin needs something not on that struct, either it belongs in core or
+executor, notifier, db path, limits, runtime, roles, and loopback config paths.
+If a plugin needs something not on that struct, either it belongs in core or
 the plugin is reaching.
 
 Everything else is a plugin, including the parts the system leans on
@@ -126,20 +127,33 @@ which silently removed the operator's own standing rules: the first
 real pull request carried a `Co-Authored-By` trailer those rules
 forbid. House rules are now an explicit layer of the system prompt.
 
+## Security boundary
+
+`/mcp-operator` rejects anonymous requests. A human uses a distinct root
+bearer delivered to the server through an inherited descriptor. Agent
+identity headers are refused rather than treated as delegated operator
+authority, and the two token types cannot substitute for one another. Stdio
+remains the simplest human operator path.
+
+For upgrade safety, the historical `/tmp/ciacola-mcp-operator.json` path is
+still materialized but now points to ordinary `/mcp`. Existing persisted
+supervisor conversations therefore lose destructive tools in the safe
+direction instead of retaining anonymous authority or failing on a missing
+file. Retire or re-provision them as ordinary coordinator agents; new
+provider roles with `surface = "operator"` are refused.
+
+This is process authorization inside a single-user laptop product, not
+multi-tenant isolation. A hostile process already running as the same OS user
+may be able to inspect another process when no OS sandbox prevents it. Use a
+separate account or stronger containment when workloads do not share that
+trust boundary.
+
 ## Known broken, in the order it will annoy you
 
-1. **The operator mount takes anonymous local callers at their word.**
-   Agents authenticate by token now, and an authenticated caller cannot
-   lie about parentage or out-reach its parent. But a local process
-   holding no token can still hit `/mcp-operator` and be treated as the
-   operator, including its claimed `spawned_by`. Containment is that no
-   agent's tool list includes a way to make arbitrary HTTP requests;
-   the fix is requiring a token on the operator mount, which needs a
-   notion of which agents hold operator rights.
-2. **`CLAUDE_CONFIG_DIR` isolates the login.** A fresh `claude_home`
+1. **`CLAUDE_CONFIG_DIR` isolates the login.** A fresh `claude_home`
    authenticates as nobody. `claude setup-token` plus `token_env` is
    the route through, and the server warns at boot.
-3. **`wait` is shadowed in mcp-repl.** `wait` is one of the six verbs
+2. **`wait` is shadowed in mcp-repl.** `wait` is one of the six verbs
    and also an mcp-repl built-in (wait for a background task), and the
    built-in wins: typing `wait` gets "no tasks in this session to wait
    for". `find wait` lists both, so the client knows about the clash
@@ -159,19 +173,22 @@ thin template, the kanban assumes discrete items, `git` simply goes
 quiet. Whether the primitive holds outside code is the interesting
 unknown.
 
-**Dogfood the Codex provider.** The adapter is now a separate crate behind
+**Continue dogfooding the Codex provider.** The adapter is now a separate crate behind
 the same registry as Claude. It preserves Codex thread ids as soon as the
 JSONL stream announces them, resumes through the provider's separate command,
 records real tokens as unpriced, applies strict scoped MCP with env-backed
 identity headers, and treats sandbox plus native execution policy as Codex's
 authority surface. Scripted tests cover the contract; the next proof is a
 small supervised repository task. Configure its provider token breaker before
-scheduling one unattended.
+scheduling one unattended. A supervised real run has since produced and
+validated `claude-wrapper` PR #780; broader repository coverage is still the
+useful next proof.
 
-**Session mining.** Provider-specific `claude_home` and `codex_home` make
+**Session mining, later.** Provider-specific `claude_home` and `codex_home` make
 the server's transcripts a separate, attributable corpus, which is what makes
-mining them meaningful. `solito` already extracts Claude prompts and tool uses
-into SQLite. The sharp first question is not clustering but **granted versus
+mining them meaningful. Solito is changing substantially, so integration is
+deliberately on hold. When it settles, the sharp first question is not
+clustering but **granted versus
 used tools**: which tools does a role grant that its agents never call, and
 does an agent that reports verifying actually have the tool call to show for
 it. Findings are self-report; transcripts are observed behaviour, and the gap

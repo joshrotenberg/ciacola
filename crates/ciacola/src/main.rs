@@ -20,6 +20,7 @@
 //! ```
 
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +48,7 @@ use ciacola_webhook::WebhookPlugin;
 use sqlx::SqlitePool;
 
 mod config;
+mod operator_auth;
 use tower_mcp::context::notification_channel;
 use tower_mcp::transport::{GenericStdioTransport, HttpTransport};
 
@@ -97,8 +99,57 @@ fn resolve_database_path(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn write_loopback_configs(directory: &Path, port: u16) -> std::io::Result<PathBuf> {
+    let config = format!(
+        "{{\"mcpServers\": {{\"ciacola\": {{\"type\": \"http\", \"url\": \"http://127.0.0.1:{port}/mcp\"}}}}}}"
+    );
+    let agent = directory.join("ciacola-mcp.json");
+    publish_loopback_config(&agent, &config)?;
+
+    // Definitions persisted before authenticated operator HTTP may still
+    // name this path. Keep the file for an upgrade window, but point it at
+    // the ordinary mount. A legacy supervisor loses authority safely instead
+    // of failing its paid turn on a missing file or retaining anonymous root.
+    publish_loopback_config(&directory.join("ciacola-mcp-operator.json"), &config)?;
+    Ok(agent)
+}
+
+/// Publish a shared, non-secret endpoint description without following a
+/// stale symlink at the predictable compatibility path. `NamedTempFile`
+/// creates a randomized 0600 file in the same directory; `persist` atomically
+/// replaces the directory entry, so a symlink is replaced rather than opened.
+fn publish_loopback_config(path: &Path, contents: &str) -> std::io::Result<()> {
+    let directory = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "loopback config path has no parent directory",
+        )
+    })?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".ciacola-mcp-")
+        .tempfile_in(directory)?;
+    temporary.write_all(contents.as_bytes())?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Consume the human HTTP credential before Tokio creates worker threads
+    // and before any provider child can inherit the server environment.
+    let operator_token = operator_auth::take_from_environment()?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(operator_token))
+}
+
+async fn run(
+    operator_token: Option<operator_auth::HumanOperatorToken>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Seeded now so the split into real crates inherits instrumentation
     // rather than needing it retrofitted. Off unless RUST_LOG asks, and
     // to stderr because stdout is the MCP transport.
@@ -139,6 +190,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(4823);
     let config_path = std::env::var("CIACOLA_CONFIG").ok();
+    eprintln!(
+        "[ciacola] operator HTTP: {}",
+        if operator_token.is_some() {
+            "human bearer configured"
+        } else {
+            "human bearer disabled; stdio operator access remains available"
+        }
+    );
 
     let pool =
         SqlitePool::connect(&format!("sqlite://{}?mode=rwc", database.path.display())).await?;
@@ -172,6 +231,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_runtime(declared_early.runtime.clone())?
         .with_providers(providers);
 
+    // Publish the internal endpoint before any executor or recovery worker can
+    // claim a turn and read it. The HTTP listener readiness gap is handled as
+    // a separate runtime-ordering issue; stale or redirected config is not.
+    let mcp_config_path = write_loopback_configs(&std::env::temp_dir(), port)?;
+
     let (tx, rx) = notification_channel(64);
     let notify = Notifier(tx);
     // Two executors, one trait, and nothing above this line can tell
@@ -198,27 +262,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             report.resubmitted, report.orphaned, report.orphans_killed, report.orphans_unverified
         );
     }
-
-    let mcp_config_path = std::env::temp_dir().join("ciacola-mcp.json");
-    std::fs::write(
-        &mcp_config_path,
-        format!(
-            "{{\"mcpServers\": {{\"ciacola\": {{\"type\": \"http\", \"url\": \"http://127.0.0.1:{port}/mcp\"}}}}}}"
-        ),
-    )?;
-    // The same server at its other mount, for roles that supervise.
-    // Capability by endpoint: an agent is handed one of these two paths
-    // in a config applied strictly, so the URL it has is the authority
-    // it has. That holds while no role can make arbitrary HTTP requests,
-    // which is a property of each role's tool list rather than of this
-    // file, and is why `Bash(curl:*)` should not appear in one.
-    let operator_mcp_config_path = std::env::temp_dir().join("ciacola-mcp-operator.json");
-    std::fs::write(
-        &operator_mcp_config_path,
-        format!(
-            "{{\"mcpServers\": {{\"ciacola\": {{\"type\": \"http\", \"url\": \"http://127.0.0.1:{port}/mcp-operator\"}}}}}}"
-        ),
-    )?;
 
     let declared = declared_early;
     declared.runtime.check_provider_homes();
@@ -264,8 +307,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         merged_roles.clone(),
         mcp_config_path.display().to_string(),
         declared.runtime.clone(),
-    )
-    .with_operator_mcp_config(operator_mcp_config_path.display().to_string());
+    );
     plugins.push(Box::new(RolesPlugin::new()));
 
     let ctx = PluginContext {
@@ -275,7 +317,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         notify: notify.clone(),
         db_path: database.path.display().to_string(),
         loopback_mcp_config: mcp_config_path.display().to_string(),
-        operator_mcp_config: operator_mcp_config_path.display().to_string(),
+        // Provider-backed operator roles are disabled. Supplying the ordinary
+        // path here keeps any compatibility caller on the weaker mount.
+        operator_mcp_config: mcp_config_path.display().to_string(),
         plugin_config: declared.plugins.clone(),
         limits: declared.limits.clone(),
         runtime: declared.runtime.clone(),
@@ -348,13 +392,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         agent_router = agent_router.resource(resource);
     }
 
-    // The operator surface again, this time over HTTP, for roles that
-    // supervise. Same construction as the stdio router because it is
-    // the same surface; a transport consumes its router, so the stdio
+    // The operator surface again, this time over human-authenticated HTTP.
+    // Same tools as stdio, but a transport consumes its router, so the stdio
     // one cannot be reused here.
-    let mut operator_router =
-        server::router_with_limits(ledger.clone(), exec, notify, true, declared.limits.clone())
-            .resource(agents_resource(ledger.clone()));
+    let mut operator_router = server::router_interactive_with_limits(
+        ledger.clone(),
+        exec,
+        notify,
+        true,
+        declared.limits.clone(),
+    )
+    .resource(agents_resource(ledger.clone()));
     operator_router = host.install(operator_router, Surface::Operator);
     operator_router = ciacola_core::complete::attach(operator_router, ledger.clone(), completing);
     for tool in health_tools(health.clone()) {
@@ -374,50 +422,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // a connection error.
     let shutdown = CancellationToken::new();
 
-    // The whole of loopback authentication: a header carries a
-    // per-agent secret, the ledger says whose it is, and the identity
-    // rides the request into every tool handler via the transport's
-    // extension bridge. No token, no identity; an unknown token is
-    // treated as no token rather than an error, because the ledger is
-    // also consulted by requests that legitimately have none (mcp-repl
-    // against localhost) and a stale token from a retired agent should
-    // degrade to anonymous, which can claim nothing, rather than break.
-    let identity_ledger = ledger.clone();
-    let attach_identity = axum::middleware::from_fn(
-        move |mut request: axum::extract::Request, next: axum::middleware::Next| {
-            let ledger = identity_ledger.clone();
-            async move {
-                let token = request
-                    .headers()
-                    .get(ciacola_core::TOKEN_HEADER)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned);
-                if let Some(token) = token {
-                    if let Ok(Some(agent_id)) = ledger.agent_id_by_token(&token).await {
-                        request
-                            .extensions_mut()
-                            .insert(ciacola_core::AgentIdentity(agent_id));
-                    }
-                }
-                next.run(request).await
-            }
-        },
-    );
-
-    let http = HttpTransport::new(agent_router)
+    // Authentication is scoped to each MCP mount, before tower-mcp can
+    // initialize a session or invoke a handler. The ordinary agent surface
+    // retains its least-authority anonymous behavior; the operator surface
+    // fails closed unless the human root bearer is valid. Agent identity
+    // headers are explicitly refused there.
+    let agent_http = HttpTransport::new(agent_router)
         .bridge_extension::<ciacola_core::AgentIdentity>()
         .into_router_at("/mcp")
-        // Capability by endpoint: which of the two mounts an agent is
-        // pointed at is the whole of what it may do, because its MCP
-        // config is applied strictly and its tool list cannot make
-        // arbitrary HTTP requests. Anything local can reach this mount,
-        // but that has always been true of `/mcp` too; the listener is
-        // loopback-only and the threat model is a laptop.
-        .merge(
-            HttpTransport::new(operator_router)
-                .bridge_extension::<ciacola_core::AgentIdentity>()
-                .into_router_at("/mcp-operator"),
-        )
+        .layer(axum::middleware::from_fn_with_state(
+            ledger.clone(),
+            operator_auth::attach_agent_identity,
+        ));
+    let operator_http = HttpTransport::new(operator_router)
+        .into_router_at("/mcp-operator")
+        .layer(axum::middleware::from_fn_with_state(
+            operator_auth::OperatorHttpAuth::new(operator_token),
+            operator_auth::require_operator,
+        ));
+    let http = agent_http
+        .merge(operator_http)
         // The board is optional by construction: nothing in core knows
         // about it, so leaving it out is leaving out a merge.
         .merge(ciacola_board::router_with_limits(
@@ -425,8 +449,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             host,
             declared.limits,
             shutdown.clone(),
-        ))
-        .layer(attach_identity);
+        ));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let http_shutdown = shutdown.clone();
     let http_handle = tokio::spawn(async move {
@@ -439,7 +462,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
     eprintln!(
         "[ciacola] board at http://127.0.0.1:{port}/board, agents' tools at /mcp, \
-         supervisors' at /mcp-operator"
+         authenticated human operators at /mcp-operator"
     );
 
     // Ctrl-C drains rather than kills. Without this, a signal ends a
@@ -549,5 +572,73 @@ mod tests {
             database.path,
             Path::new("/home/example/.local/share/ciacola/ciacola.db")
         );
+    }
+
+    #[test]
+    fn legacy_operator_config_is_downgraded_to_the_agent_mount() {
+        let directory = std::env::temp_dir().join(format!(
+            "ciacola-loopback-config-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).expect("test directory");
+
+        #[cfg(unix)]
+        let victim = {
+            use std::os::unix::fs::symlink;
+
+            let victim = directory.join("must-not-be-overwritten");
+            std::fs::write(&victim, "operator data").expect("victim");
+            symlink(&victim, directory.join("ciacola-mcp.json")).expect("agent symlink");
+            symlink(&victim, directory.join("ciacola-mcp-operator.json")).expect("legacy symlink");
+            victim
+        };
+
+        let agent = write_loopback_configs(&directory, 9345).expect("write configs");
+        let legacy = directory.join("ciacola-mcp-operator.json");
+        let agent_text = std::fs::read_to_string(&agent).expect("agent config");
+        let legacy_text = std::fs::read_to_string(&legacy).expect("legacy config");
+
+        assert_eq!(agent_text, legacy_text);
+        assert!(legacy_text.contains("http://127.0.0.1:9345/mcp"));
+        assert!(!legacy_text.contains("/mcp-operator"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                std::fs::read_to_string(&victim).expect("victim survives"),
+                "operator data"
+            );
+            assert!(
+                !std::fs::symlink_metadata(&agent)
+                    .expect("agent metadata")
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(
+                !std::fs::symlink_metadata(&legacy)
+                    .expect("legacy metadata")
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(
+                std::fs::metadata(&agent)
+                    .expect("agent permissions")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            std::fs::remove_file(victim).expect("remove victim");
+        }
+
+        std::fs::remove_file(agent).expect("remove agent config");
+        std::fs::remove_file(legacy).expect("remove legacy config");
+        std::fs::remove_dir(directory).expect("remove test directory");
     }
 }

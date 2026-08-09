@@ -18,8 +18,9 @@ cargo run -p ciacola
 
 Nothing else is needed. The board comes up on `4823` and the MCP
 server speaks on stdout. That default uses an empty configuration when
-`ciacola.toml` is absent and a temporary ledger; use the durable launch
-in `README.md` for anything beyond a smoke test.
+`ciacola.toml` is absent and a durable user-data ledger when a home directory
+is available. Use `CIACOLA_DB` when a test or deployment needs an explicit
+location.
 
 ## The four siblings
 

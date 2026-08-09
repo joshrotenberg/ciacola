@@ -71,6 +71,15 @@ pub(crate) fn build(intent: &TurnIntent) -> Result<PreparedTurn, AgentError> {
         }
     }
 
+    // MCP header values have to exist in the Codex process environment so
+    // `env_http_headers` can read them. For strict internal MCP turns, the
+    // user config is also ignored below; in that sealed shape these excludes
+    // keep the values (and ambient Ciacola/client bearer names) out of shell
+    // commands the model launches. They are defense in depth rather than an
+    // isolation claim for arbitrary user-configured Codex turns.
+    config.push("shell_environment_policy.ignore_default_excludes=false".into());
+    config.push("shell_environment_policy.exclude=[\"CIACOLA_*\",\"MCP_BEARER\"]".into());
+
     let mut env = BTreeMap::new();
     if let Some(scope) = &intent.mcp {
         let mcp = mcp_config(scope, &mut env);
@@ -221,6 +230,10 @@ mod tests {
         assert!(config.contains(&"model_reasoning_effort=\"high\""));
         assert!(config.contains(&"approval_policy=\"never\""));
         assert!(config.contains(&"sandbox_workspace_write.network_access=false"));
+        assert!(config.contains(&"shell_environment_policy.ignore_default_excludes=false"));
+        assert!(
+            config.contains(&"shell_environment_policy.exclude=[\"CIACOLA_*\",\"MCP_BEARER\"]")
+        );
     }
 
     #[test]
@@ -238,6 +251,9 @@ mod tests {
         let config = config_values(&args);
         assert!(config.contains(&"approval_policy=\"never\""));
         assert!(config.contains(&"sandbox_mode=\"read-only\""));
+        assert!(
+            config.contains(&"shell_environment_policy.exclude=[\"CIACOLA_*\",\"MCP_BEARER\"]")
+        );
         assert!(
             !config
                 .iter()

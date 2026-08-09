@@ -8,8 +8,9 @@ swarm of agents talking each other into a conclusion looks like from
 the outside, and it is what this system's unit actually is: not a job,
 not a task, but a conversation that persists.
 
-**Status: early.** It has taken one real GitHub issue to a merged pull
-request unattended. Everything here works and nothing here is stable.
+**Status: early and supervised.** Real repository work has reached reviewed
+pull requests through both provider paths, but unattended operation is still
+being hardened. The product shape works; its interfaces are not yet stable.
 
 ## The idea
 
@@ -38,9 +39,9 @@ list    every agent, with state, cost, and lineage
 kill    stop a running turn; the agent survives
 ```
 
-Agents are given these same verbs over loopback HTTP, which is all
-"multi-agent orchestration" turns out to require. A conductor spawning
-debaters is a prompt, not a framework.
+Agents are given these same verbs through an authenticated, least-authority
+loopback scope, which is all "multi-agent orchestration" turns out to
+require. A conductor spawning debaters is a prompt, not a framework.
 
 ## Everything else is a plugin
 
@@ -55,10 +56,10 @@ adding tools: board sections, HTTP routes, health statistics, its own
 retention policy, background loops, and the roles that know how to use
 its tools.
 
-It is also not a lock-in, which is what lets it stay small. Agents are
-handed an MCP config; any other MCP server can be added to it and the
-agent cannot tell the difference. A plugin earns its keep only when it
-needs something core owns.
+It is also not a lock-in, which is what lets it stay small. Agents are handed
+a strict MCP scope; any other MCP server can be added to it and the agent
+cannot tell the difference. A plugin earns its keep only when it needs
+something core owns.
 
 ## Providers
 
@@ -86,19 +87,73 @@ cargo run -p ciacola
 
 Then open the board at `http://127.0.0.1:4823/board`.
 
+For interactive operator work, run the server through its stdio MCP surface:
+
+```sh
+mcp-repl -- cargo run -p ciacola
+```
+
+The HTTP operator surface at `/mcp-operator` is bearer authenticated. Keep
+the root secret in a credential manager, pass it to the server through a
+dedicated inherited descriptor, and pass it to an HTTP client through an
+ephemeral descriptor-backed profile:
+
+```sh
+# Build before the secret descriptor exists, so Cargo and build scripts never
+# inherit it. Then start the actual binary in the first terminal.
+cargo build --locked -p ciacola
+operator_token="$(openssl rand -hex 32)"
+CIACOLA_OPERATOR_TOKEN_FD=3 ./target/debug/ciacola \
+  3< <(printf '%s' "$operator_token")
+
+# Second terminal. Load or paste the same value into an unexported variable.
+mcp-repl --config /dev/fd/3 --server ciacola_operator 3< <(
+  printf '[servers.ciacola_operator]\ntransport = "http"\nurl = "http://127.0.0.1:4823/mcp-operator"\nbearer = "%s"\n' \
+    "$operator_token"
+)
+```
+
+These bash/zsh examples carry the secret through pipes. It reaches neither
+argv, an exported environment variable, nor a persistent config file.
+`mcp-repl` currently warns about a literal bearer in the profile; in this
+recipe the complete profile exists only on the pipe, so nothing is saved.
+`CIACOLA_OPERATOR_TOKEN_FD` contains only a descriptor number. Ciacola reads
+and closes it before starting Tokio or any provider process. Supplying the
+secret itself as `CIACOLA_OPERATOR_TOKEN`, or starting the server with an
+ambient client-side `MCP_BEARER`, is rejected because startup environment
+values can remain visible to same-user process inspection after being unset.
+Omit the descriptor to disable human HTTP operator access;
+stdio remains available. Changing the root secret and restarting rotates it.
+Provider-backed agent credentials are explicitly refused on this mount,
+including roles that previously selected `surface = "operator"`. A secure
+delegated supervisor channel needs stronger process provenance than a bearer
+shared between provider processes and is tracked separately.
+
 `ciacola.toml` is optional; when absent the server starts empty. The
 ledger defaults to `$XDG_DATA_HOME/ciacola/ciacola.db`, or to
 `$HOME/.local/share/ciacola/ciacola.db` when `XDG_DATA_HOME` is unset.
 Set `CIACOLA_DB` to override it. The resolved path is printed at startup.
-Before adding schedules, configure a hard stop the selected backend can
+Before adding schedules, configure an admission stop the selected backend can
 actually report. Priced providers use `daily_stop_usd`; unpriced providers
 such as Codex need `[limits.providers.codex].daily_stop_tokens`. The rolling
 token total is input + output, with cached input already included in input.
 USD and token stops are independent, and Ciacola carries no provider price
 table. An interactive one-off run can acknowledge missing coverage with
 `send_supervised` plus a persisted reason, but no override crosses a known
-hard stop. See `ciacola.example.toml` for the annotated settings and
+stop. Admission is not a reservation: a turn already admitted can finish
+over the threshold, and concurrent turns multiply that exposure. Per-turn
+provider ceilings are tracked in [issue #78](https://github.com/joshrotenberg/ciacola/issues/78).
+See `ciacola.example.toml` for the annotated settings and
 `HANDOFF.md` for deeper design context.
+
+Ciacola is a single-operator, laptop-local product, not a multi-tenant
+security boundary. The loopback listener and bearer checks reject callers
+that do not hold authority, and strict internal Codex turns ask the CLI to
+exclude Ciacola credentials from model-launched shells. Those controls are
+defense in depth, not cross-process isolation: a hostile process already
+running as the same OS user may still inspect another process on platforms or
+provider modes without an OS sandbox. Use a separate OS account or stronger
+containment for mutually untrusted local workloads.
 
 ## License
 
