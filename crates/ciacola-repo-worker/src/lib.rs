@@ -3290,6 +3290,7 @@ async fn delegated_lineage_hops(
 ) -> Result<usize, DelegatedLineageCheckError> {
     let mut current = agent_id.to_string();
     let mut visited = HashSet::new();
+    let mut manager_hops = None;
 
     for hops in 0..=64 {
         if !visited.insert(current.clone()) {
@@ -3307,25 +3308,17 @@ async fn delegated_lineage_hops(
                 })
             })?;
 
-        if current == manager_agent_id {
-            if hops > 0 || allow_manager_itself {
-                return Ok(hops);
-            }
-            return Err(DelegatedLineageCheckError::Refusal(
-                DelegatedLineageRefusal::OutsideManager {
-                    agent_id: agent_id.to_string(),
-                    manager_agent_id: manager_agent_id.to_string(),
-                },
-            ));
+        if current == manager_agent_id && (hops > 0 || allow_manager_itself) {
+            manager_hops = Some(hops);
         }
 
         let Some(parent) = row.spawned_by else {
-            return Err(DelegatedLineageCheckError::Refusal(
-                DelegatedLineageRefusal::OutsideManager {
+            return manager_hops.ok_or_else(|| {
+                DelegatedLineageCheckError::Refusal(DelegatedLineageRefusal::OutsideManager {
                     agent_id: agent_id.to_string(),
                     manager_agent_id: manager_agent_id.to_string(),
-                },
-            ));
+                })
+            });
         };
         current = parent;
     }
@@ -5448,6 +5441,33 @@ mod tests {
                 DelegatedAssignmentRefusal::Lineage {
                     subject: DelegatedLineageSubject::AssignmentCreator,
                     reason: DelegatedLineageRefusal::OutsideManager { .. }
+                }
+            ),
+            "got: {refusal}"
+        );
+
+        let manager_cycle = delegation_fixture(false).await;
+        sqlx::query("UPDATE agents SET spawned_by = ?2 WHERE agent_id = ?1")
+            .bind(&manager_cycle.manager)
+            .bind(&manager_cycle.owner)
+            .execute(&manager_cycle.plugin.ctx.as_ref().expect("context").pool)
+            .await
+            .expect("cycle through manager");
+        let refusal = manager_cycle
+            .plugin
+            .preflight_delegated_assignment(
+                &manager_cycle.manager,
+                &policy,
+                &delegated_open(&manager_cycle.assignment_id),
+            )
+            .await
+            .expect_err("manager cycle");
+        assert!(
+            matches!(
+                refusal,
+                DelegatedAssignmentRefusal::Lineage {
+                    subject: DelegatedLineageSubject::AssignmentCreator,
+                    reason: DelegatedLineageRefusal::Cycle { .. }
                 }
             ),
             "got: {refusal}"
