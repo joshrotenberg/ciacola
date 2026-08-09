@@ -33,7 +33,10 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -45,6 +48,7 @@ use tower_mcp::{CallToolResult, Tool, ToolBuilder};
 use git_spawn::{CloneCommand, GitCommand, Repository, WorktreeCommand};
 
 use ciacola_core::agent::FlatError;
+use ciacola_core::delegation::{DelegatableAction, DelegationPolicy};
 use ciacola_core::ledger::Ledger;
 use ciacola_core::plugin::{BoxFut, Migration, Plugin, PluginContext, Section, Surface};
 use ciacola_core::roles::{Role, Roles};
@@ -1179,6 +1183,241 @@ struct FinishArgs {
     /// work at this exact full commit OID. Dirty work is never discarded.
     discard_head: Option<String>,
 }
+
+/// A future isolated broker's narrow publication request.
+///
+/// Unlike the compatibility operator tool, this shape has no agent selector,
+/// no optional head, and no non-draft mode. Repository, issue, branch, and
+/// owner are resolved from the durable assignment during preflight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegatedOpenPrRequest {
+    pub assignment_id: String,
+    pub expected_head: String,
+    pub title: String,
+    pub body: String,
+}
+
+/// The only cleanup choices available to a future delegated supervisor.
+///
+/// There is deliberately no discard variant. Removing work still requires the
+/// repo-worker's existing proof that it is merged or unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegatedFinishDisposition {
+    Retain,
+    RemoveIfMergedOrUnchanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegatedFinishIssueRequest {
+    pub assignment_id: String,
+    pub disposition: DelegatedFinishDisposition,
+}
+
+/// Closed request vocabulary for the future isolated broker.
+///
+/// This is domain input, not authority. The process-isolation backend must
+/// separately derive and attest the manager principal before invoking the
+/// read-only eligibility preflight below.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DelegatedAssignmentRequest {
+    OpenPr(DelegatedOpenPrRequest),
+    FinishIssue(DelegatedFinishIssueRequest),
+}
+
+impl DelegatedAssignmentRequest {
+    pub const fn action(&self) -> DelegatableAction {
+        match self {
+            Self::OpenPr(_) => DelegatableAction::RepoWorkerOpenPr,
+            Self::FinishIssue(_) => DelegatableAction::RepoWorkerFinishIssue,
+        }
+    }
+
+    pub fn assignment_id(&self) -> &str {
+        match self {
+            Self::OpenPr(request) => &request.assignment_id,
+            Self::FinishIssue(request) => &request.assignment_id,
+        }
+    }
+}
+
+/// Durable facts established for an attested manager before a delegated
+/// repo-worker action may enter the existing publication or cleanup fences.
+///
+/// This proof does not itself authorize an external effect. It intentionally
+/// carries no bearer, backend identity, grant epoch, or caller-supplied
+/// ancestry claim. It is not cloneable or serializable and must be recomputed
+/// at the future action convergence point rather than persisted or replayed
+/// after assignment, manager, or grant state changes.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DelegatedAssignmentEligibility {
+    manager_agent_id: String,
+    assignment_id: String,
+    owner_agent_id: String,
+    action: DelegatableAction,
+    creator_hops: usize,
+    owner_hops: usize,
+}
+
+impl DelegatedAssignmentEligibility {
+    pub fn manager_agent_id(&self) -> &str {
+        &self.manager_agent_id
+    }
+
+    pub fn assignment_id(&self) -> &str {
+        &self.assignment_id
+    }
+
+    pub fn owner_agent_id(&self) -> &str {
+        &self.owner_agent_id
+    }
+
+    pub const fn action(&self) -> DelegatableAction {
+        self.action
+    }
+
+    /// Distance from the manager to the agent that reserved the assignment.
+    /// Zero means the manager called `start_issue` directly.
+    pub const fn creator_hops(&self) -> usize {
+        self.creator_hops
+    }
+
+    /// Distance from the manager to the assignment's current implementer.
+    pub const fn owner_hops(&self) -> usize {
+        self.owner_hops
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DelegatedLineageRefusal {
+    MissingAgent {
+        agent_id: String,
+    },
+    OutsideManager {
+        agent_id: String,
+        manager_agent_id: String,
+    },
+    Cycle {
+        agent_id: String,
+    },
+    TooDeep,
+}
+
+impl fmt::Display for DelegatedLineageRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingAgent { agent_id } => {
+                write!(f, "lineage agent '{agent_id}' is missing")
+            }
+            Self::OutsideManager {
+                agent_id,
+                manager_agent_id,
+            } => write!(
+                f,
+                "agent '{agent_id}' is not descended from manager '{manager_agent_id}'"
+            ),
+            Self::Cycle { agent_id } => {
+                write!(f, "lineage contains a cycle at agent '{agent_id}'")
+            }
+            Self::TooDeep => f.write_str("lineage exceeds the 64-agent safety bound"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegatedLineageSubject {
+    AssignmentCreator,
+    AssignmentOwner,
+}
+
+impl fmt::Display for DelegatedLineageSubject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AssignmentCreator => f.write_str("assignment creator"),
+            Self::AssignmentOwner => f.write_str("assignment owner"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DelegatedAssignmentRefusal {
+    PluginUnavailable,
+    ActionNotGranted {
+        action: DelegatableAction,
+    },
+    ManagerNotFound {
+        agent_id: String,
+    },
+    ManagerRetired {
+        agent_id: String,
+    },
+    AssignmentNotFound {
+        assignment_id: String,
+    },
+    AssignmentCreatorMissing {
+        assignment_id: String,
+    },
+    AssignmentOwnerMissing {
+        assignment_id: String,
+    },
+    AmbiguousOwners {
+        assignment_id: String,
+        owners: Vec<String>,
+    },
+    Lineage {
+        subject: DelegatedLineageSubject,
+        reason: DelegatedLineageRefusal,
+    },
+    Ledger {
+        reason: String,
+    },
+    Assignments {
+        reason: String,
+    },
+}
+
+impl fmt::Display for DelegatedAssignmentRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PluginUnavailable => f.write_str("repo-worker is not set up"),
+            Self::ActionNotGranted { action } => {
+                write!(f, "delegation policy does not grant '{action}'")
+            }
+            Self::ManagerNotFound { agent_id } => {
+                write!(f, "manager agent '{agent_id}' is missing")
+            }
+            Self::ManagerRetired { agent_id } => {
+                write!(f, "manager agent '{agent_id}' is retired")
+            }
+            Self::AssignmentNotFound { assignment_id } => {
+                write!(f, "assignment '{assignment_id}' is missing")
+            }
+            Self::AssignmentCreatorMissing { assignment_id } => write!(
+                f,
+                "assignment '{assignment_id}' has no durable creator lineage"
+            ),
+            Self::AssignmentOwnerMissing { assignment_id } => {
+                write!(f, "assignment '{assignment_id}' has no current owner")
+            }
+            Self::AmbiguousOwners {
+                assignment_id,
+                owners,
+            } => write!(
+                f,
+                "assignment '{assignment_id}' has ambiguous owners [{}]",
+                owners.join(", ")
+            ),
+            Self::Lineage { subject, reason } => {
+                write!(f, "{subject} lineage refused: {reason}")
+            }
+            Self::Ledger { reason } => write!(f, "cannot read agent lineage: {reason}"),
+            Self::Assignments { reason } => {
+                write!(f, "cannot read durable assignment: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DelegatedAssignmentRefusal {}
 
 #[derive(Default)]
 pub struct RepoWorkerPlugin {
@@ -3043,6 +3282,64 @@ async fn publish_assignment(
     }
 }
 
+async fn delegated_lineage_hops(
+    ledger: &Ledger,
+    agent_id: &str,
+    manager_agent_id: &str,
+    allow_manager_itself: bool,
+) -> Result<usize, DelegatedLineageCheckError> {
+    let mut current = agent_id.to_string();
+    let mut visited = HashSet::new();
+
+    for hops in 0..=64 {
+        if !visited.insert(current.clone()) {
+            return Err(DelegatedLineageCheckError::Refusal(
+                DelegatedLineageRefusal::Cycle { agent_id: current },
+            ));
+        }
+        let row = ledger
+            .get_agent(&current)
+            .await
+            .map_err(|error| DelegatedLineageCheckError::Ledger(error.to_string()))?
+            .ok_or_else(|| {
+                DelegatedLineageCheckError::Refusal(DelegatedLineageRefusal::MissingAgent {
+                    agent_id: current.clone(),
+                })
+            })?;
+
+        if current == manager_agent_id {
+            if hops > 0 || allow_manager_itself {
+                return Ok(hops);
+            }
+            return Err(DelegatedLineageCheckError::Refusal(
+                DelegatedLineageRefusal::OutsideManager {
+                    agent_id: agent_id.to_string(),
+                    manager_agent_id: manager_agent_id.to_string(),
+                },
+            ));
+        }
+
+        let Some(parent) = row.spawned_by else {
+            return Err(DelegatedLineageCheckError::Refusal(
+                DelegatedLineageRefusal::OutsideManager {
+                    agent_id: agent_id.to_string(),
+                    manager_agent_id: manager_agent_id.to_string(),
+                },
+            ));
+        };
+        current = parent;
+    }
+
+    Err(DelegatedLineageCheckError::Refusal(
+        DelegatedLineageRefusal::TooDeep,
+    ))
+}
+
+enum DelegatedLineageCheckError {
+    Refusal(DelegatedLineageRefusal),
+    Ledger(String),
+}
+
 impl RepoWorkerPlugin {
     fn assignment_db(&self) -> Option<AssignmentDb> {
         Some(AssignmentDb::new(self.ctx.as_ref()?.pool.clone()))
@@ -3053,6 +3350,117 @@ impl RepoWorkerPlugin {
             Some(db) => db.list().await,
             None => Ok(Vec::new()),
         }
+    }
+
+    /// Verify the durable assignment and lineage facts required by the future
+    /// isolated broker.
+    ///
+    /// `manager_agent_id` is not treated as provenance. The caller must already
+    /// hold a backend-attested principal bound to that manager and policy. This
+    /// method is deliberately read-only and cannot publish, clean up, or make a
+    /// backend available; it only prevents the future broker from trusting
+    /// request prose or incomplete assignment metadata.
+    pub async fn preflight_delegated_assignment(
+        &self,
+        manager_agent_id: &str,
+        policy: &DelegationPolicy,
+        request: &DelegatedAssignmentRequest,
+    ) -> Result<DelegatedAssignmentEligibility, DelegatedAssignmentRefusal> {
+        let Some(ctx) = self.ctx.as_ref() else {
+            return Err(DelegatedAssignmentRefusal::PluginUnavailable);
+        };
+        let action = request.action();
+        if !policy.contains(action) {
+            return Err(DelegatedAssignmentRefusal::ActionNotGranted { action });
+        }
+
+        let manager = ctx
+            .ledger
+            .get_agent(manager_agent_id)
+            .await
+            .map_err(|error| DelegatedAssignmentRefusal::Ledger {
+                reason: error.to_string(),
+            })?
+            .ok_or_else(|| DelegatedAssignmentRefusal::ManagerNotFound {
+                agent_id: manager_agent_id.to_string(),
+            })?;
+        if manager.retired {
+            return Err(DelegatedAssignmentRefusal::ManagerRetired {
+                agent_id: manager_agent_id.to_string(),
+            });
+        }
+
+        let assignment_id = request.assignment_id();
+        let assignment = AssignmentDb::new(ctx.pool.clone())
+            .get_by_id(assignment_id)
+            .await
+            .map_err(|error| DelegatedAssignmentRefusal::Assignments {
+                reason: error.to_string(),
+            })?
+            .ok_or_else(|| DelegatedAssignmentRefusal::AssignmentNotFound {
+                assignment_id: assignment_id.to_string(),
+            })?;
+
+        let creator = assignment.spawned_by.as_deref().ok_or_else(|| {
+            DelegatedAssignmentRefusal::AssignmentCreatorMissing {
+                assignment_id: assignment_id.to_string(),
+            }
+        })?;
+        let creator_hops = delegated_lineage_hops(&ctx.ledger, creator, manager_agent_id, true)
+            .await
+            .map_err(|refusal| match refusal {
+                DelegatedLineageCheckError::Refusal(reason) => {
+                    DelegatedAssignmentRefusal::Lineage {
+                        subject: DelegatedLineageSubject::AssignmentCreator,
+                        reason,
+                    }
+                }
+                DelegatedLineageCheckError::Ledger(reason) => {
+                    DelegatedAssignmentRefusal::Ledger { reason }
+                }
+            })?;
+
+        let owner = assignment.agent_id.as_deref().ok_or_else(|| {
+            DelegatedAssignmentRefusal::AssignmentOwnerMissing {
+                assignment_id: assignment_id.to_string(),
+            }
+        })?;
+        let mut related = assignment.related_agent_ids.clone();
+        related.sort();
+        related.dedup();
+        if related.len() != 1 || related.first().is_none_or(|known| known != owner) {
+            if !related.iter().any(|known| known == owner) {
+                related.push(owner.to_string());
+                related.sort();
+            }
+            return Err(DelegatedAssignmentRefusal::AmbiguousOwners {
+                assignment_id: assignment_id.to_string(),
+                owners: related,
+            });
+        }
+
+        let owner_hops = delegated_lineage_hops(&ctx.ledger, owner, manager_agent_id, false)
+            .await
+            .map_err(|refusal| match refusal {
+                DelegatedLineageCheckError::Refusal(reason) => {
+                    DelegatedAssignmentRefusal::Lineage {
+                        subject: DelegatedLineageSubject::AssignmentOwner,
+                        reason,
+                    }
+                }
+                DelegatedLineageCheckError::Ledger(reason) => {
+                    DelegatedAssignmentRefusal::Ledger { reason }
+                }
+            })?;
+
+        Ok(DelegatedAssignmentEligibility {
+            manager_agent_id: manager_agent_id.to_string(),
+            assignment_id: assignment_id.to_string(),
+            owner_agent_id: owner.to_string(),
+            action,
+            creator_hops,
+            owner_hops,
+        })
     }
 }
 
@@ -4794,6 +5202,354 @@ mod tests {
             .await
             .expect("read assignment")
             .expect("assignment row")
+    }
+
+    struct DelegationFixture {
+        plugin: RepoWorkerPlugin,
+        ledger: Ledger,
+        manager: String,
+        creator: String,
+        owner: String,
+        assignment_id: String,
+    }
+
+    async fn delegation_fixture(indirect: bool) -> DelegationFixture {
+        let root =
+            std::env::temp_dir().join(format!("ciacola-delegated-preflight-{}", ulid::Ulid::new()));
+        let repos = Repos {
+            root: root.clone(),
+            allowed: Arc::new(vec!["local/repo".into()]),
+            gh_binary: PathBuf::from("gh"),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let (plugin, ledger) = memory_plugin(repos).await;
+        let manager = ledger
+            .create_agent(&ciacola_core::AgentDef::new("manager", "s"), None)
+            .await
+            .expect("manager");
+        let creator = if indirect {
+            ledger
+                .create_agent(
+                    &ciacola_core::AgentDef::new("dispatcher", "s"),
+                    Some(&manager),
+                )
+                .await
+                .expect("dispatcher")
+        } else {
+            manager.clone()
+        };
+        let owner = ledger
+            .create_agent(
+                &ciacola_core::AgentDef::new("implementer", "s"),
+                Some(&creator),
+            )
+            .await
+            .expect("owner");
+        let assignment_id = ulid::Ulid::new().to_string();
+        let now = ciacola_core::now_unix();
+        sqlx::query(
+            "INSERT INTO repo_worker_assignments
+                 (assignment_id, repo, issue_number, state, phase, base, slug, branch,
+                  worktree, bare_path, agent_id, related_agent_ids, spawned_by,
+                  created_unix, updated_unix)
+             VALUES (?1, 'local/repo', 81, 'active', 'ready', 'main', 'delegated',
+                     'agent/delegated', ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        )
+        .bind(&assignment_id)
+        .bind(root.join("wt-delegated").display().to_string())
+        .bind(root.join("repo.git").display().to_string())
+        .bind(&owner)
+        .bind(serde_json::to_string(&[&owner]).expect("owners"))
+        .bind(&creator)
+        .bind(now)
+        .execute(&plugin.ctx.as_ref().expect("context").pool)
+        .await
+        .expect("assignment");
+        DelegationFixture {
+            plugin,
+            ledger,
+            manager,
+            creator,
+            owner,
+            assignment_id,
+        }
+    }
+
+    fn delegated_open(assignment_id: &str) -> DelegatedAssignmentRequest {
+        DelegatedAssignmentRequest::OpenPr(DelegatedOpenPrRequest {
+            assignment_id: assignment_id.to_string(),
+            expected_head: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            title: "fix: delegated test".to_string(),
+            body: "Closes #81.".to_string(),
+        })
+    }
+
+    fn delegated_finish(assignment_id: &str) -> DelegatedAssignmentRequest {
+        DelegatedAssignmentRequest::FinishIssue(DelegatedFinishIssueRequest {
+            assignment_id: assignment_id.to_string(),
+            disposition: DelegatedFinishDisposition::RemoveIfMergedOrUnchanged,
+        })
+    }
+
+    fn delegated_policy(actions: impl IntoIterator<Item = DelegatableAction>) -> DelegationPolicy {
+        DelegationPolicy::new(actions).expect("delegation policy")
+    }
+
+    #[tokio::test]
+    async fn delegated_preflight_proves_direct_and_indirect_durable_lineage() {
+        let direct = delegation_fixture(false).await;
+        let policy = delegated_policy([
+            DelegatableAction::RepoWorkerOpenPr,
+            DelegatableAction::RepoWorkerFinishIssue,
+        ]);
+        let direct_proof = direct
+            .plugin
+            .preflight_delegated_assignment(
+                &direct.manager,
+                &policy,
+                &delegated_open(&direct.assignment_id),
+            )
+            .await
+            .expect("direct assignment");
+        assert_eq!(direct_proof.manager_agent_id(), direct.manager);
+        assert_eq!(direct_proof.assignment_id(), direct.assignment_id);
+        assert_eq!(direct_proof.owner_agent_id(), direct.owner);
+        assert_eq!(direct_proof.action(), DelegatableAction::RepoWorkerOpenPr);
+        assert_eq!(direct_proof.creator_hops(), 0);
+        assert_eq!(direct_proof.owner_hops(), 1);
+
+        let indirect = delegation_fixture(true).await;
+        let indirect_proof = indirect
+            .plugin
+            .preflight_delegated_assignment(
+                &indirect.manager,
+                &policy,
+                &delegated_finish(&indirect.assignment_id),
+            )
+            .await
+            .expect("indirect assignment");
+        assert_eq!(
+            indirect_proof.action(),
+            DelegatableAction::RepoWorkerFinishIssue
+        );
+        assert_eq!(indirect_proof.creator_hops(), 1);
+        assert_eq!(indirect_proof.owner_hops(), 2);
+    }
+
+    #[tokio::test]
+    async fn delegated_preflight_fails_closed_on_policy_manager_and_assignment_gaps() {
+        let fixture = delegation_fixture(false).await;
+        let open_only = delegated_policy([DelegatableAction::RepoWorkerOpenPr]);
+        assert_eq!(
+            fixture
+                .plugin
+                .preflight_delegated_assignment(
+                    &fixture.manager,
+                    &open_only,
+                    &delegated_finish(&fixture.assignment_id),
+                )
+                .await,
+            Err(DelegatedAssignmentRefusal::ActionNotGranted {
+                action: DelegatableAction::RepoWorkerFinishIssue,
+            })
+        );
+        assert_eq!(
+            fixture
+                .plugin
+                .preflight_delegated_assignment(
+                    "missing-manager",
+                    &open_only,
+                    &delegated_open(&fixture.assignment_id),
+                )
+                .await,
+            Err(DelegatedAssignmentRefusal::ManagerNotFound {
+                agent_id: "missing-manager".to_string(),
+            })
+        );
+        assert_eq!(
+            fixture
+                .plugin
+                .preflight_delegated_assignment(
+                    &fixture.manager,
+                    &open_only,
+                    &delegated_open("missing-assignment"),
+                )
+                .await,
+            Err(DelegatedAssignmentRefusal::AssignmentNotFound {
+                assignment_id: "missing-assignment".to_string(),
+            })
+        );
+
+        let ownerless = delegation_fixture(false).await;
+        sqlx::query("UPDATE repo_worker_assignments SET agent_id = NULL WHERE assignment_id = ?1")
+            .bind(&ownerless.assignment_id)
+            .execute(&ownerless.plugin.ctx.as_ref().expect("context").pool)
+            .await
+            .expect("remove owner");
+        assert_eq!(
+            ownerless
+                .plugin
+                .preflight_delegated_assignment(
+                    &ownerless.manager,
+                    &open_only,
+                    &delegated_open(&ownerless.assignment_id),
+                )
+                .await,
+            Err(DelegatedAssignmentRefusal::AssignmentOwnerMissing {
+                assignment_id: ownerless.assignment_id,
+            })
+        );
+
+        assert!(
+            fixture
+                .ledger
+                .retire_agent(&fixture.manager)
+                .await
+                .expect("retire manager")
+        );
+        assert_eq!(
+            fixture
+                .plugin
+                .preflight_delegated_assignment(
+                    &fixture.manager,
+                    &open_only,
+                    &delegated_open(&fixture.assignment_id),
+                )
+                .await,
+            Err(DelegatedAssignmentRefusal::ManagerRetired {
+                agent_id: fixture.manager,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_preflight_refuses_cross_manager_missing_cyclic_and_ambiguous_lineage() {
+        let policy = delegated_policy([DelegatableAction::RepoWorkerOpenPr]);
+
+        let cross = delegation_fixture(true).await;
+        let other_manager = cross
+            .ledger
+            .create_agent(&ciacola_core::AgentDef::new("other", "s"), None)
+            .await
+            .expect("other manager");
+        let refusal = cross
+            .plugin
+            .preflight_delegated_assignment(
+                &other_manager,
+                &policy,
+                &delegated_open(&cross.assignment_id),
+            )
+            .await
+            .expect_err("cross-manager assignment");
+        assert!(
+            matches!(
+                refusal,
+                DelegatedAssignmentRefusal::Lineage {
+                    subject: DelegatedLineageSubject::AssignmentCreator,
+                    reason: DelegatedLineageRefusal::OutsideManager { .. }
+                }
+            ),
+            "got: {refusal}"
+        );
+
+        let missing = delegation_fixture(true).await;
+        sqlx::query("UPDATE agents SET spawned_by = 'missing-link' WHERE agent_id = ?1")
+            .bind(&missing.owner)
+            .execute(&missing.plugin.ctx.as_ref().expect("context").pool)
+            .await
+            .expect("break owner lineage");
+        let refusal = missing
+            .plugin
+            .preflight_delegated_assignment(
+                &missing.manager,
+                &policy,
+                &delegated_open(&missing.assignment_id),
+            )
+            .await
+            .expect_err("missing link");
+        assert!(
+            matches!(
+                refusal,
+                DelegatedAssignmentRefusal::Lineage {
+                    subject: DelegatedLineageSubject::AssignmentOwner,
+                    reason: DelegatedLineageRefusal::MissingAgent { .. }
+                }
+            ),
+            "got: {refusal}"
+        );
+
+        let cycle = delegation_fixture(true).await;
+        sqlx::query("UPDATE agents SET spawned_by = ?2 WHERE agent_id = ?1")
+            .bind(&cycle.creator)
+            .bind(&cycle.owner)
+            .execute(&cycle.plugin.ctx.as_ref().expect("context").pool)
+            .await
+            .expect("cycle lineage");
+        let refusal = cycle
+            .plugin
+            .preflight_delegated_assignment(
+                &cycle.manager,
+                &policy,
+                &delegated_open(&cycle.assignment_id),
+            )
+            .await
+            .expect_err("cycle");
+        assert!(
+            matches!(
+                refusal,
+                DelegatedAssignmentRefusal::Lineage {
+                    subject: DelegatedLineageSubject::AssignmentCreator,
+                    reason: DelegatedLineageRefusal::Cycle { .. }
+                }
+            ),
+            "got: {refusal}"
+        );
+
+        let legacy = delegation_fixture(false).await;
+        sqlx::query(
+            "UPDATE repo_worker_assignments SET spawned_by = NULL WHERE assignment_id = ?1",
+        )
+        .bind(&legacy.assignment_id)
+        .execute(&legacy.plugin.ctx.as_ref().expect("context").pool)
+        .await
+        .expect("legacy creator");
+        assert_eq!(
+            legacy
+                .plugin
+                .preflight_delegated_assignment(
+                    &legacy.manager,
+                    &policy,
+                    &delegated_open(&legacy.assignment_id),
+                )
+                .await,
+            Err(DelegatedAssignmentRefusal::AssignmentCreatorMissing {
+                assignment_id: legacy.assignment_id,
+            })
+        );
+
+        let ambiguous = delegation_fixture(false).await;
+        sqlx::query(
+            "UPDATE repo_worker_assignments SET related_agent_ids = ?2 WHERE assignment_id = ?1",
+        )
+        .bind(&ambiguous.assignment_id)
+        .bind(serde_json::to_string(&[&ambiguous.owner, &ambiguous.manager]).expect("owners"))
+        .execute(&ambiguous.plugin.ctx.as_ref().expect("context").pool)
+        .await
+        .expect("ambiguous owners");
+        let refusal = ambiguous
+            .plugin
+            .preflight_delegated_assignment(
+                &ambiguous.manager,
+                &policy,
+                &delegated_open(&ambiguous.assignment_id),
+            )
+            .await
+            .expect_err("ambiguous owners");
+        assert!(
+            matches!(refusal, DelegatedAssignmentRefusal::AmbiguousOwners { .. }),
+            "got: {refusal}"
+        );
     }
 
     #[test]
