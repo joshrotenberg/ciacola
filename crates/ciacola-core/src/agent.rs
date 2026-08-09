@@ -31,6 +31,15 @@ pub type FlatError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentDef {
     pub name: String,
+    /// Stable catalog role this definition was instantiated from.
+    ///
+    /// Kept separate from `name`: callers rename role instances (for
+    /// example `impl-owner-repo-42`) while tuning and operator surfaces
+    /// still need to know that the instance came from
+    /// `issue-implementer`. Direct spawns and definitions written before
+    /// this field existed have no catalog provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    catalog_role: Option<String>,
     pub system_prompt: String,
     /// Which backend runs this agent's turns.
     ///
@@ -139,6 +148,7 @@ impl AgentDef {
     pub fn new(name: impl Into<String>, system_prompt: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            catalog_role: None,
             system_prompt: system_prompt.into(),
             provider: ProviderKey::claude(),
             provider_inherited: true,
@@ -156,6 +166,19 @@ impl AgentDef {
             house_rules: None,
             token_env: None,
         }
+    }
+
+    /// Catalog role this definition was instantiated from, if any.
+    ///
+    /// This is read-only outside core. Role provenance is assigned by the
+    /// catalog itself rather than accepted from raw spawn input.
+    pub fn catalog_role(&self) -> Option<&str> {
+        self.catalog_role.as_deref()
+    }
+
+    pub(crate) fn with_catalog_role(mut self, role: impl Into<String>) -> Self {
+        self.catalog_role = Some(role.into());
+        self
     }
 
     /// Choose the backend. Omitted definitions inherit the server default at
@@ -764,9 +787,19 @@ mod migration_tests {
         let def: AgentDef = serde_json::from_str(legacy).expect("a pre-provider row still parses");
         assert_eq!(def.provider, ProviderKey::claude());
         assert_eq!(def.name, "ciacola-manager");
+        assert_eq!(def.catalog_role(), None);
         assert!(
             !def.provider_inherited,
             "a stored legacy definition must not follow a new runtime default"
+        );
+    }
+
+    #[test]
+    fn direct_definitions_omit_absent_catalog_provenance() {
+        let value = serde_json::to_value(def()).expect("serialize");
+        assert!(
+            value.get("catalog_role").is_none(),
+            "direct and legacy definitions should keep their old JSON shape: {value}"
         );
     }
 

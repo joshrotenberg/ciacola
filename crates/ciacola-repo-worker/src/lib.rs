@@ -6960,6 +6960,7 @@ mod tests {
         assert!(def.allowed_tools.is_empty());
         assert!(def.inherit_provider_tools);
         assert_eq!(def.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(def.catalog_role(), Some(ROLE));
 
         std::fs::remove_dir_all(&tmp).ok();
     }
