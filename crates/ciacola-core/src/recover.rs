@@ -125,10 +125,9 @@ pub async fn recover(
             report.orphans_unverified += 1;
         }
         ledger
-            .fail_turn(
+            .recover_turn(
                 &turn.agent_id,
                 turn.seq,
-                "failed",
                 // "conversation intact" used to be asserted rather
                 // than known, and was wrong in exactly the case it was
                 // written for: the session id was recorded only at turn
@@ -150,11 +149,6 @@ pub async fn recover(
                                        verified dead, check by hand; no session recorded"
                         .to_string(),
                 },
-                0,
-                // Unknown by construction: the process that was timing
-                // this turn is the one that died.
-                0,
-                None,
             )
             .await?;
         report.orphaned += 1;
@@ -166,4 +160,62 @@ pub async fn recover(
     }
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::AgentDef;
+
+    struct NoopExecutor;
+
+    impl TurnExecutor for NoopExecutor {
+        fn submit(&self, _agent_id: String, _seq: i64) {}
+
+        fn kill(&self, _agent_id: &str, _seq: i64) -> bool {
+            false
+        }
+
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+    }
+
+    /// The process-local Instant died in the crash, but the claim time
+    /// did not. Recovery retains the durable upper bound without calling
+    /// it a measured provider duration, and marks unavailable accounting.
+    #[tokio::test]
+    async fn restart_recovery_marks_elapsed_as_an_upper_bound() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool).await.expect("ledger");
+        let agent_id = ledger
+            .create_agent(&AgentDef::new("a", "s"), None)
+            .await
+            .expect("agent");
+        let seq = ledger
+            .enqueue_turn(&agent_id, "a long enough recovery prompt")
+            .await
+            .expect("turn");
+        assert!(ledger.claim_turn(&agent_id, seq).await.expect("claim"));
+        let claimed = crate::time::now_unix_ms() - 3_000;
+        sqlx::query("UPDATE turns SET claimed_unix_ms = ?3 WHERE agent_id = ?1 AND seq = ?2")
+            .bind(&agent_id)
+            .bind(seq)
+            .bind(claimed)
+            .execute(ledger.pool())
+            .await
+            .expect("age claim");
+
+        let report = recover(&ledger, &NoopExecutor).await.expect("recover");
+        assert_eq!(report.orphaned, 1);
+        assert_eq!(report.orphans_unverified, 1);
+        let turn = ledger.get_turn(&agent_id, seq).await.unwrap().unwrap();
+        assert_eq!(turn.state, "failed");
+        assert!(turn.elapsed_ms >= 3_000, "elapsed was {}", turn.elapsed_ms);
+        assert_eq!(turn.elapsed_state, "upper_bound");
+        assert_eq!(turn.cost_state, "unreported");
+        assert_eq!(turn.usage_state, "unreported");
+    }
 }

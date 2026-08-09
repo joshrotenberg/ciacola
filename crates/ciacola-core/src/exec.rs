@@ -12,11 +12,11 @@
 //!   queue and let a worker drive the same functions.
 //!
 //! `claim_turn` is what makes both safe: whoever delivers the work, and
-//! however many times, the exchange runs at most once. The claim also
-//! gates the kill registry: only the delivery that wins the claim
-//! registers a token, so a duplicate delivery can never clobber the
-//! live turn's kill switch (a defect the adversarial review caught in
-//! the first version, where the token was registered before the claim).
+//! however many times, the exchange runs at most once. Only the delivery
+//! that wins the claim registers a kill token. It then rechecks the
+//! durable state before touching the provider, which closes the small
+//! claim-to-registration window in which a kill may already have settled
+//! the row without finding a token to signal.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -72,32 +72,10 @@ pub async fn run_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str, seq: i
 /// nothing can be left `running` by anything short of a crash.
 #[tracing::instrument(skip_all, fields(agent = %agent_id, seq, outcome = tracing::field::Empty))]
 pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str, seq: i64) {
-    let fail = |state: &'static str,
-                error: String,
-                cost: i64,
-                elapsed_ms: u64,
-                session: Option<String>,
-                exchange: Option<crate::agent::Exchange>| async move {
-        let recorded = match exchange.as_ref() {
-            Some(exchange) => {
-                ledger
-                    .fail_exchange(agent_id, seq, state, &error, exchange)
-                    .await
-            }
-            None => {
-                ledger
-                    .fail_turn(
-                        agent_id,
-                        seq,
-                        state,
-                        &error,
-                        cost,
-                        elapsed_ms as i64,
-                        session.as_deref(),
-                    )
-                    .await
-            }
-        };
+    let fail = |state: &'static str, error: String, exchange: crate::agent::Exchange| async move {
+        let recorded = ledger
+            .fail_exchange(agent_id, seq, state, &error, &exchange)
+            .await;
         if let Err(e) = recorded {
             eprintln!("[exec] record failure {agent_id}/{seq}: {e}");
         }
@@ -107,16 +85,13 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
 
     let (def, mcp, session, started, prompt) = match load(ledger, agent_id, seq).await {
         Ok(loaded) => loaded,
-        Err(e) => return fail("failed", e.to_string(), 0, 0, None, None).await,
+        Err(e) => {
+            return abort_before_provider(ledger, notify, agent_id, seq, &e.to_string()).await;
+        }
     };
 
-    let wall = std::time::Instant::now();
-    let events = SessionSink {
-        ledger: ledger.clone(),
-        agent_id: agent_id.to_string(),
-        seq,
-    };
-    match run_exchange(
+    let events = SessionSink::new(ledger.clone(), agent_id.to_string(), seq);
+    let result = run_exchange(
         ledger.providers(),
         &def,
         mcp,
@@ -125,21 +100,18 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
         &prompt,
         &events,
     )
-    .await
-    {
+    .await;
+    // On a normal provider return, make every synchronously enqueued
+    // usage observation durable before terminal settlement. If this
+    // future is cancelled instead, dropping the sender closes the queue
+    // and the detached writer drains it against the claimed killed row.
+    events.drain().await;
+    match result {
         Ok(exchange) => {
             if let Some(error) = &exchange.error {
                 // The provider ran and failed. The spend and any session
                 // it learned are real; record both.
-                return fail(
-                    "failed",
-                    error.clone(),
-                    exchange.cost_micro_usd() as i64,
-                    exchange.elapsed_ms,
-                    exchange.session.clone(),
-                    Some(exchange),
-                )
-                .await;
+                return fail("failed", error.clone(), exchange).await;
             }
             let detail: String = exchange.reply.chars().take(120).collect();
             match ledger.complete_turn(agent_id, seq, &exchange).await {
@@ -157,30 +129,17 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
                     fail(
                         "failed",
                         format!("exchange succeeded but recording failed: {e}"),
-                        exchange.cost_micro_usd() as i64,
-                        exchange.elapsed_ms,
-                        exchange.session.clone(),
-                        Some(exchange),
+                        exchange,
                     )
                     .await;
                 }
             }
         }
-        Err(e) => {
-            fail(
-                "failed",
-                e.to_string(),
-                0,
-                wall.elapsed().as_millis() as u64,
-                None,
-                None,
-            )
-            .await
-        }
+        Err(e) => abort_before_provider(ledger, notify, agent_id, seq, &e.to_string()).await,
     }
 }
 
-/// Persists a conversation id the moment a backend reveals one.
+/// Persists observations a backend reveals before its terminal outcome.
 ///
 /// Ciacola assigns ids up front, so for Claude this usually confirms an
 /// id already in the ledger and writes nothing new. It exists for the
@@ -189,12 +148,62 @@ pub async fn run_claimed_turn(ledger: &Ledger, notify: &Notifier, agent_id: &str
 /// twenty minutes to run, and a crash in those twenty minutes would
 /// otherwise lose the id and make "send again" start over.
 ///
-/// Never fails a turn. An id that cannot be written is worth a log line,
-/// not an abandoned run that has already been paid for.
+/// Usage snapshots have a tighter cancellation constraint: an async
+/// callback could be dropped with the provider future before it writes.
+/// The synchronous callback therefore only enqueues cumulative totals;
+/// one detached writer owns SQLite ordering for this turn. Normal return
+/// drains it explicitly, while cancellation drops the sender and leaves
+/// the task to drain against the claimed killed row.
+///
+/// Neither observation ever fails a turn. Telemetry that cannot be
+/// written is worth a log line, not an abandoned run already paid for.
 struct SessionSink {
     ledger: Ledger,
     agent_id: String,
     seq: i64,
+    usage_tx: mpsc::UnboundedSender<ciacola_agent::TokenUsage>,
+    usage_writer: tokio::task::JoinHandle<()>,
+}
+
+impl SessionSink {
+    fn new(ledger: Ledger, agent_id: String, seq: i64) -> Self {
+        let (usage_tx, mut usage_rx) = mpsc::unbounded_channel();
+        let writer_ledger = ledger.clone();
+        let writer_agent = agent_id.clone();
+        let usage_writer = tokio::spawn(async move {
+            while let Some(usage) = usage_rx.recv().await {
+                if let Err(e) = writer_ledger
+                    .record_usage_snapshot(&writer_agent, seq, usage)
+                    .await
+                {
+                    // Telemetry persistence is best effort and must never
+                    // turn provider work into an application failure.
+                    eprintln!("[exec] persist usage {writer_agent}/{seq}: {e}");
+                }
+            }
+        });
+        Self {
+            ledger,
+            agent_id,
+            seq,
+            usage_tx,
+            usage_writer,
+        }
+    }
+
+    async fn drain(self) {
+        let Self {
+            usage_tx,
+            usage_writer,
+            agent_id,
+            seq,
+            ..
+        } = self;
+        drop(usage_tx);
+        if let Err(e) = usage_writer.await {
+            eprintln!("[exec] usage writer {agent_id}/{seq}: {e}");
+        }
+    }
 }
 
 impl ciacola_agent::TurnEvents for SessionSink {
@@ -208,6 +217,15 @@ impl ciacola_agent::TurnEvents for SessionSink {
                 eprintln!("[exec] persist session {}: {e}", self.agent_id);
             }
         })
+    }
+
+    fn usage_snapshot(&self, usage: ciacola_agent::TokenUsage) {
+        if self.usage_tx.send(usage).is_err() {
+            eprintln!(
+                "[exec] usage writer closed before snapshot {}/{}",
+                self.agent_id, self.seq
+            );
+        }
     }
 }
 
@@ -377,7 +395,115 @@ async fn load(
     Ok((agent.def, mcp, agent.session, started, turn.prompt))
 }
 
-type Kills = Arc<Mutex<HashMap<(String, i64), CancellationToken>>>;
+pub(crate) type Kills = Arc<Mutex<HashMap<(String, i64), CancellationToken>>>;
+
+/// A kill token installed for the one delivery that owns the claim.
+/// Removing it in `Drop` keeps every early return on the safe path.
+struct KillRegistration {
+    kills: Kills,
+    key: (String, i64),
+    token: CancellationToken,
+}
+
+impl KillRegistration {
+    fn install(kills: Kills, agent_id: &str, seq: i64) -> Option<Self> {
+        let key = (agent_id.to_string(), seq);
+        let token = CancellationToken::new();
+        kills.lock().ok()?.insert(key.clone(), token.clone());
+        Some(Self { kills, key, token })
+    }
+}
+
+impl Drop for KillRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.kills.lock() {
+            map.remove(&self.key);
+        }
+    }
+}
+
+/// Run a claimed turn behind its registered kill switch.
+///
+/// Registration happens before the durable-state read. If an operator
+/// settled the turn between claim and registration, the read observes
+/// that terminal state and the provider is never polled. If the kill
+/// lands after registration, it can signal `token`; cancellation is
+/// deliberately polled first so a ready token cannot lose a select race
+/// and launch the provider anyway.
+pub(crate) async fn run_claimed_turn_cancellable(
+    ledger: &Ledger,
+    notify: &Notifier,
+    kills: Kills,
+    agent_id: &str,
+    seq: i64,
+) {
+    let Some(registration) = KillRegistration::install(kills, agent_id, seq) else {
+        abort_before_provider(
+            ledger,
+            notify,
+            agent_id,
+            seq,
+            "kill-token registry lock poisoned before provider launch",
+        )
+        .await;
+        return;
+    };
+
+    match ledger.get_turn(agent_id, seq).await {
+        Ok(Some(turn)) if turn.state == "running" => {}
+        // A kill in the claim-to-registration gap already settled the
+        // durable row. Its record wins, and no provider work may start.
+        Ok(_) => return,
+        Err(e) => {
+            abort_before_provider(
+                ledger,
+                notify,
+                agent_id,
+                seq,
+                &format!("could not validate turn state before provider launch: {e}"),
+            )
+            .await;
+            return;
+        }
+    }
+
+    run_registered_claimed_turn(ledger, notify, agent_id, seq, &registration).await;
+}
+
+async fn abort_before_provider(
+    ledger: &Ledger,
+    notify: &Notifier,
+    agent_id: &str,
+    seq: i64,
+    error: &str,
+) {
+    match ledger.abort_claimed_turn(agent_id, seq, error).await {
+        Ok(true) => {
+            tracing::warn!(agent = %agent_id, seq, %error, "dispatch aborted before provider launch");
+            notify.turn(LogLevel::Error, agent_id, seq, "failed", error);
+        }
+        Ok(false) => {}
+        Err(settle) => {
+            eprintln!(
+                "[exec] abort before provider {agent_id}/{seq}: {error}; settlement failed: {settle}"
+            );
+        }
+    }
+}
+
+async fn run_registered_claimed_turn(
+    ledger: &Ledger,
+    notify: &Notifier,
+    agent_id: &str,
+    seq: i64,
+    registration: &KillRegistration,
+) {
+    tokio::select! {
+        biased;
+        () = registration.token.cancelled() => {}
+        () = run_claimed_turn(ledger, notify, agent_id, seq) => {}
+    }
+}
 
 /// The default executor: everything a work queue would do for us,
 /// written out. A channel is the queue, a semaphore is the
@@ -441,23 +567,9 @@ impl HandExecutor {
                             return;
                         }
                     }
-                    let key = (agent_id.clone(), seq);
-                    let token = CancellationToken::new();
-                    if let Ok(mut map) = kills.lock() {
-                        map.insert(key.clone(), token.clone());
-                    }
                     inflight.fetch_add(1, Ordering::SeqCst);
-                    tokio::select! {
-                        () = run_claimed_turn(&ledger, &notify, &agent_id, seq) => {}
-                        // The kill tool recorded the turn killed before
-                        // cancelling; dropping the branch above kills
-                        // the provider process group.
-                        () = token.cancelled() => {}
-                    }
+                    run_claimed_turn_cancellable(&ledger, &notify, kills, &agent_id, seq).await;
                     inflight.fetch_sub(1, Ordering::SeqCst);
-                    if let Ok(mut map) = kills.lock() {
-                        map.remove(&key);
-                    }
                 });
             }
         });
@@ -558,6 +670,129 @@ mod config_injection_tests {
         }
     }
 
+    struct NoAttemptProvider;
+
+    impl ciacola_agent::Provider for NoAttemptProvider {
+        fn key(&self) -> ciacola_agent::ProviderKey {
+            ciacola_agent::ProviderKey::new("no-attempt")
+        }
+
+        fn capabilities(&self) -> ciacola_agent::Capabilities {
+            let mut capabilities =
+                ciacola_agent::Capabilities::none(ciacola_agent::ProviderKey::new("no-attempt"));
+            capabilities.client_assigned_resume = true;
+            capabilities.allowed_tools = true;
+            capabilities.reports_cost = true;
+            capabilities.reports_token_usage = true;
+            capabilities
+        }
+
+        fn run<'a>(
+            &'a self,
+            _intent: &'a ciacola_agent::TurnIntent,
+            _events: &'a dyn ciacola_agent::TurnEvents,
+        ) -> ciacola_agent::BoxFut<'a, Result<ciacola_agent::TurnOutcome, ciacola_agent::AgentError>>
+        {
+            Box::pin(async {
+                Err(ciacola_agent::AgentError::NotFound {
+                    provider: ciacola_agent::ProviderKey::new("no-attempt"),
+                    detail: "provider binary missing".into(),
+                })
+            })
+        }
+
+        fn owns_process(&self, _ps_line: &str) -> bool {
+            false
+        }
+    }
+
+    struct EmptyPostLaunchProvider;
+
+    impl ciacola_agent::Provider for EmptyPostLaunchProvider {
+        fn key(&self) -> ciacola_agent::ProviderKey {
+            ciacola_agent::ProviderKey::new("empty-post-launch")
+        }
+
+        fn capabilities(&self) -> ciacola_agent::Capabilities {
+            let mut capabilities = ciacola_agent::Capabilities::none(
+                ciacola_agent::ProviderKey::new("empty-post-launch"),
+            );
+            capabilities.client_assigned_resume = true;
+            capabilities.allowed_tools = true;
+            capabilities.reports_cost = true;
+            capabilities.reports_token_usage = true;
+            capabilities
+        }
+
+        fn run<'a>(
+            &'a self,
+            _intent: &'a ciacola_agent::TurnIntent,
+            events: &'a dyn ciacola_agent::TurnEvents,
+        ) -> ciacola_agent::BoxFut<'a, Result<ciacola_agent::TurnOutcome, ciacola_agent::AgentError>>
+        {
+            Box::pin(async move {
+                events.usage_snapshot(ciacola_agent::TokenUsage {
+                    input: 17,
+                    output: 3,
+                    cached_input: 5,
+                });
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                Err(ciacola_agent::AgentError::Other {
+                    provider: ciacola_agent::ProviderKey::new("empty-post-launch"),
+                    detail: "provider output ended unexpectedly".into(),
+                    partial: ciacola_agent::PartialTelemetry::none().into(),
+                })
+            })
+        }
+
+        fn owns_process(&self, _ps_line: &str) -> bool {
+            false
+        }
+    }
+
+    struct SnapshotBlockingProvider {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl ciacola_agent::Provider for SnapshotBlockingProvider {
+        fn key(&self) -> ciacola_agent::ProviderKey {
+            ciacola_agent::ProviderKey::new("snapshot-blocking")
+        }
+
+        fn capabilities(&self) -> ciacola_agent::Capabilities {
+            let mut capabilities = ciacola_agent::Capabilities::none(
+                ciacola_agent::ProviderKey::new("snapshot-blocking"),
+            );
+            capabilities.client_assigned_resume = true;
+            capabilities.allowed_tools = true;
+            capabilities.reports_cost = true;
+            capabilities.reports_token_usage = true;
+            capabilities
+        }
+
+        fn run<'a>(
+            &'a self,
+            _intent: &'a ciacola_agent::TurnIntent,
+            events: &'a dyn ciacola_agent::TurnEvents,
+        ) -> ciacola_agent::BoxFut<'a, Result<ciacola_agent::TurnOutcome, ciacola_agent::AgentError>>
+        {
+            Box::pin(async move {
+                events.usage_snapshot(ciacola_agent::TokenUsage {
+                    input: 89,
+                    output: 13,
+                    cached_input: 34,
+                });
+                self.started.notify_one();
+                std::future::pending::<()>().await;
+                unreachable!("blocking provider only ends by cancellation")
+            })
+        }
+
+        fn owns_process(&self, _ps_line: &str) -> bool {
+            false
+        }
+    }
+
     fn endpoint<'a>(
         scope: &'a ciacola_agent::McpScope,
         name: &str,
@@ -567,6 +802,32 @@ mod config_injection_tests {
             .iter()
             .find(|e| e.name == name)
             .unwrap_or_else(|| panic!("no endpoint '{name}'"))
+    }
+
+    async fn claimed_fake_turn(
+        seen: Arc<Mutex<Option<ciacola_agent::TurnIntent>>>,
+    ) -> (Ledger, String, i64, Notifier) {
+        let providers = ciacola_agent::ProviderRegistry::new()
+            .with(Arc::new(FakeProvider { seen }))
+            .expect("unique provider");
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool)
+            .await
+            .expect("ledger")
+            .with_providers(providers);
+        let agent_id = ledger
+            .create_agent(
+                &crate::agent::AgentDef::new("a", "system").provider("fake"),
+                None,
+            )
+            .await
+            .expect("agent");
+        let seq = ledger.enqueue_turn(&agent_id, "do it").await.expect("turn");
+        assert!(ledger.claim_turn(&agent_id, seq).await.expect("claim"));
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+        (ledger, agent_id, seq, Notifier(tx))
     }
 
     /// The integration proof for the runtime seam: selection comes out
@@ -642,6 +903,222 @@ mod config_injection_tests {
         assert_eq!(agent.session.as_deref(), Some("fake-session"));
         assert_eq!(agent.session_started_seq, seq);
         assert_eq!(agent.cost_micro_usd, 321);
+    }
+
+    /// HandExecutor and PollingExecutor both enter the provider through
+    /// `run_claimed_turn_cancellable`. This reproduces their old gap
+    /// deterministically: claim first, settle the kill while no token is
+    /// registered, then resume dispatch. The durable recheck must stop
+    /// before `Provider::run` is even called.
+    #[tokio::test]
+    async fn a_kill_in_the_registration_gap_never_launches_the_provider() {
+        let seen = Arc::new(Mutex::new(None));
+        let (ledger, agent_id, seq, notify) = claimed_fake_turn(seen.clone()).await;
+        assert!(
+            ledger
+                .interrupt_turn(&agent_id, seq, "killed", "killed in registration gap")
+                .await
+                .expect("kill")
+        );
+
+        let kills: Kills = Arc::new(Mutex::new(HashMap::new()));
+        run_claimed_turn_cancellable(&ledger, &notify, kills.clone(), &agent_id, seq).await;
+
+        assert!(seen.lock().expect("seen lock").is_none());
+        assert!(kills.lock().expect("kills lock").is_empty());
+        assert_eq!(
+            ledger
+                .get_turn(&agent_id, seq)
+                .await
+                .expect("turn query")
+                .expect("turn")
+                .state,
+            "killed"
+        );
+    }
+
+    /// A token can become ready after the durable recheck and before
+    /// `select!` starts polling. Cancellation is the biased first branch,
+    /// so even that exact ordering cannot poll the provider future once.
+    #[tokio::test]
+    async fn a_pre_cancelled_registration_never_polls_the_provider() {
+        let seen = Arc::new(Mutex::new(None));
+        let (ledger, agent_id, seq, notify) = claimed_fake_turn(seen.clone()).await;
+        let kills: Kills = Arc::new(Mutex::new(HashMap::new()));
+        let registration = KillRegistration::install(kills, &agent_id, seq).expect("register");
+        registration.token.cancel();
+
+        run_registered_claimed_turn(&ledger, &notify, &agent_id, seq, &registration).await;
+
+        assert!(seen.lock().expect("seen lock").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_broken_kill_registry_fails_as_a_known_non_attempt() {
+        let seen = Arc::new(Mutex::new(None));
+        let (ledger, agent_id, seq, notify) = claimed_fake_turn(seen.clone()).await;
+        let kills: Kills = Arc::new(Mutex::new(HashMap::new()));
+        let poison = kills.clone();
+        std::thread::spawn(move || {
+            let _guard = poison.lock().expect("initial lock");
+            panic!("poison registry for the regression");
+        })
+        .join()
+        .expect_err("thread must poison the registry");
+
+        run_claimed_turn_cancellable(&ledger, &notify, kills, &agent_id, seq).await;
+
+        assert!(seen.lock().expect("seen lock").is_none());
+        let turn = ledger
+            .get_turn(&agent_id, seq)
+            .await
+            .expect("turn query")
+            .expect("turn");
+        assert_eq!(turn.state, "failed");
+        assert_eq!(turn.elapsed_state, "not_attempted");
+        assert_eq!(turn.reported_cost_micro_usd(), Some(0));
+        assert_eq!(turn.reported_tokens(), Some((0, 0, 0)));
+    }
+
+    #[tokio::test]
+    async fn a_provider_error_without_partial_telemetry_is_a_known_non_attempt() {
+        let providers = ciacola_agent::ProviderRegistry::new()
+            .with(Arc::new(NoAttemptProvider))
+            .expect("provider");
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool)
+            .await
+            .expect("ledger")
+            .with_providers(providers);
+        let agent_id = ledger
+            .create_agent(
+                &crate::agent::AgentDef::new("a", "system").provider("no-attempt"),
+                None,
+            )
+            .await
+            .expect("agent");
+        let seq = ledger.enqueue_turn(&agent_id, "do it").await.expect("turn");
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+
+        run_turn(&ledger, &Notifier(tx), &agent_id, seq).await;
+
+        let turn = ledger
+            .get_turn(&agent_id, seq)
+            .await
+            .expect("turn query")
+            .expect("turn");
+        assert_eq!(turn.state, "failed");
+        assert_eq!(turn.elapsed_state, "not_attempted");
+        assert_eq!(turn.reported_cost_micro_usd(), Some(0));
+        assert_eq!(turn.reported_tokens(), Some((0, 0, 0)));
+        assert_eq!(turn.provider_turns, Some(0));
+    }
+
+    #[tokio::test]
+    async fn an_empty_post_launch_error_remains_an_attempt_with_unknown_accounting() {
+        let providers = ciacola_agent::ProviderRegistry::new()
+            .with(Arc::new(EmptyPostLaunchProvider))
+            .expect("provider");
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool)
+            .await
+            .expect("ledger")
+            .with_providers(providers);
+        let agent_id = ledger
+            .create_agent(
+                &crate::agent::AgentDef::new("a", "system").provider("empty-post-launch"),
+                None,
+            )
+            .await
+            .expect("agent");
+        let seq = ledger.enqueue_turn(&agent_id, "do it").await.expect("turn");
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+
+        run_turn(&ledger, &Notifier(tx), &agent_id, seq).await;
+
+        let turn = ledger
+            .get_turn(&agent_id, seq)
+            .await
+            .expect("turn query")
+            .expect("turn");
+        assert_eq!(turn.state, "failed");
+        assert_eq!(turn.elapsed_state, "measured");
+        assert!(turn.elapsed_ms >= 1, "elapsed was {}", turn.elapsed_ms);
+        assert_eq!(turn.cost_state, "unreported");
+        assert_eq!(turn.usage_state, "reported");
+        assert_eq!(turn.reported_cost_micro_usd(), None);
+        assert_eq!(turn.reported_tokens(), Some((17, 3, 5)));
+    }
+
+    /// Exercises the real hand executor ordering, including dropping the
+    /// provider future. The snapshot is synchronously queued immediately
+    /// before the provider blocks; kill may beat or lose the SQLite writer,
+    /// and both schedules must converge on reported usage without inventing
+    /// a monetary measurement.
+    #[tokio::test]
+    async fn hand_executor_kill_drains_the_last_usage_snapshot() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let providers = ciacola_agent::ProviderRegistry::new()
+            .with(Arc::new(SnapshotBlockingProvider {
+                started: started.clone(),
+            }))
+            .expect("provider");
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool)
+            .await
+            .expect("ledger")
+            .with_providers(providers);
+        let agent_id = ledger
+            .create_agent(
+                &crate::agent::AgentDef::new("a", "system").provider("snapshot-blocking"),
+                None,
+            )
+            .await
+            .expect("agent");
+        let seq = ledger.enqueue_turn(&agent_id, "work").await.expect("turn");
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+        let executor = HandExecutor::start(ledger.clone(), Notifier(tx), 1);
+        executor.submit(agent_id.clone(), seq);
+
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("provider never emitted its snapshot");
+        assert!(
+            ledger
+                .interrupt_turn(&agent_id, seq, "killed", "test kill")
+                .await
+                .expect("record kill")
+        );
+        assert!(
+            executor.kill(&agent_id, seq),
+            "live token was not signalled"
+        );
+
+        let turn = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let turn = ledger
+                    .get_turn(&agent_id, seq)
+                    .await
+                    .expect("turn query")
+                    .expect("turn");
+                if turn.reported_tokens() == Some((89, 13, 34)) {
+                    break turn;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached usage writer did not drain");
+        assert_eq!(turn.state, "killed");
+        assert_eq!(turn.cost_state, "unreported");
+        assert_eq!(turn.reported_cost_micro_usd(), None);
+        assert_eq!(executor.drain(Duration::from_secs(2)).await, 0);
     }
 
     /// The base names the surface and is shared; the token is secret
@@ -877,16 +1354,13 @@ mod config_injection_tests {
             .session
             .expect("assigned id");
 
-        let first = SessionSink {
-            ledger: ledger.clone(),
-            agent_id: agent_id.clone(),
-            seq: 1,
-        };
+        let first = SessionSink::new(ledger.clone(), agent_id.clone(), 1);
         ciacola_agent::TurnEvents::resume_id(
             &first,
             &ciacola_agent::ResumeId::ProviderAssigned(assigned.clone()),
         )
         .await;
+        first.drain().await;
         assert_eq!(
             ledger
                 .get_agent(&agent_id)
@@ -897,16 +1371,13 @@ mod config_injection_tests {
             1
         );
 
-        let later = SessionSink {
-            ledger: ledger.clone(),
-            agent_id: agent_id.clone(),
-            seq: 2,
-        };
+        let later = SessionSink::new(ledger.clone(), agent_id.clone(), 2);
         ciacola_agent::TurnEvents::resume_id(
             &later,
             &ciacola_agent::ResumeId::ProviderAssigned(assigned),
         )
         .await;
+        later.drain().await;
         assert_eq!(
             ledger
                 .get_agent(&agent_id)
@@ -918,15 +1389,13 @@ mod config_injection_tests {
             "re-confirming an open id must not reset rotation bookkeeping"
         );
 
+        let newest = SessionSink::new(ledger.clone(), agent_id.clone(), 3);
         ciacola_agent::TurnEvents::resume_id(
-            &SessionSink {
-                ledger: ledger.clone(),
-                agent_id: agent_id.clone(),
-                seq: 3,
-            },
+            &newest,
             &ciacola_agent::ResumeId::ProviderAssigned("provider-new".into()),
         )
         .await;
+        newest.drain().await;
         let row = ledger.get_agent(&agent_id).await.unwrap().unwrap();
         assert_eq!(row.session.as_deref(), Some("provider-new"));
         assert_eq!(row.session_started_seq, 3);

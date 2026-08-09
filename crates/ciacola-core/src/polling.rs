@@ -35,14 +35,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{Notify, Semaphore};
-use tokio_util::sync::CancellationToken;
 
-use crate::exec::{TurnExecutor, run_claimed_turn};
+use crate::exec::{Kills, TurnExecutor, run_claimed_turn_cancellable};
 use crate::ledger::Ledger;
 use crate::notify::Notifier;
 use crate::plugin::BoxFut;
-
-type Kills = Arc<Mutex<HashMap<(String, i64), CancellationToken>>>;
 
 /// A dispatch is in flight from the moment it owns a permit, not only
 /// after its task has been spawned and claimed the ledger row. Keeping
@@ -143,18 +140,7 @@ impl PollingExecutor {
                                 return;
                             }
                         }
-                        let key = (agent_id.clone(), seq);
-                        let token = CancellationToken::new();
-                        if let Ok(mut map) = kills.lock() {
-                            map.insert(key.clone(), token.clone());
-                        }
-                        tokio::select! {
-                            () = run_claimed_turn(&ledger, &notify, &agent_id, seq) => {}
-                            () = token.cancelled() => {}
-                        }
-                        if let Ok(mut map) = kills.lock() {
-                            map.remove(&key);
-                        }
+                        run_claimed_turn_cancellable(&ledger, &notify, kills, &agent_id, seq).await;
                     });
                 }
             }

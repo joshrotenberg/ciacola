@@ -121,8 +121,8 @@ pub(crate) fn classify_failure(
     }
 }
 
-fn usage_from(events: &[JsonLineEvent]) -> Option<TokenUsage> {
-    let usage = events.iter().rev().find_map(JsonLineEvent::usage)?;
+pub(crate) fn usage_snapshot(event: &JsonLineEvent) -> Option<TokenUsage> {
+    let usage = event.usage()?;
     let reported = usage.input_tokens.is_some()
         || usage.output_tokens.is_some()
         || usage.cached_input_tokens.is_some();
@@ -131,6 +131,10 @@ fn usage_from(events: &[JsonLineEvent]) -> Option<TokenUsage> {
         output: usage.output_tokens.unwrap_or_default(),
         cached_input: usage.cached_input_tokens.unwrap_or_default(),
     })
+}
+
+fn usage_from(events: &[JsonLineEvent]) -> Option<TokenUsage> {
+    events.iter().rev().find_map(usage_snapshot)
 }
 
 fn failure_message(event: &JsonLineEvent) -> String {
@@ -229,6 +233,14 @@ mod tests {
                 cached_input: 0,
             })
         );
+    }
+
+    #[test]
+    fn an_empty_usage_object_is_not_a_reported_snapshot() {
+        let event = events(&[r#"{"type":"turn.completed","usage":{}}"#])
+            .pop()
+            .expect("event");
+        assert_eq!(usage_snapshot(&event), None);
     }
 
     #[test]

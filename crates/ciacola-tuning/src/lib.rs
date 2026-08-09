@@ -45,25 +45,63 @@ pub struct Stat {
     pub role: String,
     pub runs: usize,
     pub failures: usize,
-    pub median_cost_micro_usd: i64,
-    pub median_secs: i64,
-    pub total_cost_micro_usd: i64,
+    /// Turns with an actual monetary measurement in the cost sample.
+    pub cost_samples: usize,
+    /// Turns from a cost-reporting provider whose price was unavailable.
+    pub cost_unreported: usize,
+    /// Turns from a provider that never reports money.
+    pub cost_not_priced: usize,
+    /// Legacy zero values whose measurement status is unknowable.
+    pub cost_legacy_unknown: usize,
+    pub median_cost_micro_usd: Option<i64>,
+    /// Turns with a measured provider duration.
+    pub duration_samples: usize,
+    /// Crash-recovered attempts whose claim-to-restart time is only a bound.
+    pub duration_upper_bound: usize,
+    /// Attempts whose runtime provenance could not be reconstructed.
+    pub duration_unknown: usize,
+    /// Historical attempted turns retained as runs but not durations.
+    pub duration_legacy_unknown: usize,
+    pub median_secs: Option<i64>,
+    pub total_reported_cost_micro_usd: i64,
 }
 
 /// `(provider, model, effort, role)`.
 type BucketKey = (String, String, String, String);
-/// Costs, durations, failure count.
-type Bucket = (Vec<i64>, Vec<i64>, usize);
-/// One finished turn, flattened for grouping: provider, model, effort,
-/// role, cost, duration in seconds, and whether it failed.
-type Entry = (String, String, String, String, i64, i64, bool);
 
-fn median(mut values: Vec<i64>) -> i64 {
+#[derive(Default)]
+struct Bucket {
+    costs: Vec<i64>,
+    secs: Vec<i64>,
+    runs: usize,
+    failures: usize,
+    cost_unreported: usize,
+    cost_not_priced: usize,
+    cost_legacy_unknown: usize,
+    duration_upper_bound: usize,
+    duration_unknown: usize,
+    duration_legacy_unknown: usize,
+}
+
+/// One finished turn, flattened for grouping.
+struct Entry {
+    provider: String,
+    model: String,
+    effort: String,
+    role: String,
+    cost: Option<i64>,
+    cost_state: String,
+    elapsed_state: String,
+    secs: i64,
+    failed: bool,
+}
+
+fn median(mut values: Vec<i64>) -> Option<i64> {
     if values.is_empty() {
-        return 0;
+        return None;
     }
     values.sort_unstable();
-    values[values.len() / 2]
+    Some(values[values.len() / 2])
 }
 
 /// The aggregation itself, pulled out of `collect` so it can be tested
@@ -71,30 +109,49 @@ fn median(mut values: Vec<i64>) -> i64 {
 /// same way a real ledger read would.
 fn aggregate(entries: Vec<Entry>) -> Vec<Stat> {
     let mut buckets: BTreeMap<BucketKey, Bucket> = BTreeMap::new();
-    for (provider, model, effort, role, cost, secs, failed) in entries {
-        let entry = buckets.entry((provider, model, effort, role)).or_default();
-        entry.0.push(cost);
-        entry.1.push(secs);
-        if failed {
-            entry.2 += 1;
+    for item in entries {
+        let entry = buckets
+            .entry((item.provider, item.model, item.effort, item.role))
+            .or_default();
+        entry.runs += 1;
+        match item.elapsed_state.as_str() {
+            "measured" => entry.secs.push(item.secs),
+            "upper_bound" => entry.duration_upper_bound += 1,
+            "unknown" => entry.duration_unknown += 1,
+            _ => entry.duration_legacy_unknown += 1,
+        }
+        if item.failed {
+            entry.failures += 1;
+        }
+        match item.cost {
+            Some(cost) => entry.costs.push(cost),
+            None if item.cost_state == "not_priced" => entry.cost_not_priced += 1,
+            None if item.cost_state == "legacy" => entry.cost_legacy_unknown += 1,
+            None => entry.cost_unreported += 1,
         }
     }
 
     buckets
         .into_iter()
-        .map(
-            |((provider, model, effort, role), (costs, secs, failures))| Stat {
-                provider,
-                model,
-                effort,
-                role,
-                runs: costs.len(),
-                failures,
-                total_cost_micro_usd: costs.iter().sum(),
-                median_cost_micro_usd: median(costs),
-                median_secs: median(secs),
-            },
-        )
+        .map(|((provider, model, effort, role), bucket)| Stat {
+            provider,
+            model,
+            effort,
+            role,
+            runs: bucket.runs,
+            failures: bucket.failures,
+            cost_samples: bucket.costs.len(),
+            cost_unreported: bucket.cost_unreported,
+            cost_not_priced: bucket.cost_not_priced,
+            cost_legacy_unknown: bucket.cost_legacy_unknown,
+            total_reported_cost_micro_usd: bucket.costs.iter().sum(),
+            median_cost_micro_usd: median(bucket.costs),
+            duration_samples: bucket.secs.len(),
+            duration_upper_bound: bucket.duration_upper_bound,
+            duration_unknown: bucket.duration_unknown,
+            duration_legacy_unknown: bucket.duration_legacy_unknown,
+            median_secs: median(bucket.secs),
+        })
         .collect()
 }
 
@@ -102,32 +159,41 @@ async fn collect(ledger: &Ledger) -> Result<Vec<Stat>, FlatError> {
     // Retired agents are included on purpose: an ephemeral spoke is
     // retired the moment its work is accepted, so excluding them would
     // throw away exactly the population worth measuring.
-    let rows: Vec<(String, i64, i64, String)> = sqlx::query_as(
-        "SELECT a.def, t.cost_micro_usd, t.elapsed_ms, t.state
+    let rows: Vec<(String, i64, String, i64, String, String)> = sqlx::query_as(
+        "SELECT a.def, t.cost_micro_usd, t.cost_state, t.elapsed_ms,
+                t.elapsed_state, t.state
          FROM turns t JOIN agents a ON a.agent_id = t.agent_id
-         WHERE t.state IN ('ok', 'failed', 'killed')",
+         WHERE t.state IN ('ok', 'failed', 'killed')
+           AND t.elapsed_state <> 'not_attempted'",
     )
     .fetch_all(ledger.pool())
     .await?;
 
     let entries = rows
         .into_iter()
-        .filter_map(|(def_json, cost, elapsed_ms, state)| {
-            let def = serde_json::from_str::<ciacola_core::agent::AgentDef>(&def_json).ok()?;
-            Some((
-                // The backend each agent actually ran on, read from its
-                // own definition. Rows written before the field existed
-                // deserialize as claude, so history keeps its bucket
-                // rather than shifting when a second provider lands.
-                def.provider.to_string(),
-                def.model.clone().unwrap_or_else(|| "(default)".into()),
-                def.effort.clone().unwrap_or_else(|| "(default)".into()),
-                def.name.clone(),
-                cost,
-                elapsed_ms / 1000,
-                state != "ok",
-            ))
-        })
+        .filter_map(
+            |(def_json, cost, cost_state, elapsed_ms, elapsed_state, state)| {
+                let def = serde_json::from_str::<ciacola_core::agent::AgentDef>(&def_json).ok()?;
+                let measured_cost = (cost_state == "reported"
+                    || (cost_state == "legacy" && cost != 0))
+                    .then_some(cost);
+                Some(Entry {
+                    // The backend each agent actually ran on, read from its
+                    // own definition. Rows written before the field existed
+                    // deserialize as claude, so history keeps its bucket
+                    // rather than shifting when a second provider lands.
+                    provider: def.provider.to_string(),
+                    model: def.model.clone().unwrap_or_else(|| "(default)".into()),
+                    effort: def.effort.clone().unwrap_or_else(|| "(default)".into()),
+                    role: def.name.clone(),
+                    cost: measured_cost,
+                    cost_state,
+                    elapsed_state,
+                    secs: elapsed_ms / 1000,
+                    failed: state != "ok",
+                })
+            },
+        )
         .collect();
 
     Ok(aggregate(entries))
@@ -141,9 +207,18 @@ fn stat_json(s: &Stat) -> serde_json::Value {
         "role": s.role,
         "runs": s.runs,
         "failures": s.failures,
-        "median_cost_usd": s.median_cost_micro_usd as f64 / 1e6,
+        "cost_samples": s.cost_samples,
+        "cost_unreported": s.cost_unreported,
+        "cost_not_priced": s.cost_not_priced,
+        "cost_legacy_unknown": s.cost_legacy_unknown,
+        "median_cost_usd": s.median_cost_micro_usd.map(|cost| cost as f64 / 1e6),
+        "duration_samples": s.duration_samples,
+        "duration_upper_bound": s.duration_upper_bound,
+        "duration_unknown": s.duration_unknown,
+        "duration_legacy_unknown": s.duration_legacy_unknown,
         "median_secs": s.median_secs,
-        "total_cost_usd": s.total_cost_micro_usd as f64 / 1e6,
+        "total_reported_cost_usd": s.total_reported_cost_micro_usd as f64 / 1e6,
+        "total_cost_usd": s.total_reported_cost_micro_usd as f64 / 1e6,
     })
 }
 
@@ -246,17 +321,54 @@ impl Plugin for TuningPlugin {
                 return None;
             }
             let mut html = String::from(
-                "<table><tr><th>role</th><th>model</th><th>effort</th>\
+                "<table><tr><th>provider</th><th>role</th><th>model</th><th>effort</th>\
                  <th class=\"num\">runs</th><th class=\"num\">failed</th>\
-                 <th class=\"num\">median</th><th class=\"num\">median s</th>\
-                 <th class=\"num\">total</th></tr>",
+                 <th class=\"num\">cost samples</th><th class=\"num\">without cost</th>\
+                 <th class=\"num\">median</th><th class=\"num\">duration samples</th>\
+                 <th class=\"num\">without duration</th><th class=\"num\">median s</th>\
+                 <th class=\"num\">reported total</th></tr>",
             );
             for s in &stats {
+                let mut without_cost = Vec::new();
+                if s.cost_unreported > 0 {
+                    without_cost.push(format!("{} unreported", s.cost_unreported));
+                }
+                if s.cost_not_priced > 0 {
+                    without_cost.push(format!("{} unpriced", s.cost_not_priced));
+                }
+                if s.cost_legacy_unknown > 0 {
+                    without_cost.push(format!("{} legacy unknown", s.cost_legacy_unknown));
+                }
+                let without_cost = if without_cost.is_empty() {
+                    "-".into()
+                } else {
+                    without_cost.join(" / ")
+                };
+                let mut without_duration = Vec::new();
+                if s.duration_upper_bound > 0 {
+                    without_duration.push(format!("{} upper bound", s.duration_upper_bound));
+                }
+                if s.duration_unknown > 0 {
+                    without_duration.push(format!("{} unknown", s.duration_unknown));
+                }
+                if s.duration_legacy_unknown > 0 {
+                    without_duration.push(format!("{} legacy", s.duration_legacy_unknown));
+                }
+                let without_duration = if without_duration.is_empty() {
+                    "-".into()
+                } else {
+                    without_duration.join(" / ")
+                };
                 html.push_str(&format!(
-                    "<tr><td>{role}</td><td class=\"mono\">{model}</td>\
+                    "<tr><td class=\"mono\">{provider}</td><td>{role}</td>\
+                     <td class=\"mono\">{model}</td>\
                      <td class=\"dim\">{effort}</td><td class=\"num\">{runs}</td>\
-                     <td class=\"num\">{failed}</td><td class=\"num\">{median}</td>\
+                     <td class=\"num\">{failed}</td><td class=\"num\">{samples}</td>\
+                     <td class=\"num\">{without_cost}</td><td class=\"num\">{median}</td>\
+                     <td class=\"num\">{duration_samples}</td>\
+                     <td class=\"num\">{without_duration}</td>\
                      <td class=\"num\">{secs}</td><td class=\"num\">{total}</td></tr>",
+                    provider = ciacola_core::render::esc(&s.provider),
                     role = ciacola_core::render::esc(&s.role),
                     model = ciacola_core::render::esc(&s.model),
                     effort = ciacola_core::render::esc(&s.effort),
@@ -266,14 +378,24 @@ impl Plugin for TuningPlugin {
                     } else {
                         "0".into()
                     },
-                    median = ciacola_core::render::usd(s.median_cost_micro_usd),
-                    secs = s.median_secs,
-                    total = ciacola_core::render::usd(s.total_cost_micro_usd),
+                    samples = s.cost_samples,
+                    without_cost = without_cost,
+                    median = s
+                        .median_cost_micro_usd
+                        .map(ciacola_core::render::usd)
+                        .unwrap_or_else(|| "-".into()),
+                    duration_samples = s.duration_samples,
+                    without_duration = without_duration,
+                    secs = s
+                        .median_secs
+                        .map(|seconds| seconds.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    total = ciacola_core::render::usd(s.total_reported_cost_micro_usd),
                 ));
             }
             html.push_str("</table>");
             Some(Section {
-                title: "cost by model".into(),
+                title: "reported cost by model".into(),
                 html,
             })
         })
@@ -383,12 +505,13 @@ mod tests {
 
         let s = stats.iter().find(|s| s.model == "sonnet").expect("sonnet");
         assert_eq!(s.runs, 3);
-        assert_eq!(s.total_cost_micro_usd, 600);
+        assert_eq!(s.total_reported_cost_micro_usd, 600);
+        assert_eq!(s.cost_samples, 3);
 
         let h = stats.iter().find(|s| s.model == "haiku").expect("haiku");
         assert_eq!(h.runs, 2);
         assert_eq!(
-            h.total_cost_micro_usd, 30,
+            h.total_reported_cost_micro_usd, 30,
             "haiku's spend must not include sonnet's"
         );
     }
@@ -415,7 +538,7 @@ mod tests {
         assert_eq!(s.runs, 3, "a failed turn still counts as a run");
         assert_eq!(s.failures, 1);
         assert_eq!(
-            s.total_cost_micro_usd, 350,
+            s.total_reported_cost_micro_usd, 350,
             "a failure that cost money still counts toward spend"
         );
     }
@@ -465,10 +588,11 @@ mod tests {
         assert_eq!(s.runs, 2);
         assert_eq!(s.failures, 2, "both failed and killed count as failures");
         assert_eq!(
-            s.median_cost_micro_usd, 300,
+            s.median_cost_micro_usd,
+            Some(300),
             "median of the real costs, not a zeroed-out row"
         );
-        assert_eq!(s.median_secs, 3);
+        assert_eq!(s.median_secs, Some(3));
     }
 
     /// The bucket key is `(provider, model, effort, role)` and only one
@@ -480,24 +604,28 @@ mod tests {
     #[test]
     fn aggregate_keys_on_provider() {
         let entries = vec![
-            (
-                "claude".to_string(),
-                "sonnet".to_string(),
-                "high".to_string(),
-                "role".to_string(),
-                100,
-                10,
-                false,
-            ),
-            (
-                "codex".to_string(),
-                "sonnet".to_string(),
-                "high".to_string(),
-                "role".to_string(),
-                200,
-                20,
-                false,
-            ),
+            Entry {
+                provider: "claude".into(),
+                model: "sonnet".into(),
+                effort: "high".into(),
+                role: "role".into(),
+                cost: Some(100),
+                cost_state: "reported".into(),
+                elapsed_state: "measured".into(),
+                secs: 10,
+                failed: false,
+            },
+            Entry {
+                provider: "codex".into(),
+                model: "sonnet".into(),
+                effort: "high".into(),
+                role: "role".into(),
+                cost: Some(200),
+                cost_state: "reported".into(),
+                elapsed_state: "measured".into(),
+                secs: 20,
+                failed: false,
+            },
         ];
 
         let stats = aggregate(entries);
@@ -510,5 +638,100 @@ mod tests {
             stats.iter().map(|s| s.provider.clone()).collect();
         assert!(providers.contains("claude"));
         assert!(providers.contains("codex"));
+    }
+
+    /// A real zero-cost report is a sample. An unavailable cost is a
+    /// run and a failure, but it cannot pull the median down as though
+    /// the provider had measured zero dollars.
+    #[test]
+    fn reported_zero_and_unknown_cost_are_distinct_samples() {
+        let entries = vec![
+            Entry {
+                provider: "claude".into(),
+                model: "sonnet".into(),
+                effort: "high".into(),
+                role: "role".into(),
+                cost: Some(0),
+                cost_state: "reported".into(),
+                elapsed_state: "measured".into(),
+                secs: 1,
+                failed: false,
+            },
+            Entry {
+                provider: "claude".into(),
+                model: "sonnet".into(),
+                effort: "high".into(),
+                role: "role".into(),
+                cost: None,
+                cost_state: "unreported".into(),
+                elapsed_state: "upper_bound".into(),
+                secs: 3,
+                failed: true,
+            },
+        ];
+
+        let stat = aggregate(entries).pop().expect("one bucket");
+        assert_eq!(stat.runs, 2);
+        assert_eq!(stat.failures, 1);
+        assert_eq!(stat.cost_samples, 1);
+        assert_eq!(stat.cost_unreported, 1);
+        assert_eq!(stat.cost_not_priced, 0);
+        assert_eq!(stat.cost_legacy_unknown, 0);
+        assert_eq!(stat.median_cost_micro_usd, Some(0));
+        assert_eq!(stat.total_reported_cost_micro_usd, 0);
+        assert_eq!(stat.duration_samples, 1);
+        assert_eq!(stat.duration_upper_bound, 1);
+        assert_eq!(stat.median_secs, Some(1));
+        let json = stat_json(&stat);
+        assert_eq!(json["total_cost_usd"], json["total_reported_cost_usd"]);
+    }
+
+    /// A queued kill is a terminal record but not a provider run. The
+    /// explicit provenance excludes it without using a null claim-time
+    /// heuristic, so pre-migration attempted history remains visible.
+    #[tokio::test]
+    async fn non_attempts_are_excluded_while_legacy_attempts_are_preserved() {
+        let l = ledger().await;
+        let agent_id = l
+            .create_agent(&AgentDef::new("history", "sys"), None)
+            .await
+            .expect("agent");
+
+        let queued = l
+            .enqueue_turn(&agent_id, "never launched")
+            .await
+            .expect("turn");
+        assert!(
+            l.interrupt_turn(&agent_id, queued, "killed", "stopped while queued")
+                .await
+                .expect("interrupt")
+        );
+        assert!(collect(&l).await.expect("collect").is_empty());
+
+        let legacy = l
+            .enqueue_turn(&agent_id, "historical attempt")
+            .await
+            .expect("turn");
+        sqlx::query(
+            "UPDATE turns SET state = 'failed', error = 'legacy failure',
+                 elapsed_ms = 4_000, elapsed_state = 'legacy', cost_state = 'legacy'
+             WHERE agent_id = ?1 AND seq = ?2",
+        )
+        .bind(&agent_id)
+        .bind(legacy)
+        .execute(l.pool())
+        .await
+        .expect("simulate pre-migration row");
+
+        let stats = collect(&l).await.expect("collect");
+        assert_eq!(stats.len(), 1);
+        let stat = &stats[0];
+        assert_eq!(stat.runs, 1);
+        assert_eq!(stat.failures, 1);
+        assert_eq!(stat.cost_samples, 0);
+        assert_eq!(stat.cost_legacy_unknown, 1);
+        assert_eq!(stat.duration_samples, 0);
+        assert_eq!(stat.duration_legacy_unknown, 1);
+        assert_eq!(stat.median_secs, None);
     }
 }

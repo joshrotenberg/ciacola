@@ -464,6 +464,7 @@ pub async fn run_exchange(
         );
     }
 
+    let started = std::time::Instant::now();
     match provider.run(&intent, events).await {
         Ok(outcome) => Ok(exchange_from(def, outcome)),
         // A failure that still knows what it spent comes back as an
@@ -471,7 +472,7 @@ pub async fn run_exchange(
         // spend and a session id. `Err` is reserved for a turn that
         // genuinely did not happen, because that is the only one with
         // nothing to bank.
-        Err(e) => match partial_exchange(&e, &capabilities) {
+        Err(e) => match partial_exchange(&e, &capabilities, started.elapsed()) {
             Some(exchange) => Ok(exchange),
             None => Err(e.into()),
         },
@@ -620,11 +621,12 @@ fn exchange_from(def: &AgentDef, outcome: TurnOutcome) -> Exchange {
 /// the ledger as free and unresumable. `None` means the turn really did
 /// not happen: no process, no spend, nothing to record but the failure
 /// itself.
-fn partial_exchange(error: &AgentError, capabilities: &Capabilities) -> Option<Exchange> {
+fn partial_exchange(
+    error: &AgentError,
+    capabilities: &Capabilities,
+    measured_elapsed: std::time::Duration,
+) -> Option<Exchange> {
     let partial = error.partial()?;
-    if partial.is_empty() {
-        return None;
-    }
     Some(Exchange {
         error: Some(error.to_string()),
         reply: String::new(),
@@ -645,10 +647,7 @@ fn partial_exchange(error: &AgentError, capabilities: &Capabilities) -> Option<E
         // The contract carries no provider-turn count on a partial, and
         // inventing one would be worse than admitting the gap.
         provider_turns: None,
-        elapsed_ms: partial
-            .elapsed
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or_default(),
+        elapsed_ms: partial.elapsed.unwrap_or(measured_elapsed).as_millis() as u64,
     })
 }
 
@@ -861,7 +860,8 @@ mod migration_tests {
         let mut capabilities = Capabilities::none(ProviderKey::claude());
         capabilities.reports_cost = true;
         capabilities.reports_token_usage = true;
-        let x = partial_exchange(&e, &capabilities).expect("a run that spent money is an exchange");
+        let x = partial_exchange(&e, &capabilities, Duration::from_secs(1))
+            .expect("a run that spent money is an exchange");
         assert_eq!(x.cost_micro_usd(), 900_000);
         assert_eq!(x.session.as_deref(), Some("sess-mid"));
         assert_eq!(x.elapsed_ms, 1_200_000);
@@ -877,14 +877,35 @@ mod migration_tests {
             provider: ProviderKey::claude(),
             detail: "no binary".into(),
         };
-        assert!(partial_exchange(&e, &Capabilities::none(ProviderKey::claude())).is_none());
+        assert!(
+            partial_exchange(
+                &e,
+                &Capabilities::none(ProviderKey::claude()),
+                Duration::from_secs(1),
+            )
+            .is_none()
+        );
+    }
 
-        // Present but empty is also nothing to bank.
+    /// The post-launch-capable variants remain attempts even when the
+    /// adapter could not observe a session, price, or token count. Core
+    /// still measured how long `Provider::run` was alive, and the
+    /// provider's declared accounting gaps are not known zeros.
+    #[test]
+    fn an_empty_post_launch_failure_keeps_measured_time_and_unknown_accounting() {
         let empty = AgentError::Cancelled {
             provider: ProviderKey::claude(),
             partial: PartialTelemetry::none().into(),
         };
-        assert!(partial_exchange(&empty, &Capabilities::none(ProviderKey::claude())).is_none());
+        let mut capabilities = Capabilities::none(ProviderKey::claude());
+        capabilities.reports_cost = true;
+        capabilities.reports_token_usage = true;
+        let exchange = partial_exchange(&empty, &capabilities, Duration::from_millis(321))
+            .expect("a possibly post-launch failure is an attempted exchange");
+        assert_eq!(exchange.cost, Cost::Unreported);
+        assert_eq!(exchange.usage, Usage::Unreported);
+        assert_eq!(exchange.elapsed_ms, 321);
+        assert!(exchange.error.is_some());
     }
 
     #[test]

@@ -106,9 +106,9 @@ async fn overview_body(state: &BoardState) -> String {
          <div><span class=\"stat\"><b>{}</b><span>agents</span></span>\
          <span class=\"stat\"><b>{}</b><span>running</span></span>\
          <span class=\"stat\"><b>{}</b><span>turns</span></span>\
-         <span class=\"stat\"><b>{}</b><span>total spend</span></span>\
-         <span class=\"stat\"><b>{}</b><span>last 24h{}</span></span>\
-         <span class=\"stat\"><b>{}</b><span>tokens</span></span>\
+         <span class=\"stat\"><b>{}</b><span>reported spend</span></span>\
+         <span class=\"stat\"><b>{}</b><span>reported last 24h{}</span></span>\
+         <span class=\"stat\"><b>{}</b><span>reported tokens</span></span>\
          <span class=\"stat\"><b>{}</b><span>retired</span></span></div>",
         agents.len(),
         running,
@@ -161,7 +161,7 @@ async fn overview_body(state: &BoardState) -> String {
 
     body.push_str(
         "<h2>agents</h2><table><tr><th>name</th><th>state</th><th>provider</th>\
-        <th class=\"num\">turns</th><th class=\"num\">cost</th><th>last active</th>\
+        <th class=\"num\">turns</th><th class=\"num\">reported cost</th><th>last active</th>\
         <th>session</th></tr>",
     );
     // Families together: roots first, each followed by its children.
@@ -262,16 +262,51 @@ async fn events(
     Sse::new(board_event_stream(state)).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
+fn turn_cost(turn: &TurnRow) -> String {
+    match turn.reported_cost_micro_usd() {
+        Some(cost) => usd(cost),
+        None => match turn.cost_state.as_str() {
+            "not_priced" => "unpriced".into(),
+            "unreported" => "cost unreported".into(),
+            "legacy" => "cost unknown (legacy)".into(),
+            state => format!("cost {state}"),
+        },
+    }
+}
+
+fn turn_usage(turn: &TurnRow) -> String {
+    match turn.reported_tokens() {
+        Some((input, output, _cached)) => format!("{input} in / {output} out"),
+        None => match turn.usage_state.as_str() {
+            "not_tracked" => "tokens not tracked".into(),
+            "unreported" => "tokens unreported".into(),
+            "legacy" => "tokens unknown (legacy)".into(),
+            state => format!("tokens {state}"),
+        },
+    }
+}
+
+fn turn_elapsed(turn: &TurnRow) -> String {
+    let seconds = turn.elapsed_ms as f64 / 1000.0;
+    match turn.elapsed_state.as_str() {
+        "measured" => format!("{seconds:.1}s"),
+        "upper_bound" => format!("≤{seconds:.1}s upper bound"),
+        "not_attempted" => "not attempted".into(),
+        "unknown" => "runtime unknown".into(),
+        "legacy" => format!("{seconds:.1}s legacy"),
+        state => format!("{seconds:.1}s {state}"),
+    }
+}
+
 fn turn_html(turn: &TurnRow) -> String {
     let mut out = format!(
-        "<h2>turn {} {} <span class=\"dim\">{} · {:.1}s · {} in / {} out</span></h2>\
+        "<h2>turn {} {} <span class=\"dim\">{} · {} · {}</span></h2>\
          <div class=\"msg them\">{}</div>",
         turn.seq,
         chip(&turn.state),
-        usd(turn.cost_micro_usd),
-        turn.elapsed_ms as f64 / 1000.0,
-        turn.tokens_in,
-        turn.tokens_out,
+        turn_cost(turn),
+        turn_elapsed(turn),
+        turn_usage(turn),
         esc(&turn.prompt),
     );
     if let Some(reply) = &turn.reply {
@@ -299,7 +334,7 @@ async fn agent_page(State(state): State<BoardState>, Path(agent_id): Path<String
 
     let mut body = format!(
         "<p><a href=\"/board\">&larr; board</a></p>\
-         <h1>{name} {chip} <span class=\"dim\">{turns} turns · {cost}</span></h1>\
+         <h1>{name} {chip} <span class=\"dim\">{turns} turns · {cost} reported</span></h1>\
          <p class=\"dim mono\">{id}<br>session {session}</p>",
         name = esc(&agent.name),
         chip = chip(&agent.state),
@@ -386,6 +421,54 @@ mod tests {
             limits: Default::default(),
             shutdown: CancellationToken::new(),
         }
+    }
+
+    fn turn(cost_state: &str, usage_state: &str) -> TurnRow {
+        TurnRow {
+            agent_id: "agent".into(),
+            seq: 1,
+            prompt: "work".into(),
+            state: "killed".into(),
+            reply: None,
+            error: Some("stopped".into()),
+            cost_micro_usd: 0,
+            cost_state: cost_state.into(),
+            elapsed_ms: 1_000,
+            elapsed_state: "measured".into(),
+            claimed_unix_ms: Some(1),
+            tokens_in: 0,
+            tokens_out: 0,
+            tokens_cached: 0,
+            usage_state: usage_state.into(),
+            provider_turns: None,
+        }
+    }
+
+    #[test]
+    fn turn_rendering_distinguishes_unknown_from_reported_zero() {
+        let unknown = turn_html(&turn("unreported", "unreported"));
+        assert!(unknown.contains("cost unreported"), "{unknown}");
+        assert!(unknown.contains("tokens unreported"), "{unknown}");
+
+        let measured = turn_html(&turn("reported", "reported"));
+        assert!(measured.contains("$0.0000"), "{measured}");
+        assert!(measured.contains("0 in / 0 out"), "{measured}");
+    }
+
+    #[test]
+    fn turn_rendering_names_elapsed_provenance() {
+        let mut row = turn("reported", "reported");
+        row.elapsed_state = "upper_bound".into();
+        assert!(turn_html(&row).contains("≤1.0s upper bound"));
+
+        row.elapsed_state = "not_attempted".into();
+        assert!(turn_html(&row).contains("not attempted"));
+
+        row.elapsed_state = "unknown".into();
+        assert!(turn_html(&row).contains("runtime unknown"));
+
+        row.elapsed_state = "legacy".into();
+        assert!(turn_html(&row).contains("1.0s legacy"));
     }
 
     /// `/board/events` is a long-lived SSE response by design: without

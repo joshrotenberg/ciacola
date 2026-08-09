@@ -157,6 +157,12 @@ impl CodexProvider {
                 seen_thread = Some(thread_id.to_string());
                 let _ = resume_tx.send(ResumeId::ProviderAssigned(thread_id.to_string()));
             }
+            if let Some(usage) = outcome::usage_snapshot(&event) {
+                // This handoff must happen in the synchronous wrapper
+                // callback: dropping the stream future for an operator kill
+                // cannot discard usage the provider already emitted.
+                sink.usage_snapshot(usage);
+            }
             callback_events
                 .lock()
                 .expect("codex event collection lock")
@@ -254,7 +260,9 @@ mod tests {
     #[derive(Default)]
     struct RecordingEvents {
         ids: Mutex<Vec<String>>,
-        marker: Option<PathBuf>,
+        usage: Mutex<Vec<TokenUsage>>,
+        resume_marker: Option<PathBuf>,
+        usage_marker: Option<PathBuf>,
     }
 
     impl TurnEvents for RecordingEvents {
@@ -264,10 +272,17 @@ mod tests {
                     .lock()
                     .expect("recording event lock")
                     .push(id.value().to_string());
-                if let Some(marker) = &self.marker {
+                if let Some(marker) = &self.resume_marker {
                     std::fs::write(marker, "persisted").expect("write persistence marker");
                 }
             })
+        }
+
+        fn usage_snapshot(&self, usage: TokenUsage) {
+            self.usage.lock().expect("recording usage lock").push(usage);
+            if let Some(marker) = &self.usage_marker {
+                std::fs::write(marker, "persisted").expect("write usage persistence marker");
+            }
         }
     }
 
@@ -360,6 +375,14 @@ mod tests {
             events.ids.lock().expect("ids").as_slice(),
             ["thread-success"]
         );
+        assert_eq!(
+            events.usage.lock().expect("usage").as_slice(),
+            [TokenUsage {
+                input: 21,
+                output: 5,
+                cached_input: 13,
+            }]
+        );
     }
 
     #[tokio::test]
@@ -368,7 +391,8 @@ mod tests {
         let provider = fixture("fake-codex-early.sh", [marker.display().to_string()]);
         let events = RecordingEvents {
             ids: Mutex::new(Vec::new()),
-            marker: Some(marker.clone()),
+            resume_marker: Some(marker.clone()),
+            ..Default::default()
         };
 
         let outcome = provider
@@ -378,6 +402,31 @@ mod tests {
 
         assert_eq!(outcome.reply, "persisted");
         assert_eq!(events.ids.lock().expect("ids").as_slice(), ["thread-early"]);
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[tokio::test]
+    async fn usage_is_persisted_before_the_child_and_future_can_finish() {
+        let marker = temp_path("early-usage-marker");
+        let provider = fixture("fake-codex-usage-early.sh", [marker.display().to_string()]);
+        let events = RecordingEvents {
+            usage_marker: Some(marker.clone()),
+            ..Default::default()
+        };
+
+        let outcome = provider
+            .run(&intent("open"), &events)
+            .await
+            .expect("the usage sink releases the blocked child");
+
+        let usage = TokenUsage {
+            input: 34,
+            output: 8,
+            cached_input: 21,
+        };
+        assert_eq!(outcome.reply, "usage persisted");
+        assert_eq!(outcome.usage, Usage::Reported(usage));
+        assert_eq!(events.usage.lock().expect("usage").as_slice(), [usage]);
         let _ = std::fs::remove_file(marker);
     }
 
@@ -405,8 +454,9 @@ mod tests {
     #[tokio::test]
     async fn a_terminal_failed_event_is_an_outcome_even_on_nonzero_exit() {
         let provider = fixture("fake-codex-failed.sh", []);
+        let events = RecordingEvents::default();
         let outcome = provider
-            .run(&intent("fail"), &NoEvents)
+            .run(&intent("fail"), &events)
             .await
             .expect("provider-reported failure is data");
 
@@ -423,6 +473,14 @@ mod tests {
                 output: 2,
                 cached_input: 0,
             })
+        );
+        assert_eq!(
+            events.usage.lock().expect("usage").as_slice(),
+            [TokenUsage {
+                input: 9,
+                output: 2,
+                cached_input: 0,
+            }]
         );
     }
 

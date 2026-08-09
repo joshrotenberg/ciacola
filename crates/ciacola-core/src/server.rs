@@ -162,6 +162,10 @@ fn agent_json(agent: &AgentRow) -> serde_json::Value {
 }
 
 fn turn_json(turn: &TurnRow) -> serde_json::Value {
+    let cost_usd = turn
+        .reported_cost_micro_usd()
+        .map(|micro| micro as f64 / 1e6);
+    let tokens = turn.reported_tokens();
     json!({
         "agent_id": turn.agent_id,
         "seq": turn.seq,
@@ -169,14 +173,16 @@ fn turn_json(turn: &TurnRow) -> serde_json::Value {
         "prompt": turn.prompt,
         "reply": turn.reply,
         "error": turn.error,
-        "cost_usd": turn.cost_micro_usd as f64 / 1e6,
+        "cost_usd": cost_usd,
         "cost_state": turn.cost_state,
-        "tokens_in": turn.tokens_in,
-        "tokens_out": turn.tokens_out,
-        "tokens_cached": turn.tokens_cached,
+        "tokens_in": tokens.map(|tokens| tokens.0),
+        "tokens_out": tokens.map(|tokens| tokens.1),
+        "tokens_cached": tokens.map(|tokens| tokens.2),
         "usage_state": turn.usage_state,
         "provider_turns": turn.provider_turns,
         "elapsed_ms": turn.elapsed_ms,
+        "elapsed_state": turn.elapsed_state,
+        "claimed_unix_ms": turn.claimed_unix_ms,
     })
 }
 
@@ -585,19 +591,7 @@ pub fn router_with_limits(
                     // finds the claim already refused. Then signal, so a
                     // turn that had already claimed still gets stopped.
                     match ledger
-                        .fail_turn(
-                            &args.agent_id,
-                            args.seq,
-                            "killed",
-                            "killed by request",
-                            0,
-                            // A kill settles the row from outside the
-                            // run, so the elapsed the executor was
-                            // measuring is not reachable here. Would
-                            // need a claimed-at column to do better.
-                            0,
-                            None,
-                        )
+                        .interrupt_turn(&args.agent_id, args.seq, "killed", "killed by request")
                         .await
                     {
                         Ok(recorded) => {
@@ -639,6 +633,51 @@ pub fn router_with_limits(
         router.tool(kill)
     } else {
         router
+    }
+}
+
+#[cfg(test)]
+mod telemetry_serialization_tests {
+    use super::*;
+
+    fn turn(cost_state: &str, usage_state: &str) -> TurnRow {
+        TurnRow {
+            agent_id: "agent".into(),
+            seq: 1,
+            prompt: "work".into(),
+            state: "killed".into(),
+            reply: None,
+            error: Some("stopped".into()),
+            cost_micro_usd: 0,
+            cost_state: cost_state.into(),
+            elapsed_ms: 1_000,
+            elapsed_state: "measured".into(),
+            claimed_unix_ms: Some(1),
+            tokens_in: 0,
+            tokens_out: 0,
+            tokens_cached: 0,
+            usage_state: usage_state.into(),
+            provider_turns: None,
+        }
+    }
+
+    #[test]
+    fn unavailable_telemetry_serializes_as_null_not_measured_zero() {
+        let value = turn_json(&turn("unreported", "unreported"));
+        assert!(value["cost_usd"].is_null());
+        assert!(value["tokens_in"].is_null());
+        assert!(value["tokens_out"].is_null());
+        assert_eq!(value["cost_state"], "unreported");
+        assert_eq!(value["usage_state"], "unreported");
+    }
+
+    #[test]
+    fn a_reported_zero_serializes_as_zero() {
+        let value = turn_json(&turn("reported", "reported"));
+        assert_eq!(value["cost_usd"], 0.0);
+        assert_eq!(value["tokens_in"], 0);
+        assert_eq!(value["tokens_out"], 0);
+        assert_eq!(value["elapsed_state"], "measured");
     }
 }
 

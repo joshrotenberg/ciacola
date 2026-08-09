@@ -117,6 +117,25 @@ impl Health {
             Some(host) => host.health().await,
             None => json!({}),
         };
+        let cost_states = json!({
+            "reported": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND cost_state = 'reported'").await,
+            "unreported": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND cost_state = 'unreported'").await,
+            "not_priced": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND cost_state = 'not_priced'").await,
+            "legacy": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND cost_state = 'legacy'").await,
+        });
+        let usage_states = json!({
+            "reported": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND usage_state = 'reported'").await,
+            "unreported": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND usage_state = 'unreported'").await,
+            "not_tracked": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND usage_state = 'not_tracked'").await,
+            "legacy": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND usage_state = 'legacy'").await,
+        });
+        let elapsed_states = json!({
+            "measured": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND elapsed_state = 'measured'").await,
+            "upper_bound": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND elapsed_state = 'upper_bound'").await,
+            "unknown": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND elapsed_state = 'unknown'").await,
+            "not_attempted": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND elapsed_state = 'not_attempted'").await,
+            "legacy": self.count("SELECT COUNT(*) FROM turns WHERE state IN ('ok', 'failed', 'killed') AND elapsed_state = 'legacy'").await,
+        });
         json!({
             "db_bytes": self.db_bytes(),
             "providers": self.providers,
@@ -127,15 +146,46 @@ impl Health {
             "turns_with_text": self
                 .count("SELECT COUNT(*) FROM turns WHERE prompt <> '' OR reply IS NOT NULL")
                 .await,
+            "reported_cost_micro_usd": self
+                .count(
+                    "SELECT COALESCE(SUM(cost_micro_usd), 0) FROM turns
+                     WHERE state IN ('ok', 'failed', 'killed')
+                       AND (cost_state = 'reported'
+                            OR (cost_state = 'legacy' AND cost_micro_usd <> 0))"
+                )
+                .await,
             "tokens_in": self
-                .count("SELECT COALESCE(SUM(tokens_in), 0) FROM turns")
+                .count(
+                    "SELECT COALESCE(SUM(tokens_in), 0) FROM turns
+                     WHERE state IN ('ok', 'failed', 'killed')
+                       AND (usage_state = 'reported'
+                            OR (usage_state = 'legacy'
+                                AND (tokens_in <> 0 OR tokens_out <> 0 OR tokens_cached <> 0)))"
+                )
                 .await,
             "tokens_out": self
-                .count("SELECT COALESCE(SUM(tokens_out), 0) FROM turns")
+                .count(
+                    "SELECT COALESCE(SUM(tokens_out), 0) FROM turns
+                     WHERE state IN ('ok', 'failed', 'killed')
+                       AND (usage_state = 'reported'
+                            OR (usage_state = 'legacy'
+                                AND (tokens_in <> 0 OR tokens_out <> 0 OR tokens_cached <> 0)))"
+                )
                 .await,
             "tokens_cached": self
-                .count("SELECT COALESCE(SUM(tokens_cached), 0) FROM turns")
+                .count(
+                    "SELECT COALESCE(SUM(tokens_cached), 0) FROM turns
+                     WHERE state IN ('ok', 'failed', 'killed')
+                       AND (usage_state = 'reported'
+                            OR (usage_state = 'legacy'
+                                AND (tokens_in <> 0 OR tokens_out <> 0 OR tokens_cached <> 0)))"
+                )
                 .await,
+            "telemetry": {
+                "cost_states": cost_states,
+                "usage_states": usage_states,
+                "elapsed_states": elapsed_states,
+            },
             "turn_text_bytes": self
                 .count(
                     "SELECT COALESCE(SUM(LENGTH(prompt) + LENGTH(COALESCE(reply, ''))), 0)
@@ -261,4 +311,81 @@ pub fn resources(health: Health) -> Vec<Resource> {
         })
         .build();
     vec![resource]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::{AgentDef, Exchange};
+    use crate::ledger::Ledger;
+
+    #[tokio::test]
+    async fn health_counts_reported_zero_separately_from_unreported() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.expect("pool");
+        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+
+        let measured = ledger
+            .create_agent(&AgentDef::new("measured", "s"), None)
+            .await
+            .expect("agent");
+        let seq = ledger.enqueue_turn(&measured, "work").await.expect("turn");
+        assert!(ledger.claim_turn(&measured, seq).await.expect("claim"));
+        assert!(
+            ledger
+                .complete_turn(
+                    &measured,
+                    seq,
+                    &Exchange {
+                        reply: "done".into(),
+                        session: None,
+                        cost: ciacola_agent::Cost::Reported { micro_usd: 0 },
+                        usage: ciacola_agent::Usage::Reported(
+                            ciacola_agent::TokenUsage::default(),
+                        ),
+                        provider_turns: Some(0),
+                        elapsed_ms: 1,
+                        error: None,
+                    },
+                )
+                .await
+                .expect("complete")
+        );
+
+        let unknown = ledger
+            .create_agent(&AgentDef::new("unknown", "s"), None)
+            .await
+            .expect("agent");
+        let seq = ledger.enqueue_turn(&unknown, "work").await.expect("turn");
+        assert!(ledger.claim_turn(&unknown, seq).await.expect("claim"));
+        assert!(
+            ledger
+                .interrupt_turn(&unknown, seq, "killed", "stopped")
+                .await
+                .expect("interrupt")
+        );
+
+        let not_attempted = ledger
+            .create_agent(&AgentDef::new("not-attempted", "s"), None)
+            .await
+            .expect("agent");
+        let seq = ledger
+            .enqueue_turn(&not_attempted, "queued")
+            .await
+            .expect("turn");
+        assert!(
+            ledger
+                .interrupt_turn(&not_attempted, seq, "killed", "stopped while queued")
+                .await
+                .expect("interrupt")
+        );
+
+        let report = Health::new(pool, "").report().await;
+        assert_eq!(report["reported_cost_micro_usd"], 0);
+        assert_eq!(report["telemetry"]["cost_states"]["reported"], 2);
+        assert_eq!(report["telemetry"]["cost_states"]["unreported"], 1);
+        assert_eq!(report["telemetry"]["usage_states"]["reported"], 2);
+        assert_eq!(report["telemetry"]["usage_states"]["unreported"], 1);
+        assert_eq!(report["telemetry"]["elapsed_states"]["measured"], 2);
+        assert_eq!(report["telemetry"]["elapsed_states"]["not_attempted"], 1);
+    }
 }

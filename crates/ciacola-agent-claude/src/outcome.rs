@@ -8,9 +8,99 @@ use ciacola_agent::{
     AgentError, Cost, PartialTelemetry, ProviderKey, ResumeId, TokenUsage, TurnFailure,
     TurnOutcome, Usage,
 };
-use claude_wrapper::QueryResult;
+use claude_wrapper::{QueryResult, streaming::StreamEvent};
 
-/// A successful `execute_json` call, translated. Every field on
+/// Token usage on one complete assistant message in Claude's JSONL
+/// stream.
+///
+/// Assistant events are provider-internal turns, not cumulative ciacola
+/// totals. The adapter deduplicates them by message id and adds them to
+/// the cumulative snapshot it publishes through `TurnEvents`.
+pub(crate) fn assistant_usage(event: &StreamEvent) -> Option<(Option<String>, TokenUsage)> {
+    if event.event_type() != Some("assistant") {
+        return None;
+    }
+    let message = event.data.get("message")?;
+    let usage = message.get("usage")?;
+    let field = |name: &str| usage.get(name).and_then(serde_json::Value::as_u64);
+    let reported = [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cached_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_write_input_tokens",
+        "reasoning_output_tokens",
+    ]
+    .iter()
+    .any(|name| field(name).is_some());
+    if !reported {
+        return None;
+    }
+    let message_id = message
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let cached_input = field("cache_read_input_tokens")
+        .or_else(|| field("cached_input_tokens"))
+        .unwrap_or_default();
+    let cache_write = field("cache_creation_input_tokens")
+        .or_else(|| field("cache_write_input_tokens"))
+        .unwrap_or_default();
+    Some((
+        message_id,
+        TokenUsage {
+            // Claude splits non-cached, cache-read, and cache-write
+            // input into separate buckets. The portable contract keeps
+            // total input with cache-read as a subset.
+            input: field("input_tokens")
+                .unwrap_or_default()
+                .saturating_add(cached_input)
+                .saturating_add(cache_write),
+            output: field("output_tokens")
+                .unwrap_or_default()
+                .saturating_add(field("reasoning_output_tokens").unwrap_or_default()),
+            cached_input,
+        },
+    ))
+}
+
+/// Add a provider-internal assistant message to a cumulative snapshot.
+pub(crate) fn add_usage(total: TokenUsage, next: TokenUsage) -> TokenUsage {
+    TokenUsage {
+        input: total.input.saturating_add(next.input),
+        output: total.output.saturating_add(next.output),
+        cached_input: total.cached_input.saturating_add(next.cached_input),
+    }
+}
+
+/// Reported terminal usage, preserving a genuine all-zero report.
+pub(crate) fn reported_usage(result: &QueryResult) -> Option<TokenUsage> {
+    result.usage.as_ref().and_then(|usage| {
+        let reported = usage.input_tokens.is_some()
+            || usage.cached_input_tokens.is_some()
+            || usage.cache_write_input_tokens.is_some()
+            || usage.output_tokens.is_some()
+            || usage.reasoning_output_tokens.is_some();
+        reported.then(|| {
+            let cached_input = usage.cached_input_tokens.unwrap_or_default();
+            TokenUsage {
+                input: usage
+                    .input_tokens
+                    .unwrap_or_default()
+                    .saturating_add(cached_input)
+                    .saturating_add(usage.cache_write_input_tokens.unwrap_or_default()),
+                output: usage
+                    .output_tokens
+                    .unwrap_or_default()
+                    .saturating_add(usage.reasoning_output_tokens.unwrap_or_default()),
+                cached_input,
+            }
+        })
+    })
+}
+
+/// A terminal Claude result, translated. Every field on
 /// [`QueryResult`] is optional-by-construction, so there is nothing
 /// here that can fail.
 pub(crate) fn from_query_result(result: QueryResult, elapsed: Duration) -> TurnOutcome {
@@ -28,14 +118,10 @@ pub(crate) fn from_query_result(result: QueryResult, elapsed: Duration) -> TurnO
     // "nothing was ever reported": see `Usage`'s own docs. Claude
     // counts tokens, so a missing or empty usage block here is the
     // former, not zero.
-    let usage = match result.usage.as_ref() {
-        Some(u) if !u.is_empty() => Usage::Reported(TokenUsage {
-            input: u.input_tokens.unwrap_or_default(),
-            output: u.output_tokens.unwrap_or_default(),
-            cached_input: u.cached_input_tokens.unwrap_or_default(),
-        }),
-        _ => Usage::Unreported,
-    };
+    let usage = reported_usage(&result)
+        .map(Usage::Reported)
+        .unwrap_or(Usage::Unreported);
+    let failure = result.is_error.then(|| result_failure(&result));
 
     TurnOutcome {
         reply: result.result.trim().to_string(),
@@ -45,91 +131,69 @@ pub(crate) fn from_query_result(result: QueryResult, elapsed: Duration) -> TurnO
         provider_turns: result.num_turns,
         elapsed,
         metadata: BTreeMap::new(),
-        failure: result
-            .is_error
-            .then(|| TurnFailure::reported(result.result.trim().to_string())),
+        failure,
     }
 }
 
-/// A run that hit `--max-turns` or `--max-budget-usd`, reproducing
-/// `ciacola-core::agent`'s `capped()`: the provider ran, at length, and
-/// stopped at a ceiling we set. That is data, not a failure to run, so
-/// it comes back as `Some(TurnOutcome)` rather than falling through to
-/// [`classify_failure`]. `None` means "this was not a cap", and the
-/// caller classifies the error normally.
+/// A terminal `stream-json` result, with observations made earlier in
+/// the stream filling only fields the terminal event omitted.
 ///
-/// Cost and usage use the same three-state types every other outcome
-/// does. The cap events carry a spend figure but never a token
-/// breakdown, so usage reads [`Usage::Unreported`] here rather than a
-/// zeroed [`TokenUsage`], and an absent cost reads [`Cost::Unreported`]
-/// rather than zero -- the exact "free and unreported look the same"
-/// bug issue 53 exists to fix. The old `Exchange`-shaped code flattened
-/// both to zero because it had no type that could say otherwise; this
-/// one does, so it is not reproduced.
-pub(crate) fn capped(
-    error: &claude_wrapper::Error,
+/// The terminal result is authoritative when it reports usage. The
+/// cumulative assistant-message total is a fallback, never something
+/// added to that terminal number. A terminal event also proves a
+/// client-assigned or earlier stream-observed session was opened even
+/// when this CLI version omitted `session_id` from the result itself.
+pub(crate) fn from_stream_result(
+    result: QueryResult,
+    cumulative_usage: Option<TokenUsage>,
     elapsed: Duration,
-    assigned_resume: Option<&ResumeId>,
-) -> Option<TurnOutcome> {
-    let (cost_usd, num_turns, session_id, message) = match error {
-        claude_wrapper::Error::MaxTurnsExceeded {
-            cost_usd,
-            num_turns,
-            session_id,
-            max_turns,
-            ..
-        } => (
-            *cost_usd,
-            *num_turns,
-            session_id.clone(),
-            match max_turns {
-                Some(n) => format!("reached maximum number of turns ({n})"),
-                None => "reached maximum number of turns".to_string(),
-            },
-        ),
-        claude_wrapper::Error::MaxBudgetExceeded {
-            cost_usd,
-            num_turns,
-            session_id,
-            max_usd,
-            ..
-        } => (
-            *cost_usd,
-            *num_turns,
-            session_id.clone(),
-            match max_usd {
-                Some(usd) => format!("reached maximum budget (${usd:.2})"),
-                None => "reached maximum budget".to_string(),
-            },
-        ),
-        _ => return None,
-    };
-
-    // A cap is a terminal provider result, so it proves the assigned
-    // session was opened even if this CLI version omitted the id from
-    // its error payload.
-    let resume = session_id
-        .map(ResumeId::ProviderAssigned)
-        .or_else(|| assigned_resume.map(|r| ResumeId::ProviderAssigned(r.value().to_string())));
-
-    Some(TurnOutcome {
-        reply: String::new(),
-        resume,
-        cost: match cost_usd {
-            Some(usd) => Cost::Reported {
-                micro_usd: (usd * 1_000_000.0) as u64,
-            },
-            None => Cost::Unreported,
-        },
-        usage: Usage::Unreported,
-        provider_turns: num_turns,
-        elapsed,
-        metadata: BTreeMap::new(),
-        failure: Some(TurnFailure::limit(message)),
-    })
+    fallback_resume: Option<&ResumeId>,
+) -> TurnOutcome {
+    let mut outcome = from_query_result(result, elapsed);
+    if matches!(outcome.usage, Usage::Unreported)
+        && let Some(usage) = cumulative_usage
+    {
+        outcome.usage = Usage::Reported(usage);
+    }
+    if outcome.resume.is_none()
+        && let Some(resume) = fallback_resume
+    {
+        outcome.resume = Some(ResumeId::ProviderAssigned(resume.value().to_string()));
+    }
+    outcome
 }
 
-/// Everything that is not a cap: typed, and honest about spend.
+fn result_failure(result: &QueryResult) -> TurnFailure {
+    let message = result_error_message(result);
+    match result
+        .extra
+        .get("subtype")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("error_max_turns" | "error_max_budget_usd") => {
+            TurnFailure::limit(message.to_lowercase())
+        }
+        _ => TurnFailure::reported(message),
+    }
+}
+
+fn result_error_message(result: &QueryResult) -> String {
+    let reply = result.result.trim();
+    if !reply.is_empty() {
+        return reply.to_string();
+    }
+    result
+        .extra
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|errors| errors.first())
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("claude reported an error")
+        .to_string()
+}
+
+/// Map a wrapper failure into a typed provider error while preserving
+/// any telemetry observed before the stream ended.
 ///
 /// [`AgentError::Timeout`], [`AgentError::Protocol`], and the
 /// post-launch shapes of [`AgentError::Other`] carry a
@@ -137,10 +201,8 @@ pub(crate) fn capped(
 /// follow a completed process launch: a JSON parse failure means the
 /// CLI ran to completion and produced output, and an ordinary nonzero
 /// exit means the same. Money and tokens are left `None` on that
-/// partial because `claude-wrapper`'s failure variants do not carry the
-/// result event's spend fields the way the two cap variants
-/// ([`capped`]) do -- there is nothing more honest to report here than
-/// "this much time passed".
+/// partial when the stream did not report them -- there is nothing more
+/// honest to retain in that case than "this much time passed".
 ///
 /// No branch that names a variant calls `claude_wrapper::Error`'s own
 /// `Display`: `CommandFailed`, `Auth`, `MaxTurnsExceeded`, and
@@ -158,18 +220,25 @@ pub(crate) fn capped(
 /// that exists at the pinned revision is named above and does not
 /// reach it. If upstream adds a variant that carries a command line,
 /// name it explicitly here rather than letting it fall through.
+#[cfg(test)]
 pub(crate) fn classify_failure(
     error: claude_wrapper::Error,
     elapsed: Duration,
     provider: ProviderKey,
 ) -> AgentError {
-    let launched_partial = || {
-        PartialTelemetry {
-            elapsed: Some(elapsed),
-            ..PartialTelemetry::none()
-        }
-        .into()
-    };
+    classify_failure_with_partial(error, elapsed, provider, PartialTelemetry::none())
+}
+
+/// Classify a stream failure without discarding usage or a session that
+/// arrived before the terminal error.
+pub(crate) fn classify_failure_with_partial(
+    error: claude_wrapper::Error,
+    elapsed: Duration,
+    provider: ProviderKey,
+    mut observed: PartialTelemetry,
+) -> AgentError {
+    observed.elapsed = Some(elapsed);
+    let launched_partial = || observed.clone().into();
 
     match error {
         claude_wrapper::Error::NotFound => AgentError::NotFound {
@@ -221,11 +290,18 @@ pub(crate) fn classify_failure(
             stdout,
             stderr,
             ..
-        } => AgentError::Other {
-            provider,
-            detail: command_failed_detail(exit_code, &stdout, &stderr),
-            partial: launched_partial(),
-        },
+        } => {
+            let detail = command_failed_detail(exit_code, &stdout, &stderr);
+            let detail = match claude_wrapper::auth::classify_failure(exit_code, &stdout, &stderr) {
+                Some(kind) => format!("auth error ({kind:?}): {detail}"),
+                None => detail,
+            };
+            AgentError::Other {
+                provider,
+                detail,
+                partial: launched_partial(),
+            }
+        }
         // The wrapper's own BudgetTracker ceiling, checked before the
         // CLI is dispatched: this adapter never attaches one today, so
         // this arm is unreachable in practice, but it is pre-launch by
@@ -263,14 +339,46 @@ mod tests {
     use super::*;
     use claude_wrapper::Error as WrapperError;
 
-    fn capped_error(result_json: &str) -> WrapperError {
-        WrapperError::from_command_failure(
-            "claude -p ...".into(),
-            1,
-            result_json.into(),
-            String::new(),
-            None,
-        )
+    fn stream_event(json: &str) -> StreamEvent {
+        serde_json::from_str(json).expect("stream event")
+    }
+
+    #[test]
+    fn assistant_usage_requires_a_numeric_bucket_but_keeps_reported_zero() {
+        let empty = stream_event(r#"{"type":"assistant","message":{"usage":{}}}"#);
+        let nulls = stream_event(
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":null,"output_tokens":null}}}"#,
+        );
+        let zero = stream_event(
+            r#"{"type":"assistant","message":{"id":"zero","usage":{"input_tokens":0,"output_tokens":0}}}"#,
+        );
+        let cached = stream_event(
+            r#"{"type":"assistant","message":{"id":"cached","usage":{"input_tokens":3,"cache_read_input_tokens":5,"cache_creation_input_tokens":7,"output_tokens":2}}}"#,
+        );
+
+        assert_eq!(assistant_usage(&empty), None);
+        assert_eq!(assistant_usage(&nulls), None);
+        assert_eq!(
+            assistant_usage(&zero),
+            Some((Some("zero".into()), TokenUsage::default())),
+            "an explicit numeric zero is a report, not an absent measurement"
+        );
+        assert_eq!(
+            assistant_usage(&cached),
+            Some((
+                Some("cached".into()),
+                TokenUsage {
+                    input: 15,
+                    output: 2,
+                    cached_input: 5,
+                }
+            )),
+            "portable input includes Claude's non-cached, cache-read, and cache-write buckets"
+        );
+    }
+
+    fn query_result(result_json: &str) -> QueryResult {
+        serde_json::from_str(result_json).expect("query result")
     }
 
     /// The bug issue 53 exists for: a run that worked for minutes and
@@ -278,13 +386,12 @@ mod tests {
     /// zero and unresumable.
     #[test]
     fn a_capped_run_keeps_its_spend_and_session_as_reported_not_zero() {
-        let e = capped_error(
+        let result = query_result(
             r#"{"type":"result","subtype":"error_max_turns","is_error":true,
                 "total_cost_usd":1.25,"num_turns":60,"session_id":"sess-1",
                 "errors":["Reached maximum number of turns (60)"]}"#,
         );
-        let outcome = capped(&e, Duration::from_millis(323_000), None)
-            .expect("a cap is an outcome, not a failure to run");
+        let outcome = from_stream_result(result, None, Duration::from_millis(323_000), None);
 
         assert!(!outcome.succeeded());
         assert_eq!(
@@ -310,12 +417,12 @@ mod tests {
     /// where the old `Exchange` type could only flatten to zero.
     #[test]
     fn a_capped_run_without_a_reported_cost_is_unreported_not_zero() {
-        let e = capped_error(
+        let result = query_result(
             r#"{"type":"result","subtype":"error_max_turns","is_error":true,
                 "errors":["Reached maximum number of turns (60)"]}"#,
         );
         let assigned = ResumeId::ClientAssigned("assigned-1".into());
-        let outcome = capped(&e, Duration::from_millis(10), Some(&assigned)).expect("still capped");
+        let outcome = from_stream_result(result, None, Duration::from_millis(10), Some(&assigned));
 
         assert_eq!(outcome.cost, Cost::Unreported);
         assert!(outcome.cost.is_missing());
@@ -331,17 +438,17 @@ mod tests {
     /// one, from the other constructor.
     #[test]
     fn a_max_budget_cap_is_recognised_and_carries_its_spend() {
-        let e = capped_error(
+        let result = query_result(
             r#"{"type":"result","subtype":"error_max_budget_usd","is_error":true,
                 "errors":["Reached maximum budget ($0.01)"],"num_turns":1,
                 "total_cost_usd":0.1273986,"session_id":"s1"}"#,
         );
-        let outcome =
-            capped(&e, Duration::from_millis(5_000), None).expect("a budget cap is a cap");
+        let outcome = from_stream_result(result, None, Duration::from_millis(5_000), None);
         assert_eq!(
             outcome.failure_message(),
             Some("reached maximum budget ($0.01)")
         );
+        assert_eq!(outcome.cost, Cost::Reported { micro_usd: 127_398 });
         assert_eq!(
             outcome.resume,
             Some(ResumeId::ProviderAssigned("s1".into()))
@@ -352,8 +459,15 @@ mod tests {
     /// silently downgraded into a capped outcome.
     #[test]
     fn an_ordinary_failure_is_not_treated_as_a_cap() {
-        let e = capped_error("command not found");
-        assert!(capped(&e, Duration::from_millis(10), None).is_none());
+        let result = query_result(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,
+                "result":"command not found"}"#,
+        );
+        let outcome = from_stream_result(result, None, Duration::from_millis(10), None);
+        assert_eq!(
+            outcome.failure,
+            Some(TurnFailure::reported("command not found"))
+        );
     }
 
     #[test]
@@ -460,6 +574,26 @@ mod tests {
         );
         assert_eq!(outcome.provider_turns, Some(2));
         assert!(outcome.succeeded());
+    }
+
+    #[test]
+    fn a_terminal_result_normalizes_claudes_split_input_buckets() {
+        let qr: QueryResult = serde_json::from_str(
+            r#"{"result":"done","is_error":false,
+                "usage":{"input_tokens":10,"cache_read_input_tokens":6,
+                         "cache_creation_input_tokens":4,"output_tokens":5}}"#,
+        )
+        .unwrap();
+
+        let outcome = from_query_result(qr, Duration::from_millis(1));
+        assert_eq!(
+            outcome.usage,
+            Usage::Reported(TokenUsage {
+                input: 20,
+                output: 5,
+                cached_input: 6,
+            })
+        );
     }
 
     /// A result event with no usage block at all is a gap, not zero
