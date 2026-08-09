@@ -48,10 +48,58 @@ use ciacola_core::plugin::{BoxFut, Migration, Plugin, PluginContext, Section, Su
 use ciacola_core::roles::{Role, Roles};
 
 const ROLE: &str = "issue-implementer";
+const START_ISSUE_ROLE_ARGUMENTS: [&str; 3] = ["repo", "issue", "worktree"];
 /// The other half of the loop: whoever dispatches work is also who
 /// notices what the implementer prompt got wrong, and that only turns
 /// into a better prompt if it is somebody's stated job.
 const MANAGER: &str = "repo-manager";
+
+/// `start_issue` owns this role's argument map. Configured overrides may
+/// change the prompt and provisioning, but cannot require values the tool has
+/// no typed way to supply or drop the values that define its contract.
+fn validate_start_issue_role_arguments(role: &Role) -> Result<(), String> {
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    for argument in &role.arguments {
+        *counts.entry(argument.as_str()).or_default() += 1;
+    }
+
+    let missing: Vec<&str> = START_ISSUE_ROLE_ARGUMENTS
+        .iter()
+        .copied()
+        .filter(|argument| !counts.contains_key(argument))
+        .collect();
+    let unsupported: Vec<&str> = counts
+        .keys()
+        .copied()
+        .filter(|argument| !START_ISSUE_ROLE_ARGUMENTS.contains(argument))
+        .collect();
+    let duplicate: Vec<&str> = counts
+        .iter()
+        .filter_map(|(argument, count)| (*count > 1).then_some(*argument))
+        .collect();
+
+    if missing.is_empty() && unsupported.is_empty() && duplicate.is_empty() {
+        return Ok(());
+    }
+
+    let mut differences = Vec::new();
+    if !missing.is_empty() {
+        differences.push(format!("missing {missing:?}"));
+    }
+    if !unsupported.is_empty() {
+        differences.push(format!("unsupported {unsupported:?}"));
+    }
+    if !duplicate.is_empty() {
+        differences.push(format!("duplicate {duplicate:?}"));
+    }
+    Err(format!(
+        "role '{}' is incompatible with start_issue: expected exactly arguments {:?}; {}. \
+         start_issue supplies only repo, issue, and worktree",
+        role.name,
+        START_ISSUE_ROLE_ARGUMENTS,
+        differences.join("; ")
+    ))
+}
 
 const ASSIGNMENTS_TABLE: &str = "repo_worker_assignments";
 const MIGRATIONS: &[Migration] = &[
@@ -3182,6 +3230,9 @@ to do, on purpose."
                                 return Ok(CallToolResult::error(refusal.to_string()));
                             }
                         };
+                        if let Err(error) = validate_start_issue_role_arguments(&role) {
+                            return Ok(CallToolResult::error(error));
+                        }
                         let assignments = AssignmentDb::new(ctx.pool.clone());
                         let (mut assignment, claimed) = match assignments
                             .reserve(
@@ -6718,6 +6769,78 @@ mod tests {
         ] {
             assert!(!conventional_title(bad), "should fail: {bad}");
         }
+    }
+
+    #[test]
+    fn start_issue_role_argument_contract_is_exact_and_deterministic() {
+        let mut role = native_implementer_role();
+        role.arguments = vec!["worktree".into(), "repo".into(), "issue".into()];
+        validate_start_issue_role_arguments(&role).expect("order does not matter");
+
+        role.arguments = vec!["repo".into(), "worktree".into()];
+        assert_eq!(
+            validate_start_issue_role_arguments(&role).expect_err("missing issue"),
+            "role 'issue-implementer' is incompatible with start_issue: expected exactly \
+             arguments [\"repo\", \"issue\", \"worktree\"]; missing [\"issue\"]. \
+             start_issue supplies only repo, issue, and worktree"
+        );
+
+        role.arguments = vec![
+            "repo".into(),
+            "issue".into(),
+            "worktree".into(),
+            "release".into(),
+            "repo".into(),
+        ];
+        assert_eq!(
+            validate_start_issue_role_arguments(&role).expect_err("extra and duplicate"),
+            "role 'issue-implementer' is incompatible with start_issue: expected exactly \
+             arguments [\"repo\", \"issue\", \"worktree\"]; unsupported [\"release\"]; \
+             duplicate [\"repo\"]. start_issue supplies only repo, issue, and worktree"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn incompatible_implementer_refuses_before_assignment_github_or_git() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ciacola-role-argument-preflight-{}",
+            ulid::Ulid::new()
+        ));
+        let fake = FakeGh::new(&tmp);
+        let repos = Repos {
+            root: tmp.join("repos"),
+            allowed: Arc::new(vec!["local/repo".into()]),
+            gh_binary: fake.binary.clone(),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let (mut plugin, ledger) = memory_plugin(repos.clone()).await;
+        let mut role = native_implementer_role();
+        role.arguments.push("release".into());
+        plugin.ctx.as_mut().expect("context").roles = roles_with_implementer(role);
+
+        let start = operator_tool(&plugin, "start_issue");
+        let out = start.call(json!({"repo": "local/repo", "issue": 85})).await;
+        let rendered = serde_json::to_string(&out).expect("render");
+
+        assert!(
+            rendered.contains("unsupported [\\\"release\\\"]"),
+            "must explain the incompatible role: {rendered}"
+        );
+        assert!(fake.log().is_empty(), "GitHub must not run: {}", fake.log());
+        assert!(
+            !repos.root.exists(),
+            "clone, refs, and worktree paths must remain absent"
+        );
+        assert!(ledger.list_agents().await.expect("agents").is_empty());
+        let assignments = AssignmentDb::new(plugin.ctx.as_ref().expect("context").pool.clone())
+            .list()
+            .await
+            .expect("assignments");
+        assert!(assignments.is_empty(), "no durable claim may be created");
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// `start_issue` creates an agent through plugin wiring, so it must
