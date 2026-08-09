@@ -80,6 +80,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub mod capability;
+pub mod environment;
 pub mod error;
 pub mod events;
 pub mod intent;
@@ -89,6 +90,9 @@ pub mod provider;
 pub use capability::{
     CacheTreatment, Capabilities, CeilingCapability, Constraint, EnforcementGranularity, MeterId,
     Severity, Unsupported, Validation,
+};
+pub use environment::{
+    PROVIDER_CHILD_BASELINE_ENV, ProviderChildEnvironment, ProviderChildEnvironmentError,
 };
 pub use error::{AgentError, PartialTelemetry};
 pub use events::{NoEvents, TurnEvents};

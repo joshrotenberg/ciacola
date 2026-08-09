@@ -89,7 +89,9 @@ impl HumanOperatorToken {
 /// desktop operating systems it can remain visible to same-user process
 /// inspection even after `unsetenv`. Only the descriptor number is inherited.
 /// The descriptor is read and closed here, before an agent can exist.
-pub fn take_from_environment() -> Result<Option<HumanOperatorToken>, OperatorTokenError> {
+pub fn take_from_environment(
+    allow_client_bearer_passthrough: bool,
+) -> Result<Option<HumanOperatorToken>, OperatorTokenError> {
     let descriptor = std::env::var_os(OPERATOR_TOKEN_FD_ENV);
     let unsafe_inline = std::env::var_os(UNSAFE_OPERATOR_TOKEN_ENV);
     let ambient_client_bearer = std::env::var_os(CLIENT_BEARER_ENV);
@@ -99,9 +101,10 @@ pub fn take_from_environment() -> Result<Option<HumanOperatorToken>, OperatorTok
     unsafe {
         std::env::remove_var(OPERATOR_TOKEN_FD_ENV);
         std::env::remove_var(UNSAFE_OPERATOR_TOKEN_ENV);
-        // `MCP_BEARER` belongs to an HTTP client, never to the server or a
-        // provider child. Drop an accidentally inherited copy at the same
-        // pre-thread boundary.
+        // `MCP_BEARER` belongs to an HTTP client, never to the server. Main
+        // may already have snapshotted it for a deliberately allowlisted
+        // provider child; either way, remove the daemon's ambient copy at the
+        // same pre-thread boundary.
         std::env::remove_var(CLIENT_BEARER_ENV);
     }
 
@@ -110,7 +113,7 @@ pub fn take_from_environment() -> Result<Option<HumanOperatorToken>, OperatorTok
             "CIACOLA_OPERATOR_TOKEN is unsafe at process startup; pass the secret through CIACOLA_OPERATOR_TOKEN_FD",
         ));
     }
-    if ambient_client_bearer.is_some() {
+    if ambient_client_bearer.is_some() && !allow_client_bearer_passthrough {
         return Err(OperatorTokenError(
             "MCP_BEARER belongs to the HTTP client, not the server; refusing to leave it in the server's startup environment",
         ));

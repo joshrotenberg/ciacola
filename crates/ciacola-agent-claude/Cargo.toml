@@ -12,7 +12,6 @@ authors.workspace = true
 ciacola-agent = { workspace = true }
 claude-wrapper = { workspace = true }
 serde_json = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
