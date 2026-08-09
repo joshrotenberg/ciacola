@@ -12,6 +12,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
+use crate::capability::CeilingCapability;
+
 /// Which conversation to continue, and who chose its name.
 ///
 /// The two variants are not cosmetic. ciacola assigns an id *before*
@@ -263,6 +267,21 @@ pub struct McpScope {
     pub strict: bool,
 }
 
+/// The exact provider-native ceiling admitted for one turn.
+///
+/// The capability is copied beside the value rather than rediscovered at
+/// execution time. That snapshot lets a restart reject provider/version drift
+/// instead of applying the same number to a wider or otherwise different
+/// meter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnCeiling {
+    /// Unit, enforcement granularity, and cache semantics admitted for this
+    /// turn.
+    pub capability: CeilingCapability,
+    /// Maximum provider-native units, in `capability.meter`.
+    pub limit: u64,
+}
+
 /// One turn, as intent.
 ///
 /// Built by the caller from an agent definition and the thing being
@@ -307,6 +326,9 @@ pub struct TurnIntent {
     /// Ceiling on provider-internal turns (tool calls and the like) for
     /// this one reply. `None` is the provider's default.
     pub max_provider_turns: Option<u32>,
+    /// Provider-native work ceiling admitted for this turn. `None` means no
+    /// per-turn ceiling was requested; it does not mean zero.
+    pub turn_ceiling: Option<TurnCeiling>,
     /// Scoped MCP endpoints. `None` means the agent gets whatever the
     /// provider would give it, which for an isolated turn is nothing.
     pub mcp: Option<McpScope>,
@@ -357,6 +379,21 @@ mod tests {
         assert!(!ResumeId::ClientAssigned("a".into()).is_open());
         assert!(ResumeId::ProviderAssigned("a".into()).is_open());
         assert_eq!(ResumeId::ClientAssigned("a".into()).value(), "a");
+    }
+
+    #[test]
+    fn a_ceiling_snapshot_round_trips_without_losing_meter_semantics() {
+        let ceiling = TurnCeiling {
+            capability: CeilingCapability {
+                meter: crate::MeterId::new("claude.max_budget.micro_usd.v1"),
+                granularity: crate::EnforcementGranularity::ProviderResponseBoundary,
+                cache_treatment: crate::CacheTreatment::NotApplicable,
+            },
+            limit: 25_000,
+        };
+        let json = serde_json::to_string(&ceiling).expect("serialize ceiling");
+        let decoded: TurnCeiling = serde_json::from_str(&json).expect("deserialize ceiling");
+        assert_eq!(decoded, ceiling);
     }
 
     /// Both spellings of the isolation switch are in live config files,

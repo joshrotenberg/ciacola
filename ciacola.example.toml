@@ -57,11 +57,11 @@ hermetic = "full"
 # codex_token_env = "CIACOLA_CODEX_TOKEN"
 
 [limits]
-# Circuit breakers, not budgets. Measured spend across real turns spans
-# 54x, so no number is correct; a breaker only has to be wrong in the
-# safe direction. Applies to new submissions, never to running work.
-# Set both before adding a schedule. Leaving them commented is an
-# explicit choice to run without a monetary circuit breaker.
+# Rolling admission circuit breakers, not per-turn budgets. Measured spend
+# across real turns spans 54x, so no number is correct; a breaker only has to
+# be wrong in the safe direction. These apply to new submissions, never to
+# work already admitted. Leaving them commented is an explicit choice to run
+# without a monetary admission breaker.
 # daily_warn_usd = 25.0
 # daily_stop_usd = 50.0
 
@@ -70,19 +70,51 @@ hermetic = "full"
 max_spawn_depth = 3
 
 # Backends that do not report money need a provider token stop before
-# schedules, webhooks, or agents may submit work to them. Tokens are total
+# schedules, webhooks, or agents may submit work to them. These are reported
 # input + output over a rolling 24 hours; cached input is already included in
 # input and is never counted twice. Warning-only configuration does not make
-# unattended work bounded.
+# unattended work admissible.
 # [limits.providers.codex]
 # daily_warn_tokens = 2_000_000
 # daily_stop_tokens = 4_000_000
+#
+# A separate provider-native ceiling is reapplied to every opening or resumed
+# Codex execution. This number is NOT portable total tokens and enforcement is
+# NOT exact: the detected, wrapper-tested CLI version declares a versioned
+# meter and checks it at provider-response boundaries. Work already in flight
+# can overshoot; concurrent Codex root/subagent responses can multiply that
+# soft-boundary overshoot, so it is not bounded to exactly one response. Codex
+# 0.145-0.146 use weighted non-cached input + output; 0.147 prefers
+# provider-supplied rollout units and uses that calculation only as a fallback.
+# The board shows the exact meter, cache treatment, and granularity.
+# per_turn_ceiling = 250_000
+
+# Claude's provider-native ceiling is integer micro-USD: 2_000_000 means
+# $2.00. Claude also checks at a provider-response boundary and can overshoot.
+# Its rolling admission accounting remains the global daily USD policy above.
+# [limits.providers.claude]
+# per_turn_ceiling = 2_000_000
 
 # Dollar and token stops are independent admission breakers: reaching either
 # refuses new work, while admitted and running turns finish. They are not
 # reservations, so one turn can cross the threshold and concurrent turns can
-# multiply the overshoot. Ciacola uses the measurements each backend reports
-# and deliberately carries no provider price table.
+# multiply the overshoot. A per-turn ceiling narrows one execution; it does
+# not reserve aggregate rolling capacity and concurrent turns each receive
+# their own ceiling. Ciacola uses provider-declared meters and the measurements
+# each backend reports and deliberately carries no provider price table.
+#
+# Omitting per_turn_ceiling is explicit UNBOUNDED behavior and does not by
+# itself block otherwise-admissible automatic work. If it is configured but
+# the installed adapter/CLI cannot honor it, automatic work fails closed
+# before provider side effects. `send_supervised` may override unavailable
+# protection only with a durable human reason; it never overrides a reached
+# rolling stop. The effective ceiling and its semantics are persisted on the
+# queued turn, so restart, recovery, and later config changes cannot widen it.
+#
+# Current Codex budget-failure JSONL omits terminal usage (upstream:
+# https://github.com/openai/codex/issues/37676). Ciacola records usage as
+# unreported, or retains an earlier partial snapshot, rather than presenting
+# an invented exact usage or overshoot figure.
 
 # Plugins read their own sections; the server never sees these fields.
 [plugins.repo-worker]

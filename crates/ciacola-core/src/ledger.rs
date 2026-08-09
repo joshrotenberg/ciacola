@@ -105,6 +105,17 @@ pub struct TurnRow {
     /// Canonical JSON describing a supervised admission override, when
     /// one was used. Policy owns the shape; the ledger owns durability.
     pub admission_override: Option<String>,
+    /// Queryable result of the per-turn protection decision:
+    /// `enforced`, `unbounded`, `override_unavailable`, or `legacy`.
+    pub turn_protection_state: String,
+    /// Canonical versioned JSON containing the exact provider capability,
+    /// configured value, and any supervised unavailable-protection audit.
+    pub turn_protection: Option<String>,
+    /// `none`, `limit`, `reported`, `not_attempted`, or `legacy`.
+    pub failure_kind: String,
+    /// Provider conversation observed during this specific turn. The agent
+    /// session remains the current aggregate; this is immutable provenance.
+    pub provider_session: Option<String>,
 }
 
 type AgentTuple = (
@@ -140,8 +151,42 @@ const TURN_SELECT: &str = "\
     SELECT agent_id, seq, prompt, state, reply, error, cost_micro_usd, cost_state,
            elapsed_ms, elapsed_state, claimed_unix_ms, tokens_in, tokens_out,
            tokens_cached, usage_state, usage_complete, provider_turns, provider,
-           settled_unix, admission_override
+           settled_unix, admission_override, turn_protection_state,
+           turn_protection, failure_kind, provider_session
     FROM turns";
+
+// Intentionally installed before its marker column. Core migrations are
+// durable but not one enclosing transaction; if startup stops between these
+// two steps, SQLite accepts this trigger and rejects an enforced claim with
+// `no such column` instead of allowing an old executable to run without the
+// persisted ceiling. The following migration adds the column and turns that
+// temporary hard stop into the explicit version check below.
+const ENFORCED_CLAIM_FENCE_SQL: &str = "\
+    CREATE TRIGGER IF NOT EXISTS ciacola_turn_enforced_claim_fence
+       BEFORE UPDATE OF state ON turns
+       WHEN OLD.state = 'queued'
+        AND NEW.state = 'running'
+        AND OLD.turn_protection_state = 'enforced'
+        AND NEW.turn_protection_claim_version < 1
+     BEGIN
+       SELECT RAISE(ABORT,
+           'enforced turn requires a per-turn-protection-aware claimant');
+     END";
+
+// Installed before the same marker column as the claim fence. During that
+// short migration boundary an old terminal write fails on the absent column;
+// after setup completes, old executions (claim version zero) cannot leave a
+// failed or killed row with the new writer's misleading `none` provenance.
+const OLD_TERMINAL_PROVENANCE_SQL: &str = "\
+    CREATE TRIGGER IF NOT EXISTS ciacola_turn_old_terminal_provenance
+       AFTER UPDATE OF state ON turns
+       WHEN NEW.state IN ('failed', 'killed')
+        AND NEW.failure_kind = 'none'
+        AND NEW.turn_protection_claim_version = 0
+     BEGIN
+       UPDATE turns SET failure_kind = 'legacy'
+        WHERE agent_id = NEW.agent_id AND seq = NEW.seq;
+     END";
 
 fn agent_row(t: AgentTuple) -> Result<AgentRow, FlatError> {
     let (
@@ -194,6 +239,10 @@ fn turn_row(row: SqliteRow) -> Result<TurnRow, FlatError> {
         provider: row.try_get("provider")?,
         settled_unix: row.try_get("settled_unix")?,
         admission_override: row.try_get("admission_override")?,
+        turn_protection_state: row.try_get("turn_protection_state")?,
+        turn_protection: row.try_get("turn_protection")?,
+        failure_kind: row.try_get("failure_kind")?,
+        provider_session: row.try_get("provider_session")?,
     })
 }
 
@@ -214,6 +263,14 @@ fn usage_state(usage: ciacola_agent::Usage) -> &'static str {
         ciacola_agent::Usage::Reported(_) => "reported",
         ciacola_agent::Usage::Unreported => "unreported",
         ciacola_agent::Usage::NotTracked => "not_tracked",
+    }
+}
+
+fn failure_kind(kind: Option<ciacola_agent::FailureKind>) -> &'static str {
+    match kind {
+        Some(ciacola_agent::FailureKind::Limit) => "limit",
+        Some(ciacola_agent::FailureKind::Reported) => "reported",
+        None => "none",
     }
 }
 
@@ -423,6 +480,37 @@ impl Ledger {
                 "CREATE INDEX IF NOT EXISTS idx_turns_state_settled
                      ON turns(state, settled_unix)",
             ),
+            Migration::add_column(
+                "0027_turns_turn_protection_state",
+                "ALTER TABLE turns ADD COLUMN turn_protection_state TEXT NOT NULL DEFAULT 'legacy'",
+            ),
+            Migration::add_column(
+                "0028_turns_turn_protection",
+                "ALTER TABLE turns ADD COLUMN turn_protection TEXT",
+            ),
+            Migration::add_column(
+                "0029_turns_failure_kind",
+                "ALTER TABLE turns ADD COLUMN failure_kind TEXT NOT NULL DEFAULT 'legacy'",
+            ),
+            Migration::add_column(
+                "0030_turns_provider_session",
+                "ALTER TABLE turns ADD COLUMN provider_session TEXT",
+            ),
+            // An additive schema is intentionally usable by older binaries,
+            // but an old claimant does not know how to pass an enforced
+            // ceiling to the provider. Keep such a row queued unless the
+            // same state transition proves that the claimant understands
+            // the persisted #78 contract. Unbounded, unavailable-override,
+            // and legacy rows retain deliberate mixed-version compatibility.
+            Migration::new("0031_turns_enforced_claim_fence", ENFORCED_CLAIM_FENCE_SQL),
+            Migration::new(
+                "0032_turns_old_terminal_provenance",
+                OLD_TERMINAL_PROVENANCE_SQL,
+            ),
+            Migration::add_column(
+                "0033_turns_protection_claim_version",
+                "ALTER TABLE turns ADD COLUMN turn_protection_claim_version INTEGER NOT NULL DEFAULT 0",
+            ),
         ];
         crate::plugin::apply_migrations(&pool, "core", MIGRATIONS).await?;
         let ledger = Self {
@@ -594,6 +682,7 @@ impl Ledger {
         seq: i64,
         session: &str,
     ) -> Result<(), FlatError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "UPDATE agents SET session = ?3,
                  session_started_seq = CASE
@@ -605,8 +694,18 @@ impl Ledger {
         .bind(agent_id)
         .bind(seq)
         .bind(session)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE turns SET provider_session = ?3
+             WHERE agent_id = ?1 AND seq = ?2",
+        )
+        .bind(agent_id)
+        .bind(seq)
+        .bind(session)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -912,11 +1011,21 @@ impl Ledger {
         // sender's turn number under a kill-plus-resend race.
         let row: Option<(i64,)> = sqlx::query_as(
             "INSERT INTO turns
-                 (agent_id, seq, prompt, state, at_unix, provider, admission_override)
+                 (agent_id, seq, prompt, state, at_unix, provider, admission_override,
+                  turn_protection_state, turn_protection, failure_kind)
              SELECT a.agent_id,
                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE agent_id = a.agent_id),
                     ?2, 'queued', ?3,
-                    COALESCE(NULLIF(json_extract(a.def, '$.provider'), ''), 'claude'), ?4
+                    COALESCE(NULLIF(json_extract(a.def, '$.provider'), ''), 'claude'), ?4,
+                    'unbounded',
+                    json_object(
+                        'version', 1,
+                        'provider', COALESCE(NULLIF(json_extract(a.def, '$.provider'), ''), 'claude'),
+                        'state', 'unbounded',
+                        'configured_limit', NULL,
+                        'capability', NULL,
+                        'unavailable_override', NULL),
+                    'none'
                FROM agents a
               WHERE a.agent_id = ?1 AND a.retired = 0
                AND NOT EXISTS (SELECT 1 FROM turns
@@ -948,7 +1057,8 @@ impl Ledger {
     /// `running` without the clock it needs to settle elapsed time.
     pub async fn claim_turn(&self, agent_id: &str, seq: i64) -> Result<bool, FlatError> {
         let done = sqlx::query(
-            "UPDATE turns SET state = 'running', claimed_unix_ms = ?3
+            "UPDATE turns SET state = 'running', claimed_unix_ms = ?3,
+                 turn_protection_claim_version = 1
              WHERE agent_id = ?1 AND seq = ?2 AND state = 'queued'",
         )
         .bind(agent_id)
@@ -1037,6 +1147,10 @@ impl Ledger {
                  END,
                  usage_complete = CASE WHEN state = 'queued' THEN 1 ELSE 0 END,
                  provider_turns = CASE WHEN state = 'queued' THEN 0 ELSE NULL END,
+                 failure_kind = CASE
+                     WHEN state = 'queued' THEN 'not_attempted'
+                     ELSE 'reported'
+                 END,
                  elapsed_state = CASE
                      WHEN state = 'queued' THEN 'not_attempted'
                      WHEN ?8 = 'recovery' AND claimed_unix_ms IS NOT NULL THEN 'upper_bound'
@@ -1086,7 +1200,8 @@ impl Ledger {
                  cost_micro_usd = 0, cost_state = 'reported',
                  tokens_in = 0, tokens_out = 0, tokens_cached = 0,
                  usage_state = 'reported', usage_complete = 1, provider_turns = 0,
-                 elapsed_ms = 0, elapsed_state = 'not_attempted', settled_unix = ?4
+                 elapsed_ms = 0, elapsed_state = 'not_attempted',
+                 failure_kind = 'not_attempted', settled_unix = ?4
              WHERE agent_id = ?1 AND seq = ?2 AND state = 'running'",
         )
         .bind(agent_id)
@@ -1139,7 +1254,8 @@ impl Ledger {
                  END,
                  usage_complete = CASE
                      WHEN ?10 = 'reported' AND ?11 THEN 1 ELSE 0 END,
-                 provider_turns = ?12, settled_unix = ?13
+                 provider_turns = ?12, failure_kind = 'none',
+                 provider_session = COALESCE(?14, provider_session), settled_unix = ?13
              WHERE agent_id = ?1 AND seq = ?2 AND state = 'running'",
         )
         .bind(agent_id)
@@ -1155,6 +1271,7 @@ impl Ledger {
         .bind(exchange.usage_complete)
         .bind(exchange.provider_turns.map(i64::from))
         .bind(crate::time::now_unix())
+        .bind(exchange.session.as_deref())
         .execute(&mut *tx)
         .await?;
         let recorded = done.rows_affected() == 1;
@@ -1248,7 +1365,11 @@ impl Ledger {
                  END,
                  usage_complete = CASE WHEN state = 'queued' THEN 1 ELSE 0 END,
                  provider_turns = CASE WHEN state = 'queued' THEN 0 ELSE provider_turns END,
-                 settled_unix = ?9
+                 failure_kind = CASE
+                     WHEN state = 'queued' THEN 'not_attempted'
+                     ELSE 'reported'
+                 END,
+                 provider_session = COALESCE(?10, provider_session), settled_unix = ?9
              WHERE agent_id = ?1 AND seq = ?2 AND state IN ('queued', 'running')",
         )
         .bind(agent_id)
@@ -1260,6 +1381,7 @@ impl Ledger {
         .bind(elapsed_ms)
         .bind(usage_state(unavailable_usage))
         .bind(crate::time::now_unix())
+        .bind(session)
         .execute(&mut *tx)
         .await?;
         let recorded = done.rows_affected() == 1;
@@ -1308,7 +1430,9 @@ impl Ledger {
         let tokens_cached = saturated_i64(tokens.cached_input);
         let mut tx = self.pool.begin().await?;
         let done = sqlx::query(
-            "UPDATE turns SET state = ?3, error = ?4, cost_micro_usd = ?5,
+            "UPDATE turns SET state = ?3, error = ?4,
+                 reply = CASE WHEN ?17 = '' THEN reply ELSE ?17 END,
+                 cost_micro_usd = ?5,
                  cost_state = ?6, elapsed_ms = ?7, elapsed_state = 'measured',
                  tokens_in = CASE
                      WHEN ?11 = 'reported' OR usage_state <> 'reported' THEN ?8
@@ -1328,7 +1452,8 @@ impl Ledger {
                  END,
                  usage_complete = CASE
                      WHEN ?11 = 'reported' AND ?12 THEN 1 ELSE 0 END,
-                 provider_turns = ?13, settled_unix = ?14
+                 provider_turns = ?13, failure_kind = ?15,
+                 provider_session = COALESCE(?16, provider_session), settled_unix = ?14
              WHERE agent_id = ?1 AND seq = ?2 AND state IN ('queued', 'running')",
         )
         .bind(agent_id)
@@ -1345,6 +1470,9 @@ impl Ledger {
         .bind(exchange.usage_complete)
         .bind(exchange.provider_turns.map(i64::from))
         .bind(crate::time::now_unix())
+        .bind(failure_kind(exchange.failure_kind))
+        .bind(exchange.session.as_deref())
+        .bind(&exchange.reply)
         .execute(&mut *tx)
         .await?;
         let recorded = done.rows_affected() == 1;
@@ -1442,6 +1570,37 @@ mod session_tests {
         ) -> ciacola_agent::BoxFut<'a, Result<ciacola_agent::TurnOutcome, ciacola_agent::AgentError>>
         {
             Box::pin(async { panic!("accounting-only provider must not run") })
+        }
+
+        fn owns_process(&self, _ps_line: &str) -> bool {
+            false
+        }
+    }
+
+    struct CeilingProvider {
+        capability: ciacola_agent::CeilingCapability,
+    }
+
+    impl ciacola_agent::Provider for CeilingProvider {
+        fn key(&self) -> ciacola_agent::ProviderKey {
+            ciacola_agent::ProviderKey::new("fenced")
+        }
+
+        fn capabilities(&self) -> ciacola_agent::Capabilities {
+            let mut capabilities = ciacola_agent::Capabilities::none(self.key());
+            capabilities.reports_cost = true;
+            capabilities.reports_token_usage = true;
+            capabilities.turn_ceiling = Some(self.capability.clone());
+            capabilities
+        }
+
+        fn run<'a>(
+            &'a self,
+            _intent: &'a ciacola_agent::TurnIntent,
+            _events: &'a dyn ciacola_agent::TurnEvents,
+        ) -> ciacola_agent::BoxFut<'a, Result<ciacola_agent::TurnOutcome, ciacola_agent::AgentError>>
+        {
+            Box::pin(async { panic!("claim-fence provider must not run") })
         }
 
         fn owns_process(&self, _ps_line: &str) -> bool {
@@ -1619,6 +1778,7 @@ mod session_tests {
             provider_turns: Some(1),
             elapsed_ms: 1,
             error: None,
+            failure_kind: None,
         }
     }
 
@@ -2135,7 +2295,7 @@ mod session_tests {
             .expect("snapshot")
         );
         let exchange = Exchange {
-            reply: String::new(),
+            reply: "partial answer before the ceiling".into(),
             session: None,
             cost: ciacola_agent::Cost::Unreported,
             usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage {
@@ -2147,6 +2307,7 @@ mod session_tests {
             provider_turns: Some(9),
             elapsed_ms: 250,
             error: Some("limited".into()),
+            failure_kind: Some(ciacola_agent::FailureKind::Limit),
         };
         assert!(
             l.fail_exchange(&id, seq, "failed", "limited", &exchange)
@@ -2162,6 +2323,11 @@ mod session_tests {
         );
         assert_eq!(turn.provider_turns, Some(9));
         assert_eq!(turn.elapsed_state, "measured");
+        assert_eq!(turn.failure_kind, "limit");
+        assert_eq!(
+            turn.reply.as_deref(),
+            Some("partial answer before the ceiling")
+        );
         assert!(turn.usage_complete);
         assert!(turn.settled_unix.is_some());
         assert_eq!(turn.reported_tokens(), Some((12, 3, 7)));
@@ -2200,6 +2366,7 @@ mod session_tests {
             provider_turns: Some(1),
             elapsed_ms: 100,
             error: None,
+            failure_kind: None,
         };
         assert!(
             l.complete_turn(&id, success, &no_terminal_usage)
@@ -2237,6 +2404,7 @@ mod session_tests {
             provider_turns: None,
             elapsed_ms: 200,
             error: Some("timed out after launch".into()),
+            failure_kind: Some(ciacola_agent::FailureKind::Reported),
         };
         assert!(
             l.fail_exchange(
@@ -2381,6 +2549,7 @@ mod session_tests {
             provider_turns: Some(0),
             elapsed_ms: 0,
             error: None,
+            failure_kind: None,
         };
         assert!(l.complete_turn(&id, seq, &outcome).await.expect("complete"));
         let turn = l.get_turn(&id, seq).await.unwrap().unwrap();
@@ -2627,6 +2796,10 @@ mod session_tests {
             assert_eq!(turn.settled_unix, Some(100 + seq));
             assert_eq!(turn.usage_complete, complete);
             assert_eq!(turn.admission_override, None);
+            assert_eq!(turn.turn_protection_state, "legacy");
+            assert_eq!(turn.turn_protection, None);
+            assert_eq!(turn.failure_kind, "legacy");
+            assert_eq!(turn.provider_session, None);
         }
         let legacy = ledger
             .get_turn("legacy-agent", 1)
@@ -2636,6 +2809,7 @@ mod session_tests {
         assert_eq!(legacy.provider, "claude");
         assert_eq!(legacy.settled_unix, None);
         assert!(!legacy.usage_complete);
+        assert_eq!(legacy.turn_protection_state, "legacy");
 
         // Simulate a #64 binary writing after the additive #65 schema has
         // been installed: its INSERT/UPDATE statements know none of the
@@ -2668,6 +2842,8 @@ mod session_tests {
         assert_eq!(mixed.provider, "codex");
         assert!(mixed.settled_unix.is_some());
         assert!(!mixed.usage_complete);
+        assert_eq!(mixed.turn_protection_state, "legacy");
+        assert_eq!(mixed.failure_kind, "legacy");
         let providers = ciacola_agent::ProviderRegistry::new()
             .with(Arc::new(AccountingProvider {
                 key: ciacola_agent::ProviderKey::codex(),
@@ -2712,6 +2888,504 @@ mod session_tests {
     }
 
     #[tokio::test]
+    async fn a_partial_turn_protection_migration_resumes_without_widening_old_rows() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool.clone()).await.expect("initial setup");
+        let agent_id = ledger
+            .create_agent(&AgentDef::new("legacy", "s"), None)
+            .await
+            .expect("agent");
+
+        // Recreate the exact crash boundary after 0027: the queryable state
+        // exists and defaults legacy, while the three later columns and
+        // their markers do not. Re-running setup must append only what is
+        // missing and must not reinterpret the queued row as unbounded.
+        // The later mixed-version triggers reference those columns, so remove
+        // their whole migration suffix first to recreate a real after-0027
+        // database rather than an impossible crossed schema.
+        sqlx::query("DROP TRIGGER ciacola_turn_enforced_claim_fence")
+            .execute(&pool)
+            .await
+            .expect("remove claim trigger");
+        sqlx::query("DROP TRIGGER ciacola_turn_old_terminal_provenance")
+            .execute(&pool)
+            .await
+            .expect("remove terminal trigger");
+        sqlx::query("ALTER TABLE turns DROP COLUMN turn_protection_claim_version")
+            .execute(&pool)
+            .await
+            .expect("remove claim marker");
+        sqlx::query(
+            "DELETE FROM schema_migrations WHERE owner = 'core' AND name IN (
+                 '0031_turns_enforced_claim_fence',
+                 '0032_turns_old_terminal_provenance',
+                 '0033_turns_protection_claim_version')",
+        )
+        .execute(&pool)
+        .await
+        .expect("remove mixed-version migration markers");
+        for (migration, column) in [
+            ("0030_turns_provider_session", "provider_session"),
+            ("0029_turns_failure_kind", "failure_kind"),
+            ("0028_turns_turn_protection", "turn_protection"),
+        ] {
+            sqlx::query("DELETE FROM schema_migrations WHERE owner = 'core' AND name = ?1")
+                .bind(migration)
+                .execute(&pool)
+                .await
+                .expect("remove marker");
+            sqlx::query(&format!("ALTER TABLE turns DROP COLUMN {column}"))
+                .execute(&pool)
+                .await
+                .expect("recreate partial migration");
+        }
+        sqlx::query(
+            "INSERT INTO turns (agent_id, seq, prompt, state, at_unix, provider)
+             VALUES (?1, 1, 'queued before upgrade', 'queued', 1, 'claude')",
+        )
+        .bind(&agent_id)
+        .execute(&pool)
+        .await
+        .expect("legacy writer row");
+
+        let reopened = Ledger::setup(pool.clone()).await.expect("resume migration");
+        let row = reopened.get_turn(&agent_id, 1).await.unwrap().unwrap();
+        assert_eq!(row.turn_protection_state, "legacy");
+        assert_eq!(row.turn_protection, None);
+        assert_eq!(row.failure_kind, "legacy");
+        assert_eq!(row.provider_session, None);
+
+        let reopened_again = Ledger::setup(pool.clone())
+            .await
+            .expect("idempotent reopen");
+        assert_eq!(
+            reopened_again
+                .get_turn(&agent_id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .turn_protection_state,
+            "legacy"
+        );
+        let (markers,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM schema_migrations
+             WHERE owner = 'core' AND name BETWEEN '0027_turns_turn_protection_state'
+                                             AND '0030_turns_provider_session'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("markers");
+        assert_eq!(markers, 4);
+    }
+
+    #[tokio::test]
+    async fn enforced_turns_require_an_aware_claim_but_unbounded_and_legacy_remain_compatible() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let capability = ciacola_agent::CeilingCapability {
+            meter: ciacola_agent::MeterId::new("fenced_units_v1"),
+            granularity: ciacola_agent::EnforcementGranularity::Exact,
+            cache_treatment: ciacola_agent::CacheTreatment::Included,
+        };
+        let providers = ciacola_agent::ProviderRegistry::new()
+            .with(Arc::new(CeilingProvider { capability }))
+            .and_then(|registry| {
+                registry.with(Arc::new(AccountingProvider {
+                    key: ciacola_agent::ProviderKey::new("unfenced"),
+                    reports_cost: true,
+                    reports_usage: true,
+                }))
+            })
+            .expect("provider");
+        let ledger = Ledger::setup(pool.clone())
+            .await
+            .expect("ledger")
+            .with_providers(providers.clone());
+        let limits = crate::limits::Limits {
+            providers: [(
+                "fenced".into(),
+                crate::limits::ProviderLimits {
+                    per_turn_ceiling: Some(41),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let enforced_agent = ledger
+            .create_agent(&AgentDef::new("enforced", "s").provider("fenced"), None)
+            .await
+            .expect("enforced agent");
+        let enforced_seq = match ledger
+            .admit_turn(
+                &limits,
+                crate::admission::AdmissionAuthority::Automatic,
+                &enforced_agent,
+                "protected work",
+                "test",
+            )
+            .await
+            .expect("admission")
+        {
+            crate::admission::AdmissionDecision::Admitted { seq, .. } => seq,
+            decision => panic!("unexpected admission: {decision:?}"),
+        };
+
+        // Reproduce the only nontransactional migration boundary that
+        // matters: the trigger has been durably installed, but the marker
+        // column does not exist yet. SQLite permits that trigger definition.
+        // Resolving it during an old claim fails closed on the absent NEW
+        // column, leaving the enforced row queued.
+        sqlx::query("DROP TRIGGER ciacola_turn_enforced_claim_fence")
+            .execute(&pool)
+            .await
+            .expect("remove trigger before dropping column");
+        sqlx::query("DROP TRIGGER ciacola_turn_old_terminal_provenance")
+            .execute(&pool)
+            .await
+            .expect("remove provenance trigger before dropping column");
+        sqlx::query("ALTER TABLE turns DROP COLUMN turn_protection_claim_version")
+            .execute(&pool)
+            .await
+            .expect("remove marker column");
+        sqlx::query(ENFORCED_CLAIM_FENCE_SQL)
+            .execute(&pool)
+            .await
+            .expect("install trigger before column");
+        sqlx::query(OLD_TERMINAL_PROVENANCE_SQL)
+            .execute(&pool)
+            .await
+            .expect("install provenance trigger before column");
+        sqlx::query(
+            "DELETE FROM schema_migrations
+             WHERE owner = 'core' AND name = '0033_turns_protection_claim_version'",
+        )
+        .execute(&pool)
+        .await
+        .expect("remove column marker");
+
+        let partial_old_claim = sqlx::query(
+            "UPDATE turns SET state = 'running', claimed_unix_ms = ?3
+             WHERE agent_id = ?1 AND seq = ?2 AND state = 'queued'",
+        )
+        .bind(&enforced_agent)
+        .bind(enforced_seq)
+        .bind(crate::time::now_unix_ms())
+        .execute(&pool)
+        .await
+        .expect_err("old claim must fail at the partial boundary");
+        assert!(
+            partial_old_claim
+                .to_string()
+                .contains("turn_protection_claim_version"),
+            "{partial_old_claim}"
+        );
+        let (state,): (String,) =
+            sqlx::query_as("SELECT state FROM turns WHERE agent_id = ?1 AND seq = ?2")
+                .bind(&enforced_agent)
+                .bind(enforced_seq)
+                .fetch_one(&pool)
+                .await
+                .expect("partial fenced row");
+        assert_eq!(state, "queued");
+
+        // Reopening completes the column migration exactly once. With the
+        // complete schema, the same old claim reaches the trigger's explicit
+        // diagnostic; the aware claim advances the marker in the transition
+        // itself and succeeds.
+        let ledger = Ledger::setup(pool.clone())
+            .await
+            .expect("resume setup")
+            .with_providers(providers.clone());
+        Ledger::setup(pool.clone()).await.expect("idempotent setup");
+        let (trigger_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'ciacola_turn_enforced_claim_fence'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("trigger count");
+        assert_eq!(trigger_count, 1);
+        let (provenance_trigger_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'ciacola_turn_old_terminal_provenance'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("provenance trigger count");
+        assert_eq!(provenance_trigger_count, 1);
+        let (migration_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM schema_migrations
+             WHERE owner = 'core'
+               AND name IN ('0031_turns_enforced_claim_fence',
+                            '0032_turns_old_terminal_provenance',
+                            '0033_turns_protection_claim_version')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("migration count");
+        assert_eq!(migration_count, 3);
+
+        let old_claim = sqlx::query(
+            "UPDATE turns SET state = 'running', claimed_unix_ms = ?3
+             WHERE agent_id = ?1 AND seq = ?2 AND state = 'queued'",
+        )
+        .bind(&enforced_agent)
+        .bind(enforced_seq)
+        .bind(crate::time::now_unix_ms())
+        .execute(&pool)
+        .await
+        .expect_err("old claim must be fenced");
+        assert!(
+            old_claim
+                .to_string()
+                .contains("per-turn-protection-aware claimant"),
+            "{old_claim}"
+        );
+        let (state, claim_version): (String, i64) = sqlx::query_as(
+            "SELECT state, turn_protection_claim_version FROM turns
+             WHERE agent_id = ?1 AND seq = ?2",
+        )
+        .bind(&enforced_agent)
+        .bind(enforced_seq)
+        .fetch_one(&pool)
+        .await
+        .expect("fenced row");
+        assert_eq!((state.as_str(), claim_version), ("queued", 0));
+
+        assert!(
+            ledger
+                .claim_turn(&enforced_agent, enforced_seq)
+                .await
+                .expect("aware claim")
+        );
+        let (state, claim_version): (String, i64) = sqlx::query_as(
+            "SELECT state, turn_protection_claim_version FROM turns
+             WHERE agent_id = ?1 AND seq = ?2",
+        )
+        .bind(&enforced_agent)
+        .bind(enforced_seq)
+        .fetch_one(&pool)
+        .await
+        .expect("aware row");
+        assert_eq!((state.as_str(), claim_version), ("running", 1));
+        let limited = Exchange {
+            reply: "partial".into(),
+            session: Some("fenced-session".into()),
+            cost: ciacola_agent::Cost::Reported { micro_usd: 7 },
+            usage: ciacola_agent::Usage::Unreported,
+            usage_complete: false,
+            provider_turns: None,
+            elapsed_ms: 9,
+            error: Some("ceiling reached".into()),
+            failure_kind: Some(ciacola_agent::FailureKind::Limit),
+        };
+        assert!(
+            ledger
+                .fail_exchange(
+                    &enforced_agent,
+                    enforced_seq,
+                    "failed",
+                    "ceiling reached",
+                    &limited,
+                )
+                .await
+                .expect("typed terminal")
+        );
+        assert_eq!(
+            ledger
+                .get_turn(&enforced_agent, enforced_seq)
+                .await
+                .unwrap()
+                .unwrap()
+                .failure_kind,
+            "limit",
+            "an aware typed terminal must not be rewritten by the old-writer trigger"
+        );
+
+        // Unbounded is an explicit decision that an old executable cannot
+        // widen, so downgrade compatibility remains intentional.
+        let unbounded_agent = ledger
+            .create_agent(&AgentDef::new("unbounded", "s").provider("fenced"), None)
+            .await
+            .expect("unbounded agent");
+        let unbounded_seq = ledger
+            .enqueue_turn(&unbounded_agent, "unbounded work")
+            .await
+            .expect("unbounded turn");
+        let unbounded_claim = sqlx::query(
+            "UPDATE turns SET state = 'running', claimed_unix_ms = ?3
+             WHERE agent_id = ?1 AND seq = ?2 AND state = 'queued'",
+        )
+        .bind(&unbounded_agent)
+        .bind(unbounded_seq)
+        .bind(crate::time::now_unix_ms())
+        .execute(&pool)
+        .await
+        .expect("old unbounded claim");
+        assert_eq!(unbounded_claim.rows_affected(), 1);
+        sqlx::query(
+            "UPDATE turns SET state = 'ok', reply = 'old success'
+             WHERE agent_id = ?1 AND seq = ?2 AND state = 'running'",
+        )
+        .bind(&unbounded_agent)
+        .bind(unbounded_seq)
+        .execute(&pool)
+        .await
+        .expect("old unbounded success");
+        let (success_kind, success_claim): (String, i64) = sqlx::query_as(
+            "SELECT failure_kind, turn_protection_claim_version FROM turns
+             WHERE agent_id = ?1 AND seq = ?2",
+        )
+        .bind(&unbounded_agent)
+        .bind(unbounded_seq)
+        .fetch_one(&pool)
+        .await
+        .expect("old success provenance");
+        assert_eq!((success_kind.as_str(), success_claim), ("none", 0));
+
+        // An old queued kill never attempted the provider, but the old
+        // executable cannot write the new `not_attempted` kind. `legacy` is
+        // the conservative truth; leaving the admission-time `none` would
+        // incorrectly describe a successful/non-failed terminal.
+        let killed_agent = ledger
+            .create_agent(&AgentDef::new("killed", "s").provider("fenced"), None)
+            .await
+            .expect("killed agent");
+        let killed_seq = ledger
+            .enqueue_turn(&killed_agent, "queued kill")
+            .await
+            .expect("killed turn");
+        sqlx::query(
+            "UPDATE turns SET state = 'killed', error = 'old queued kill'
+             WHERE agent_id = ?1 AND seq = ?2 AND state = 'queued'",
+        )
+        .bind(&killed_agent)
+        .bind(killed_seq)
+        .execute(&pool)
+        .await
+        .expect("old queued kill");
+        assert_eq!(
+            ledger
+                .get_turn(&killed_agent, killed_seq)
+                .await
+                .unwrap()
+                .unwrap()
+                .failure_kind,
+            "legacy"
+        );
+
+        // A supervised unavailable-protection override is also deliberately
+        // runnable by an old executable. Its failure must still lose the
+        // admission-time `none` provenance.
+        let override_agent = ledger
+            .create_agent(&AgentDef::new("override", "s").provider("unfenced"), None)
+            .await
+            .expect("override agent");
+        let override_limits = crate::limits::Limits {
+            providers: [(
+                "unfenced".into(),
+                crate::limits::ProviderLimits {
+                    per_turn_ceiling: Some(17),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let override_seq = match ledger
+            .admit_turn(
+                &override_limits,
+                crate::admission::AdmissionAuthority::Supervised {
+                    reason: "mixed-version test",
+                },
+                &override_agent,
+                "override work",
+                "test",
+            )
+            .await
+            .expect("override admission")
+        {
+            crate::admission::AdmissionDecision::Admitted { seq, .. } => seq,
+            decision => panic!("unexpected override admission: {decision:?}"),
+        };
+        let override_claim = sqlx::query(
+            "UPDATE turns SET state = 'running', claimed_unix_ms = ?3
+             WHERE agent_id = ?1 AND seq = ?2 AND state = 'queued'",
+        )
+        .bind(&override_agent)
+        .bind(override_seq)
+        .bind(crate::time::now_unix_ms())
+        .execute(&pool)
+        .await
+        .expect("old override claim");
+        assert_eq!(override_claim.rows_affected(), 1);
+        sqlx::query(
+            "UPDATE turns SET state = 'failed', error = 'old failure'
+             WHERE agent_id = ?1 AND seq = ?2 AND state = 'running'",
+        )
+        .bind(&override_agent)
+        .bind(override_seq)
+        .execute(&pool)
+        .await
+        .expect("old override failure");
+        let override_row = ledger
+            .get_turn(&override_agent, override_seq)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(override_row.turn_protection_state, "override_unavailable");
+        assert_eq!(override_row.failure_kind, "legacy");
+
+        // A row written by an old executable defaults to legacy and must
+        // remain claimable by that same executable; it never represented an
+        // enforceable promise in the first place.
+        let legacy_agent = ledger
+            .create_agent(&AgentDef::new("legacy", "s").provider("fenced"), None)
+            .await
+            .expect("legacy agent");
+        sqlx::query(
+            "INSERT INTO turns (agent_id, seq, prompt, state, at_unix, provider)
+             VALUES (?1, 1, 'legacy work', 'queued', 1, 'fenced')",
+        )
+        .bind(&legacy_agent)
+        .execute(&pool)
+        .await
+        .expect("legacy turn");
+        let legacy_claim = sqlx::query(
+            "UPDATE turns SET state = 'running', claimed_unix_ms = ?3
+             WHERE agent_id = ?1 AND seq = ?2 AND state = 'queued'",
+        )
+        .bind(&legacy_agent)
+        .bind(1_i64)
+        .bind(crate::time::now_unix_ms())
+        .execute(&pool)
+        .await
+        .expect("old legacy claim");
+        assert_eq!(legacy_claim.rows_affected(), 1);
+        let (legacy_state, legacy_kind, legacy_claim_version): (String, String, i64) =
+            sqlx::query_as(
+                "SELECT state, failure_kind, turn_protection_claim_version FROM turns
+                 WHERE agent_id = ?1 AND seq = 1",
+            )
+            .bind(&legacy_agent)
+            .fetch_one(&pool)
+            .await
+            .expect("legacy compatibility row");
+        assert_eq!(
+            (
+                legacy_state.as_str(),
+                legacy_kind.as_str(),
+                legacy_claim_version,
+            ),
+            ("running", "legacy", 0)
+        );
+    }
+
+    #[tokio::test]
     async fn spend_window_uses_terminal_settlement_and_enqueue_stamps_auditable_provenance() {
         let l = ledger().await;
         let id = l
@@ -2746,6 +3420,7 @@ mod session_tests {
             provider_turns: Some(1),
             elapsed_ms: 172_800_000,
             error: None,
+            failure_kind: None,
         };
         let cutoff = crate::time::now_unix() - 60;
         assert!(l.complete_turn(&id, seq, &outcome).await.expect("settle"));
@@ -2810,6 +3485,7 @@ mod session_tests {
                     provider_turns: None,
                     elapsed_ms: u64::MAX,
                     error: Some("no terminal usage".into()),
+                    failure_kind: Some(ciacola_agent::FailureKind::Reported),
                 },
             )
             .await
@@ -2845,6 +3521,7 @@ mod session_tests {
                     provider_turns: None,
                     elapsed_ms: u64::MAX,
                     error: None,
+                    failure_kind: None,
                 },
             )
             .await

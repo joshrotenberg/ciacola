@@ -22,6 +22,12 @@ pub struct ProviderLimits {
     pub daily_warn_tokens: Option<u64>,
     /// Refuse new submissions at or above this value in 24 hours.
     pub daily_stop_tokens: Option<u64>,
+    /// Provider-native ceiling applied independently to every turn.
+    ///
+    /// The unit and enforcement boundary come from the selected
+    /// provider's declared capability. Unlike the rolling token stop,
+    /// this is passed to the provider and enforced while that turn runs.
+    pub per_turn_ceiling: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -82,6 +88,7 @@ impl Limits {
         for (provider, limits) in &self.providers {
             validate_tokens(provider, "daily_warn_tokens", limits.daily_warn_tokens)?;
             validate_tokens(provider, "daily_stop_tokens", limits.daily_stop_tokens)?;
+            validate_ceiling(provider, limits.per_turn_ceiling)?;
             if let (Some(warn), Some(stop)) = (limits.daily_warn_tokens, limits.daily_stop_tokens)
                 && warn > stop
             {
@@ -130,16 +137,22 @@ impl Limits {
         } else {
             self.providers
                 .iter()
-                .map(
-                    |(provider, limit)| match (limit.daily_warn_tokens, limit.daily_stop_tokens) {
+                .map(|(provider, limit)| {
+                    let rolling = match (limit.daily_warn_tokens, limit.daily_stop_tokens) {
                         (Some(warn), Some(stop)) => {
                             format!("{provider} warn {warn} tokens/day, stop {stop}")
                         }
                         (Some(warn), None) => format!("{provider} warn {warn} tokens/day"),
                         (None, Some(stop)) => format!("{provider} stop {stop} tokens/day"),
                         (None, None) => format!("{provider} token limits disabled"),
-                    },
-                )
+                    };
+                    match limit.per_turn_ceiling {
+                        Some(ceiling) => {
+                            format!("{rolling}, per-turn ceiling {ceiling} provider units")
+                        }
+                        None => format!("{rolling}, per-turn unbounded"),
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("; ")
         };
@@ -174,6 +187,19 @@ fn validate_tokens(provider: &str, name: &str, value: Option<u64>) -> Result<(),
     {
         return Err(format!(
             "limits.providers.{provider}: {name} must be between 1 and {} tokens",
+            i64::MAX
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_ceiling(provider: &str, value: Option<u64>) -> Result<(), FlatError> {
+    if let Some(value) = value
+        && (value == 0 || value > i64::MAX as u64)
+    {
+        return Err(format!(
+            "limits.providers.{provider}: per_turn_ceiling must be between 1 and {} provider-native units",
             i64::MAX
         )
         .into());
@@ -287,9 +313,27 @@ pub struct ProviderAdmissionStatus {
     pub accounting: ProviderAccounting,
     pub daily_warn_tokens: Option<u64>,
     pub daily_stop_tokens: Option<u64>,
+    /// Configured provider-native ceiling for each newly admitted turn.
+    pub per_turn_ceiling: Option<u64>,
+    /// Whether that separate, per-turn protection can be applied by the
+    /// currently registered adapter. This does not describe the rolling
+    /// daily stop in `state`.
+    pub turn_protection: TurnProtectionStatus,
+    /// Exact provider semantics used by an enforced ceiling. Persisting
+    /// this snapshot on the turn prevents a restart from silently changing
+    /// the meter or enforcement boundary.
+    pub turn_ceiling_capability: Option<ciacola_agent::CeilingCapability>,
     pub state: AdmissionState,
     pub automatic_allowed: bool,
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnProtectionStatus {
+    Enforced,
+    Unbounded,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -367,8 +411,20 @@ impl Limits {
                     accounting: provider,
                     daily_warn_tokens: limits.daily_warn_tokens,
                     daily_stop_tokens: limits.daily_stop_tokens,
+                    per_turn_ceiling: limits.per_turn_ceiling,
+                    turn_protection: if limits.per_turn_ceiling.is_some() {
+                        TurnProtectionStatus::Unavailable
+                    } else {
+                        TurnProtectionStatus::Unbounded
+                    },
+                    turn_ceiling_capability: None,
                     state,
-                    automatic_allowed: state.automatic_allowed(),
+                    // Capability resolution happens in Ledger, which owns
+                    // the live provider registry. Until then a configured
+                    // ceiling is conservatively unavailable rather than a
+                    // contradictory "unavailable but automatic" report.
+                    automatic_allowed: state.automatic_allowed()
+                        && limits.per_turn_ceiling.is_none(),
                     detail,
                 }
             })
@@ -420,6 +476,196 @@ pub struct AdmissionOverride {
     pub daily_stop_tokens: Option<u64>,
     pub cost_gaps: u64,
     pub usage_gaps: u64,
+}
+
+/// Durable result of resolving the configured per-turn ceiling at the
+/// admission boundary.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnProtectionState {
+    Enforced,
+    Unbounded,
+    OverrideUnavailable,
+    Legacy,
+}
+
+impl TurnProtectionState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforced => "enforced",
+            Self::Unbounded => "unbounded",
+            Self::OverrideUnavailable => "override_unavailable",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
+/// Separate audit for proceeding when a configured per-turn protection is
+/// unavailable. It deliberately does not share the rolling admission
+/// override column: both conditions may need acknowledgement on one turn.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TurnProtectionOverride {
+    pub reason: String,
+    pub source: String,
+    pub checked_unix: i64,
+}
+
+/// Versioned, canonical policy snapshot stamped before a turn is queued.
+///
+/// `capability` is the exact semantic contract (meter, enforcement boundary,
+/// and cache treatment), not merely a claim that a provider has some limit.
+/// Execution compares it byte-for-value with the live adapter before launch.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TurnProtectionSnapshot {
+    pub version: u8,
+    pub provider: String,
+    pub state: TurnProtectionState,
+    pub configured_limit: Option<u64>,
+    pub capability: Option<ciacola_agent::CeilingCapability>,
+    pub unavailable_override: Option<TurnProtectionOverride>,
+}
+
+impl TurnProtectionSnapshot {
+    pub const VERSION: u8 = 1;
+
+    pub fn unbounded(provider: impl Into<String>) -> Self {
+        Self {
+            version: Self::VERSION,
+            provider: provider.into(),
+            state: TurnProtectionState::Unbounded,
+            configured_limit: None,
+            capability: None,
+            unavailable_override: None,
+        }
+    }
+
+    pub fn enforced(
+        provider: impl Into<String>,
+        limit: u64,
+        capability: ciacola_agent::CeilingCapability,
+    ) -> Self {
+        Self {
+            version: Self::VERSION,
+            provider: provider.into(),
+            state: TurnProtectionState::Enforced,
+            configured_limit: Some(limit),
+            capability: Some(capability),
+            unavailable_override: None,
+        }
+    }
+
+    pub fn override_unavailable(
+        provider: impl Into<String>,
+        limit: u64,
+        audit: TurnProtectionOverride,
+    ) -> Self {
+        Self {
+            version: Self::VERSION,
+            provider: provider.into(),
+            state: TurnProtectionState::OverrideUnavailable,
+            configured_limit: Some(limit),
+            capability: None,
+            unavailable_override: Some(audit),
+        }
+    }
+
+    /// Validate persisted provenance before provider launch and reconstruct
+    /// only a ceiling whose complete invariant is intact.
+    pub fn validate_for_execution(
+        &self,
+        persisted_state: &str,
+        persisted_provider: &str,
+        live_capability: Option<&ciacola_agent::CeilingCapability>,
+    ) -> Result<Option<ciacola_agent::TurnCeiling>, String> {
+        let resend = "resend the turn so current policy can be admitted and persisted";
+        if self.version != Self::VERSION {
+            return Err(format!(
+                "unsupported turn-protection snapshot version {}; {resend}",
+                self.version
+            ));
+        }
+        if self.provider != persisted_provider {
+            return Err(format!(
+                "turn-protection provider '{}' does not match persisted provider '{}'; {resend}",
+                self.provider, persisted_provider
+            ));
+        }
+        if self.state.as_str() != persisted_state {
+            return Err(format!(
+                "turn-protection state '{}' does not match persisted state '{persisted_state}'; {resend}",
+                self.state.as_str()
+            ));
+        }
+        match self.state {
+            TurnProtectionState::Enforced => {
+                let limit = self.configured_limit.ok_or_else(|| {
+                    format!("enforced turn protection has no persisted limit; {resend}")
+                })?;
+                if limit == 0 || limit > i64::MAX as u64 {
+                    return Err(format!(
+                        "enforced turn protection has invalid persisted limit {limit}; {resend}"
+                    ));
+                }
+                let capability = self.capability.clone().ok_or_else(|| {
+                    format!("enforced turn protection has no capability snapshot; {resend}")
+                })?;
+                if self.unavailable_override.is_some() {
+                    return Err(format!(
+                        "enforced turn protection unexpectedly contains an unavailable override; {resend}"
+                    ));
+                }
+                if live_capability != Some(&capability) {
+                    return Err(format!(
+                        "provider turn-ceiling capability changed since admission; {resend}"
+                    ));
+                }
+                Ok(Some(ciacola_agent::TurnCeiling { capability, limit }))
+            }
+            TurnProtectionState::Unbounded => {
+                if self.configured_limit.is_some()
+                    || self.capability.is_some()
+                    || self.unavailable_override.is_some()
+                {
+                    return Err(format!(
+                        "unbounded turn protection contains ceiling or override data; {resend}"
+                    ));
+                }
+                Ok(None)
+            }
+            TurnProtectionState::OverrideUnavailable => {
+                let limit = self.configured_limit.ok_or_else(|| {
+                    format!("unavailable-protection override has no persisted limit; {resend}")
+                })?;
+                if limit == 0 || limit > i64::MAX as u64 {
+                    return Err(format!(
+                        "unavailable-protection override has invalid persisted limit {limit}; {resend}"
+                    ));
+                }
+                if self.capability.is_some() {
+                    return Err(format!(
+                        "unavailable-protection override unexpectedly contains a capability; {resend}"
+                    ));
+                }
+                let audit = self.unavailable_override.as_ref().ok_or_else(|| {
+                    format!("unavailable-protection override has no audit; {resend}")
+                })?;
+                if audit.reason.trim().is_empty() || audit.source.trim().is_empty() {
+                    return Err(format!(
+                        "unavailable-protection override has an empty audit field; {resend}"
+                    ));
+                }
+                if live_capability.is_some() {
+                    return Err(format!(
+                        "provider turn-ceiling capability changed since the unavailable override; {resend}"
+                    ));
+                }
+                Ok(None)
+            }
+            TurnProtectionState::Legacy => Err(format!(
+                "legacy turn has no enforceable per-turn protection provenance; {resend}"
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -503,6 +749,32 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_configured_protection_is_conservatively_non_automatic() {
+        let provider = ProviderAccounting {
+            provider: "codex".into(),
+            reports_token_usage: true,
+            ..Default::default()
+        };
+        let limits = Limits {
+            providers: [(
+                "codex".into(),
+                ProviderLimits {
+                    daily_stop_tokens: Some(1_000),
+                    per_turn_ceiling: Some(100),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+
+        let status = &limits.evaluate(&accounting(provider)).providers[0];
+        assert_eq!(status.state, AdmissionState::Ok);
+        assert_eq!(status.turn_protection, TurnProtectionStatus::Unavailable);
+        assert!(!status.automatic_allowed);
+    }
+
+    #[test]
     fn exact_token_boundary_stops_and_missing_usage_fails_closed() {
         let limits = Limits {
             providers: [(
@@ -510,6 +782,7 @@ mod tests {
                 ProviderLimits {
                     daily_warn_tokens: Some(75),
                     daily_stop_tokens: Some(100),
+                    ..Default::default()
                 },
             )]
             .into(),

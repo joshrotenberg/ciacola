@@ -191,6 +191,7 @@ pub enum Submission {
     Submitted {
         seq: i64,
         admission_override: Option<crate::limits::AdmissionOverride>,
+        turn_protection_override: Option<crate::limits::TurnProtectionOverride>,
     },
     Busy {
         reason: String,
@@ -216,6 +217,12 @@ pub enum Submission {
     },
     /// An unpriced provider has no token stop for automatic work.
     Unguarded {
+        provider: String,
+        reason: String,
+    },
+    /// A per-turn ceiling is configured but the selected adapter cannot
+    /// enforce it. Automatic work fails closed before a row is queued.
+    ProtectionUnavailable {
         provider: String,
         reason: String,
     },
@@ -373,8 +380,10 @@ async fn submit_with_authority(
             status,
             global,
             admission_override,
+            turn_protection_override,
             ..
         }) => {
+            let admission_override = admission_override.map(|audit| *audit);
             let spent = global.reported_spend_micro_usd;
             if let Some(warn) = global.daily_warn_micro_usd.filter(|warn| spent >= *warn) {
                 let stop_detail = global
@@ -430,6 +439,24 @@ async fn submit_with_authority(
                     "supervised admission override"
                 );
             }
+            if let Some(audit) = &turn_protection_override {
+                notify.turn(
+                    LogLevel::Warning,
+                    agent_id,
+                    seq,
+                    "turn_protection_override",
+                    &format!(
+                        "{source}: supervised unavailable per-turn protection override: {}",
+                        audit.reason
+                    ),
+                );
+                tracing::warn!(
+                    agent = %agent_id,
+                    seq,
+                    reason = %audit.reason,
+                    "supervised unavailable per-turn protection override"
+                );
+            }
             exec.submit(agent_id.to_string(), seq);
             tracing::Span::current().record("outcome", "submitted");
             tracing::info!(agent = %agent_id, seq, source, "turn submitted");
@@ -437,6 +464,7 @@ async fn submit_with_authority(
             Submission::Submitted {
                 seq,
                 admission_override,
+                turn_protection_override,
             }
         }
         Ok(AdmissionDecision::Busy { reason }) => {
@@ -511,6 +539,19 @@ async fn submit_with_authority(
                 &format!("{source}: {provider}: {detail}"),
             );
             Submission::Unguarded {
+                provider,
+                reason: detail,
+            }
+        }
+        Ok(AdmissionDecision::ProtectionUnavailable { provider, detail }) => {
+            notify.turn(
+                LogLevel::Error,
+                agent_id,
+                0,
+                "turn_protection_unavailable",
+                &format!("{source}: {provider}: {detail}"),
+            );
+            Submission::ProtectionUnavailable {
                 provider,
                 reason: detail,
             }

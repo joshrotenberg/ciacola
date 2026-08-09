@@ -452,6 +452,7 @@ mod tests {
                 provider_turns: Some(1),
                 elapsed_ms: elapsed_ms as u64,
                 error: None,
+                failure_kind: None,
             },
         )
         .await

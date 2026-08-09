@@ -59,9 +59,11 @@
 //! cannot keep its credentials in a directory of our choosing, or
 //! cannot confine filesystem writes and network reach the way a
 //! [`Sandbox`] asks, must say so and fail. A provider that cannot count
-//! its own internal turns may warn and carry on. The difference is
-//! [`Severity`], and the line is drawn at security: see
-//! [`Constraint::security`].
+//! its own internal turns may warn and carry on. A provider-work ceiling is
+//! the other blocking boundary: it is not security, but silently dropping it
+//! would exceed the spend authorization for the turn. The difference is
+//! executable in [`Constraint::severity`]; [`Constraint::security`] remains
+//! the narrower authority classification.
 //!
 //! # Why the futures are boxed
 //!
@@ -84,10 +86,15 @@ pub mod intent;
 pub mod outcome;
 pub mod provider;
 
-pub use capability::{Capabilities, Constraint, Severity, Unsupported, Validation};
+pub use capability::{
+    CacheTreatment, Capabilities, CeilingCapability, Constraint, EnforcementGranularity, MeterId,
+    Severity, Unsupported, Validation,
+};
 pub use error::{AgentError, PartialTelemetry};
 pub use events::{NoEvents, TurnEvents};
-pub use intent::{Effort, Isolation, McpEndpoint, McpScope, ResumeId, Sandbox, TurnIntent};
+pub use intent::{
+    Effort, Isolation, McpEndpoint, McpScope, ResumeId, Sandbox, TurnCeiling, TurnIntent,
+};
 pub use outcome::{Cost, FailureKind, TokenUsage, TurnFailure, TurnOutcome, Usage};
 pub use provider::{DuplicateProvider, Provider, ProviderKey, ProviderRegistry};
 

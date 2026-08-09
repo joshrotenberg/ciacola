@@ -8,7 +8,8 @@ use ciacola_agent::{
 #[cfg(test)]
 use codex_wrapper::CodexCommand;
 use codex_wrapper::{
-    ApprovalPolicy, ExecCommand, ExecResumeCommand, McpConfigBuilder, McpServerConfig, SandboxMode,
+    ApprovalPolicy, ExecCommand, ExecResumeCommand, McpConfigBuilder, McpServerConfig,
+    RolloutBudgetConfig, SandboxMode,
 };
 
 /// An opening turn or a resumed turn, with the child-only environment
@@ -48,6 +49,19 @@ pub(crate) fn build(intent: &TurnIntent) -> Result<PreparedTurn, AgentError> {
     }
 
     let mut config = Vec::new();
+    let rollout_budget = intent
+        .turn_ceiling
+        .as_ref()
+        .map(|ceiling| {
+            RolloutBudgetConfig::builder(ceiling.limit)
+                .build()
+                .map_err(|error| AgentError::Unsupported {
+                    provider: provider.clone(),
+                    constraint: ciacola_agent::Constraint::TurnCeiling,
+                    detail: error.to_string(),
+                })
+        })
+        .transpose()?;
     if let Some(instructions) = &intent.instructions {
         config.push(format!(
             "developer_instructions={}",
@@ -110,6 +124,9 @@ pub(crate) fn build(intent: &TurnIntent) -> Result<PreparedTurn, AgentError> {
             for value in config {
                 command = command.config(value);
             }
+            if let Some(budget) = rollout_budget {
+                command = command.rollout_budget(budget);
+            }
             PreparedCommand::Resume(command)
         }
         _ => {
@@ -128,6 +145,9 @@ pub(crate) fn build(intent: &TurnIntent) -> Result<PreparedTurn, AgentError> {
             command = apply_exec_sandbox(command, intent.sandbox);
             for value in config {
                 command = command.config(value);
+            }
+            if let Some(budget) = rollout_budget {
+                command = command.rollout_budget(budget);
             }
             PreparedCommand::Exec(command)
         }
@@ -186,13 +206,28 @@ fn mcp_config(scope: &McpScope, env: &mut BTreeMap<String, String>) -> McpConfig
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ciacola_agent::{McpEndpoint, Sandbox};
+    use ciacola_agent::{
+        CacheTreatment, CeilingCapability, EnforcementGranularity, McpEndpoint, MeterId, Sandbox,
+        TurnCeiling,
+    };
 
     fn config_values(args: &[String]) -> Vec<&str> {
         args.windows(2)
             .filter(|pair| pair[0] == "-c")
             .map(|pair| pair[1].as_str())
             .collect()
+    }
+
+    fn with_ceiling(mut intent: TurnIntent, limit: u64) -> TurnIntent {
+        intent.turn_ceiling = Some(TurnCeiling {
+            capability: CeilingCapability {
+                meter: MeterId::new(crate::WEIGHTED_ROLLOUT_METER),
+                granularity: EnforcementGranularity::ProviderResponseBoundary,
+                cache_treatment: CacheTreatment::Excluded,
+            },
+            limit,
+        });
+        intent
     }
 
     #[test]
@@ -259,6 +294,51 @@ mod tests {
                 .iter()
                 .any(|value| value.starts_with("developer_instructions="))
         );
+    }
+
+    #[test]
+    fn a_native_ceiling_is_identical_on_open_and_resume() {
+        let open = with_ceiling(TurnIntent::new("open"), 12_345);
+        let mut resume = with_ceiling(TurnIntent::new("resume"), 12_345);
+        resume.resume = Some(ResumeId::ProviderAssigned("thread-1".into()));
+
+        for args in [
+            build(&open).expect("open command").command.args(),
+            build(&resume).expect("resume command").command.args(),
+        ] {
+            let values = config_values(&args);
+            let budgets = values
+                .iter()
+                .filter(|value| value.starts_with("features.rollout_budget={"))
+                .copied()
+                .collect::<Vec<_>>();
+            assert_eq!(budgets.len(), 1, "{args:?}");
+            assert!(budgets[0].contains("enabled=true"), "{}", budgets[0]);
+            assert!(budgets[0].contains("limit_tokens=12345"), "{}", budgets[0]);
+            assert!(
+                budgets[0].contains("sampling_token_weight=1"),
+                "{}",
+                budgets[0]
+            );
+            assert!(
+                budgets[0].contains("prefill_token_weight=1"),
+                "{}",
+                budgets[0]
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_native_ceiling_fails_before_command_construction() {
+        let intent = with_ceiling(TurnIntent::new("go"), 0);
+        let error = build(&intent).expect_err("zero is not a Codex budget");
+        assert!(matches!(
+            error,
+            AgentError::Unsupported {
+                constraint: ciacola_agent::Constraint::TurnCeiling,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -35,8 +35,9 @@ CIACOLA_DB="$HOME/.local/share/ciacola/ciacola.db" cargo run -p ciacola
 
 The default database is durable under `$XDG_DATA_HOME/ciacola`, or
 `$HOME/.local/share/ciacola` when XDG is unset. `CIACOLA_DB` selects an
-explicit location. Before adding a scheduled agent, configure an observable
-admission stop in `ciacola.toml`; an admitted turn can still overshoot it.
+explicit location. Before adding a scheduled agent, configure both an
+observable rolling admission stop and the provider's enforceable per-turn
+ceiling in `ciacola.toml`.
 
 | variable | meaning |
 |---|---|
@@ -61,6 +62,59 @@ Four surfaces, one process:
 
 `ciacola.example.toml` is annotated and is the fastest way to see what
 is configurable.
+
+## Two limit planes
+
+The rolling 24-hour stop and the per-turn ceiling are intentionally different
+contracts.
+
+The rolling USD/provider-token stop is an admission breaker. It observes
+settled ledger telemetry and decides whether another turn may be queued. It is
+not a reservation: an admitted turn can finish beyond it, and concurrent turns
+can multiply the overshoot. A known reached stop is final; even the supervised
+submission path cannot cross it.
+
+`[limits.providers.<provider>].per_turn_ceiling` is passed to the provider for
+one execution. Admission copies the effective value plus the provider's meter,
+cache treatment, and enforcement granularity onto the queued turn. Execution
+uses that snapshot instead of rereading config, so restart, recovery, and a
+later config change cannot silently widen it. Opening and resumed conversations
+take the same ceiling.
+
+The unit is deliberately provider-native. Claude declares integer micro-USD.
+Supported Codex versions declare a versioned rollout meter: 0.145-0.146 use
+weighted non-cached input plus output; 0.147 prefers provider-supplied rollout
+units and falls back to that weighted calculation. Both providers observe the
+counter at response boundaries, so work already in flight may cross the value
+before the provider stops. Codex root and subagent responses may be concurrent
+and multiply that soft-boundary overshoot; it is not bounded to exactly one
+response. This is enforceable work protection, not a claim of exact
+portable-token parity.
+
+No configured ceiling is explicit `UNBOUNDED` behavior and preserves the
+backward-compatible automatic path. A configured ceiling that the detected
+runtime cannot honor is `UNSUPPORTED`: automatic submission fails before
+provider side effects. `send_supervised` may run it only with a durable human
+reason, recorded as `OVERRIDDEN`. Every terminal limit result remains a failed
+turn with `failure_kind = limit`, its per-turn session, elapsed time, cost, and
+whatever usage the provider actually exposed.
+
+Codex's current budget-exhaustion `turn.failed` event omits usage
+([openai/codex#37676](https://github.com/openai/codex/issues/37676)). Ciacola
+therefore stores usage as unreported, or keeps an earlier partial snapshot,
+rather than manufacturing an exact terminal count. The board keeps rolling
+admission, live protection support, the durable turn snapshot, and measured
+usage visibly separate.
+
+A paid 0.145.0 proof used a one-unit ceiling on both an opening turn and its
+resume. Each execution emitted its requested one-word reply and then ended as
+`failed` / `failure_kind = limit` with `shared rollout token budget exhausted`.
+The opening settled in 3.061 seconds and the resume in 2.490 seconds; both kept
+the same provider session and the same persisted
+`weighted_non_cached_input_plus_output.v1` response-boundary snapshot. This
+demonstrates the expected boundary overshoot—one complete short response was
+already available when enforcement stopped further work—but no numeric
+overshoot is claimed because 0.145.0 omitted terminal usage on both turns.
 
 ## Layout, and where the line falls
 
@@ -178,11 +232,13 @@ the same registry as Claude. It preserves Codex thread ids as soon as the
 JSONL stream announces them, resumes through the provider's separate command,
 records real tokens as unpriced, applies strict scoped MCP with env-backed
 identity headers, and treats sandbox plus native execution policy as Codex's
-authority surface. Scripted tests cover the contract; the next proof is a
-small supervised repository task. Configure its provider token breaker before
-scheduling one unattended. A supervised real run has since produced and
-validated `claude-wrapper` PR #780; broader repository coverage is still the
-useful next proof.
+authority surface. Scripted tests cover the contract. Configure both its
+rolling provider token breaker and native per-turn ceiling before scheduling
+it unattended; startup advertises protection only for wrapper-tested CLI
+versions. A paid one-unit 0.145.0 proof now covers both opening and resume and
+records the response-boundary result above. The useful next proof is broader
+repository coverage and provider versions. A supervised real run has since
+produced and validated `claude-wrapper` PR #780.
 
 **Session mining, later.** Provider-specific `claude_home` and `codex_home` make
 the server's transcripts a separate, attributable corpus, which is what makes

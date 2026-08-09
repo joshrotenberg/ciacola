@@ -49,6 +49,16 @@ pub(crate) fn build(
     if let Some(max_turns) = intent.max_provider_turns {
         command = command.max_turns(max_turns);
     }
+    if let Some(ceiling) = &intent.turn_ceiling {
+        if ceiling.limit == 0 {
+            return Err(AgentError::Unsupported {
+                provider: ciacola_agent::ProviderKey::claude(),
+                constraint: ciacola_agent::Constraint::TurnCeiling,
+                detail: "Claude's per-turn micro-USD ceiling must be positive".into(),
+            });
+        }
+        command = command.max_budget_usd(ceiling.limit as f64 / 1_000_000.0);
+    }
     if let Some(scope) = &intent.mcp {
         // Endpoints (and their per-agent secret headers) become a JSON
         // file on disk, the shape the CLI's own --mcp-config already
@@ -140,6 +150,14 @@ mod tests {
         TurnIntent::new(prompt)
     }
 
+    fn with_ceiling(mut intent: TurnIntent, limit: u64) -> TurnIntent {
+        intent.turn_ceiling = Some(ciacola_agent::TurnCeiling {
+            capability: crate::turn_ceiling_capability(),
+            limit,
+        });
+        intent
+    }
+
     #[test]
     fn a_fresh_turn_with_no_resume_sends_instructions_and_no_session_flag() {
         let mut i = intent("hello");
@@ -193,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn model_effort_tools_and_turn_ceiling_render_as_flags() {
+    fn model_effort_tools_and_internal_turn_ceiling_render_as_flags() {
         let mut i = intent("go");
         i.model = Some("opus".into());
         i.effort = Some(ContractEffort::High);
@@ -211,6 +229,37 @@ mod tests {
         assert_eq!(args[pos + 1], "Read,Edit");
         let pos = args.iter().position(|a| a == "--max-turns").unwrap();
         assert_eq!(args[pos + 1], "12");
+    }
+
+    #[test]
+    fn a_micro_usd_ceiling_is_identical_on_open_and_resume() {
+        let open = with_ceiling(intent("open"), 12_345);
+        let mut resume = with_ceiling(intent("resume"), 12_345);
+        resume.resume = Some(ResumeId::ProviderAssigned("session-1".into()));
+
+        for turn in [open, resume] {
+            let mut guard = None;
+            let args = build(&turn, &mut guard).expect("builds").args();
+            let position = args
+                .iter()
+                .position(|arg| arg == "--max-budget-usd")
+                .expect("native budget flag");
+            assert_eq!(args[position + 1], "0.012345", "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_zero_micro_usd_ceiling_is_rejected_before_launch() {
+        let turn = with_ceiling(intent("go"), 0);
+        let mut guard = None;
+        let error = build(&turn, &mut guard).expect_err("zero cannot authorize work");
+        assert!(matches!(
+            error,
+            AgentError::Unsupported {
+                constraint: ciacola_agent::Constraint::TurnCeiling,
+                ..
+            }
+        ));
     }
 
     /// The legacy path used an empty vector for both "inherit" and
