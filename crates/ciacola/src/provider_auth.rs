@@ -199,7 +199,7 @@ mod tests {
     #[cfg(unix)]
     use std::io::{Seek, Write};
     #[cfg(unix)]
-    use std::os::fd::{AsRawFd, IntoRawFd};
+    use std::os::fd::IntoRawFd;
 
     #[test]
     fn descriptor_metadata_is_validated_as_one_authority_set() {
@@ -257,17 +257,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_closed_descriptor_is_refused_without_assuming_file_ownership() {
-        let file = tempfile::tempfile().expect("temporary credential source");
-        let descriptor = file.as_raw_fd();
-        drop(file);
-
+    fn an_unopen_descriptor_is_refused_without_racing_fd_reuse() {
+        // A recently closed descriptor can be reused immediately by another
+        // parallel test. Passing that stale number here would let the reader
+        // duplicate and close an unrelated test's live descriptor. INT_MAX is
+        // outside the process descriptor table on supported Unix platforms,
+        // so fcntl deterministically reports EBADF without owning anything.
+        let descriptor = i32::MAX;
         let error = read_token_descriptor(
             OsString::from(descriptor.to_string()),
             CODEX_TOKEN_FD_ENV,
             "Codex",
         )
-        .expect_err("closed descriptor");
+        .expect_err("unopen descriptor");
         assert!(
             error
                 .to_string()
