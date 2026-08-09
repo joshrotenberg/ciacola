@@ -37,7 +37,7 @@ ciacola-core = { path = "crates/ciacola-core" }
 # work. See CONTRIBUTING.md.
 tower-mcp = { git = "https://github.com/joshrotenberg/tower-mcp", rev = "9c8b53973e650a140fe4c180e6c3fad4a6e65b9b", features = ["http"] }
 claude-wrapper = { git = "https://github.com/joshrotenberg/claude-wrapper", rev = "22484531ecbec0789c16ee10f8abaa95d5501596" }
-codex-wrapper = { git = "https://github.com/joshrotenberg/codex-wrapper", rev = "a63a0d383af82d4cb72879a48293869548248715" }
+codex-wrapper = { git = "https://github.com/joshrotenberg/codex-wrapper", rev = "f250f0efcaaf4c3f93ad82ebabc534a853dde68b" }
 git-spawn = { git = "https://github.com/joshrotenberg/git-spawn", rev = "ea2826b9da416cc9396ce79f2af7f9770cd50ac1" }
 
 axum = "0.8"
