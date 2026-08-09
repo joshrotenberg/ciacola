@@ -128,6 +128,10 @@ max_spawn_depth = 3
 [plugins.repo-worker]
 root = "~/.local/share/ciacola/repos"
 repos = ["joshrotenberg/mdbook-lint"]
+# Optional per-repository templates select a policy-compatible branch while
+# retaining the collision-resistant assignment slug. Unlisted repositories use
+# the compatible default `agent/{slug}`; `{slug}` is the only placeholder.
+# branch_templates = { "joshrotenberg/mdbook-lint" = "fix/{slug}" }
 
 # [plugins.webhook]
 # hooks = [{ path = "issue", agent = "tower-mcp-manager" }]
