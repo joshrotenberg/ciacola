@@ -162,7 +162,7 @@ pub async fn apply_migrations(
 /// server remembering to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
-    /// stdio: the person running the server.
+    /// Stdio or root-bearer HTTP: a human operating the server.
     Operator,
     /// Loopback HTTP: the agents themselves.
     Agent,

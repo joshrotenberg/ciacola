@@ -280,8 +280,10 @@ struct StartIssueArgs {
     issue: u64,
     /// Branch to cut from. Defaults to the repository's default branch.
     base: Option<String>,
-    /// Your agent_id, if an agent is starting this.
-    spawned_by: Option<String>,
+    /// Deprecated compatibility field. Parentage is derived from the
+    /// authenticated request context and this value is ignored.
+    #[serde(rename = "spawned_by")]
+    _spawned_by: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -559,7 +561,6 @@ to do, on purpose."
     }
 
     fn tools(&self, surface: Surface) -> Vec<Tool> {
-        let operator_surface = surface == Surface::Operator;
         let (Some(repos), Some(ctx)) = (self.repos.clone(), self.ctx.clone()) else {
             return Vec::new();
         };
@@ -581,17 +582,6 @@ to do, on purpose."
                     move |State((repos, ctx, roles)): State<(Repos, PluginContext, Roles)>,
                           mcp: Context,
                           Json(args): Json<StartIssueArgs>| async move {
-                        // Same policy as spawn: an authenticated caller
-                        // is the parent whatever it claims; only the
-                        // operator's terminal is taken at its word.
-                        let caller = mcp
-                            .extension::<ciacola_core::AgentIdentity>()
-                            .map(|i| i.0.clone());
-                        let spawned_by = match (&caller, operator_surface) {
-                            (Some(id), _) => Some(id.clone()),
-                            (None, true) => args.spawned_by.clone(),
-                            (None, false) => None,
-                        };
                         if !repos.allows(&args.repo) {
                             return Ok(CallToolResult::error(format!(
                                 "repository '{}' is not in the configured list",
@@ -601,34 +591,24 @@ to do, on purpose."
                         let Some(role) = roles.get(ROLE).cloned() else {
                             return Ok(CallToolResult::error("role missing".to_string()));
                         };
-                        if role.surface.as_deref() == Some("operator") {
-                            return Ok(CallToolResult::error(format!(
-                                "role '{}' carries the operator surface, which provider-backed agents cannot hold; use stdio or authenticated human HTTP",
-                                role.name
-                            )));
-                        }
-                        if role.inherit_provider_tools && (caller.is_some() || !operator_surface) {
-                            return Ok(CallToolResult::error(format!(
-                                "role '{}' inherits its provider's native tool policy, which an agent cannot bound; ask the operator to start the issue",
-                                role.name
-                            )));
-                        }
-                        let grant = match ciacola_core::grant_child_tools(
+                        // Authority is settled before the default-branch GitHub
+                        // query, clone, worktree, agent, or assignment can
+                        // mutate anything. `spawn_role` calls this same typed
+                        // convergence point.
+                        let authorization = match ciacola_core::preflight_role_spawn(
                             &ctx.ledger,
-                            caller.as_deref(),
-                            role.allowed_tools.clone(),
+                            &role,
+                            &mcp,
+                            surface,
+                            ctx.limits.max_spawn_depth,
                         )
                         .await
                         {
-                            Ok(grant) => grant,
-                            Err(e) => return Ok(CallToolResult::error(e.to_string())),
+                            Ok(authorization) => authorization,
+                            Err(refusal) => {
+                                return Ok(CallToolResult::error(refusal.to_string()));
+                            }
                         };
-                        if !grant.denied.is_empty() {
-                            return Ok(CallToolResult::error(format!(
-                                "issue-implementer needs tools its parent does not hold: {}",
-                                grant.denied.join(", ")
-                            )));
-                        }
                         let slug = format!("{}-{}", args.repo.replace('/', "-"), args.issue);
                         let base = match &args.base {
                             Some(base) => base.clone(),
@@ -660,7 +640,11 @@ to do, on purpose."
                         let mut def = roles.to_def(&role, &args_map);
                         def.name = format!("impl-{slug}");
 
-                        match ctx.ledger.create_agent(&def, spawned_by.as_deref()).await {
+                        match ctx
+                            .ledger
+                            .create_agent(&def, authorization.spawned_by.as_deref())
+                            .await
+                        {
                             Ok(agent_id) => {
                                 let assignment = Assignment {
                                     repo: args.repo.clone(),
@@ -1610,6 +1594,136 @@ mod tests {
         assert_eq!(ledger.list_agents().await.expect("list").len(), 1);
     }
 
+    /// The shared role preflight must derive the real parent before applying
+    /// depth. Claiming a shallower parent cannot make either creation path
+    /// pass, and start_issue must refuse before repository or assignment
+    /// state exists.
+    #[tokio::test]
+    async fn start_issue_and_spawn_role_share_depth_and_trusted_parentage() {
+        let root_path = std::env::temp_dir().join(format!("ciacola-depth-{}", ulid::Ulid::new()));
+        let repos = Repos {
+            root: root_path.clone(),
+            allowed: Arc::new(vec!["local/repo".into()]),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let (mut plugin, ledger) = memory_plugin(repos).await;
+        let ctx = plugin.ctx.as_mut().expect("context");
+        ctx.limits.max_spawn_depth = 1;
+        let roles = ctx.roles.clone();
+        let pool = ctx.pool.clone();
+        let implementer = roles.get(ROLE).expect("implementer");
+
+        let root = ledger
+            .create_agent(&ciacola_core::AgentDef::new("root", "s"), None)
+            .await
+            .expect("root");
+        let parent = ledger
+            .create_agent(
+                &ciacola_core::AgentDef::new("manager", "s")
+                    .allowed_tools(implementer.allowed_tools.clone()),
+                Some(&root),
+            )
+            .await
+            .expect("parent");
+
+        let mut extensions = Extensions::new();
+        extensions.insert(ciacola_core::AgentIdentity(parent.clone()));
+        let request = RequestContext::new(RequestId::Number(72))
+            .with_extensions(Arc::new(extensions.clone()));
+        let start = plugin
+            .tools(Surface::Agent)
+            .into_iter()
+            .find(|tool| tool.definition().name == "start_issue")
+            .expect("start_issue");
+        let start_out = start
+            .call_with_context(
+                request,
+                json!({
+                    "repo": "local/repo",
+                    "issue": 72,
+                    "base": "main",
+                    "spawned_by": root,
+                }),
+            )
+            .await;
+        let start_rendered = serde_json::to_string(&start_out).expect("render start_issue");
+
+        let spawn_role = ciacola_core::roles::tools_with_depth(roles, ledger.clone(), 1, false)
+            .into_iter()
+            .find(|tool| tool.definition().name == "spawn_role")
+            .expect("spawn_role");
+        let request =
+            RequestContext::new(RequestId::Number(73)).with_extensions(Arc::new(extensions));
+        let spawn_out = spawn_role
+            .call_with_context(
+                request,
+                json!({
+                    "role": ROLE,
+                    "arguments": {
+                        "repo": "local/repo",
+                        "issue": "72",
+                        "worktree": root_path.join("never-created").display().to_string(),
+                    },
+                    "spawned_by": root,
+                }),
+            )
+            .await;
+        let spawn_rendered = serde_json::to_string(&spawn_out).expect("render spawn_role");
+
+        assert_eq!(start_rendered, spawn_rendered, "refusal paths drifted");
+        assert!(
+            start_rendered.contains("depth 2, past the limit of 1"),
+            "must use authenticated parent depth: {start_rendered}"
+        );
+        assert!(!root_path.exists(), "preflight must run before clone");
+        assert_eq!(ledger.list_agents().await.expect("agents").len(), 2);
+        assert!(
+            ciacola_core::Store::new(pool, "repo-worker")
+                .list::<Assignment>(Some("agent/"))
+                .await
+                .expect("assignments")
+                .is_empty(),
+            "refusal must not record an assignment"
+        );
+    }
+
+    /// Omitting the identity header cannot turn an at-limit agent into an
+    /// anonymous root and bypass role authorization.
+    #[tokio::test]
+    async fn anonymous_agent_surface_cannot_start_an_issue() {
+        let root = std::env::temp_dir().join(format!("ciacola-anonymous-{}", ulid::Ulid::new()));
+        let repos = Repos {
+            root: root.clone(),
+            allowed: Arc::new(vec!["local/repo".into()]),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let (plugin, ledger) = memory_plugin(repos).await;
+        let start = plugin
+            .tools(Surface::Agent)
+            .into_iter()
+            .find(|tool| tool.definition().name == "start_issue")
+            .expect("start_issue");
+        let out = start
+            .call_with_context(
+                RequestContext::new(RequestId::Number(74)),
+                json!({
+                    "repo": "local/repo",
+                    "issue": 72,
+                    "base": "main",
+                    "spawned_by": "forged",
+                }),
+            )
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+
+        assert!(
+            rendered.contains("requires an authenticated agent"),
+            "must refuse: {rendered}"
+        );
+        assert!(!root.exists(), "refusal must happen before clone");
+        assert!(ledger.list_agents().await.expect("agents").is_empty());
+    }
+
     /// Issue #70: repo-worker used to rebuild its own shipped role catalog in
     /// setup, so the public roles tool showed an operator's configured Codex
     /// override while start_issue silently created the Claude-shaped role.
@@ -1632,13 +1746,19 @@ mod tests {
         plugin.setup(&ctx).await.expect("setup");
         let start = operator_tool(&plugin, "start_issue");
         let out = start
-            .call(json!({"repo": "local/repo", "issue": 70, "base": "main"}))
+            .call(json!({
+                "repo": "local/repo",
+                "issue": 70,
+                "base": "main",
+                "spawned_by": "forged-parent",
+            }))
             .await;
         let rendered = serde_json::to_string(&out).expect("render");
         assert!(rendered.contains("\"agent_id\""), "got: {rendered}");
 
         let agents = ledger.list_agents().await.expect("agents");
         assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].spawned_by, None, "caller prose is not lineage");
         let def = &agents[0].def;
         assert_eq!(def.provider.as_str(), "codex");
         assert_eq!(def.model, None, "the shipped Claude model must not leak");

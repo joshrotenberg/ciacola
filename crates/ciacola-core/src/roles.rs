@@ -30,13 +30,16 @@ use std::sync::Arc;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tower_mcp::context::RequestContext;
 use tower_mcp::extract::{Context, Json, State};
 use tower_mcp::{
     CallToolResult, GetPromptResult, Prompt, PromptArgument, PromptBuilder, Tool, ToolBuilder,
 };
 
 use crate::agent::{AgentDef, FlatError};
+use crate::identity::{AgentIdentity, grant_child_tools_from_parent};
 use crate::ledger::Ledger;
+use crate::plugin::Surface;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -375,8 +378,153 @@ struct SpawnRoleArgs {
     model: Option<String>,
     /// Override the role's effort for this instance.
     effort: Option<String>,
-    /// Your own agent_id, if you are an agent spawning a helper.
-    spawned_by: Option<String>,
+    /// Deprecated compatibility field. Parentage is derived from the
+    /// authenticated request context and this value is ignored.
+    #[serde(rename = "spawned_by")]
+    _spawned_by: Option<String>,
+}
+
+/// The authority core derived for a role creation request.
+///
+/// Creation paths persist this value verbatim. It never comes from caller
+/// prose: an authenticated request is always attributed to that agent, an
+/// anonymous agent-surface request is refused, and an interactive operator
+/// creates a root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleSpawnAuthorization {
+    pub spawned_by: Option<String>,
+}
+
+/// Stable policy categories returned by every role-backed creation path.
+///
+/// The variant is suitable for programmatic comparison while
+/// [`std::fmt::Display`]
+/// supplies the same actionable text to `spawn_role`, `start_issue`, and any
+/// future role consumer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleSpawnRefusal {
+    UnauthenticatedAgentSurface,
+    OperatorSurface { role: String },
+    ProviderNativeTools { role: String },
+    ChildTools { role: String, denied: Vec<String> },
+    Depth { depth: i64, max_depth: i64 },
+    CallerNotFound { agent_id: String },
+    Ledger { reason: String },
+}
+
+impl std::fmt::Display for RoleSpawnRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnauthenticatedAgentSurface => write!(
+                f,
+                "role spawning on the agent HTTP surface requires an authenticated agent"
+            ),
+            Self::OperatorSurface { role } => write!(
+                f,
+                "role '{role}' carries the operator surface, which provider-backed agents cannot hold; use stdio or authenticated human HTTP"
+            ),
+            Self::ProviderNativeTools { role } => write!(
+                f,
+                "role '{role}' inherits its provider's native tool policy, which an agent cannot bound; ask the operator to create it"
+            ),
+            Self::ChildTools { role, denied } => write!(
+                f,
+                "role '{role}' needs tools its parent does not hold: {}",
+                denied.join(", ")
+            ),
+            Self::Depth { depth, max_depth } => write!(
+                f,
+                "refused: spawning here would be depth {depth}, past the limit of {max_depth}. Do the work yourself or ask the operator to raise max_spawn_depth."
+            ),
+            Self::CallerNotFound { agent_id } => write!(f, "caller '{agent_id}' not found"),
+            Self::Ledger { reason } => {
+                write!(
+                    f,
+                    "could not authorize role spawn against the ledger: {reason}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RoleSpawnRefusal {}
+
+/// Authorize one role-backed agent creation before any side effect.
+///
+/// The request context is deliberately accepted instead of a caller id so
+/// plugins cannot accidentally trust an argument supplied by an agent. This
+/// is the convergence point for role surface, provider policy, named tool
+/// grants, lineage, and spawn depth.
+pub async fn preflight_role_spawn(
+    ledger: &Ledger,
+    role: &Role,
+    request: &RequestContext,
+    surface: Surface,
+    max_depth: i64,
+) -> Result<RoleSpawnAuthorization, RoleSpawnRefusal> {
+    let caller = request.extension::<AgentIdentity>().map(|i| i.0.clone());
+    let spawned_by = caller.clone();
+
+    // An agent can deliberately omit its identity header when making an
+    // arbitrary HTTP request. Treating that request as a new root would let
+    // it bypass both its named-tool ceiling and max_spawn_depth. Humans have
+    // stdio and the separately authenticated operator HTTP mount.
+    if caller.is_none() && surface == Surface::Agent {
+        return Err(RoleSpawnRefusal::UnauthenticatedAgentSurface);
+    }
+
+    if role.surface.as_deref() == Some("operator") {
+        return Err(RoleSpawnRefusal::OperatorSurface {
+            role: role.name.clone(),
+        });
+    }
+    if role.inherit_provider_tools && (caller.is_some() || surface != Surface::Operator) {
+        return Err(RoleSpawnRefusal::ProviderNativeTools {
+            role: role.name.clone(),
+        });
+    }
+
+    let parent = match caller.as_deref() {
+        Some(agent_id) => match ledger.get_agent(agent_id).await {
+            Ok(Some(parent)) => Some(parent),
+            Ok(None) => {
+                return Err(RoleSpawnRefusal::CallerNotFound {
+                    agent_id: agent_id.to_string(),
+                });
+            }
+            Err(error) => {
+                return Err(RoleSpawnRefusal::Ledger {
+                    reason: error.to_string(),
+                });
+            }
+        },
+        None => None,
+    };
+
+    let grant = grant_child_tools_from_parent(parent.as_ref(), role.allowed_tools.clone());
+    if !grant.denied.is_empty() {
+        return Err(RoleSpawnRefusal::ChildTools {
+            role: role.name.clone(),
+            denied: grant.denied,
+        });
+    }
+
+    if max_depth > 0
+        && let Some(parent) = spawned_by.as_deref()
+    {
+        let depth = ledger
+            .spawn_depth(parent)
+            .await
+            .map_err(|error| RoleSpawnRefusal::Ledger {
+                reason: error.to_string(),
+            })?
+            + 1;
+        if depth > max_depth {
+            return Err(RoleSpawnRefusal::Depth { depth, max_depth });
+        }
+    }
+
+    Ok(RoleSpawnAuthorization { spawned_by })
 }
 
 /// `spawn_role` and `roles`. Both surfaces: an orchestrator provisions
@@ -391,6 +539,11 @@ pub fn tools_with_depth(
     max_depth: i64,
     operator_surface: bool,
 ) -> Vec<Tool> {
+    let surface = if operator_surface {
+        Surface::Operator
+    } else {
+        Surface::Agent
+    };
     let spawn_role = {
         let roles = roles.clone();
         ToolBuilder::new("spawn_role")
@@ -406,40 +559,26 @@ pub fn tools_with_depth(
                 move |State((roles, ledger)): State<(Roles, Ledger)>,
                       ctx: Context,
                       Json(args): Json<SpawnRoleArgs>| async move {
-                    // Same policy as spawn: derived beats claimed, the
-                    // operator's terminal is trusted, an anonymous
-                    // caller on the agent surface claims nothing.
-                    let caller = ctx
-                        .extension::<crate::identity::AgentIdentity>()
-                        .map(|i| i.0.clone());
-                    let spawned_by = match (&caller, operator_surface) {
-                        (Some(id), _) => Some(id.clone()),
-                        (None, true) => args.spawned_by.clone(),
-                        (None, false) => None,
-                    };
                     let Some(role) = roles.get(&args.role) else {
                         return Ok(CallToolResult::error(format!(
                             "no role '{}'; see the roles tool",
                             args.role
                         )));
                     };
-                    // The HTTP operator mount is human-bearer-only. Even a
-                    // human spawning this role would have to copy that root
-                    // bearer into a provider process, where another worker
-                    // under the same OS user could steal it.
-                    if role.surface.as_deref() == Some("operator") {
-                        return Ok(CallToolResult::error(format!(
-                            "role '{}' carries the operator surface, which provider-backed \
-                             agents cannot hold; use stdio or authenticated human HTTP",
-                            role.name
-                        )));
-                    }
-                    if role.inherit_provider_tools && (caller.is_some() || !operator_surface) {
-                        return Ok(CallToolResult::error(format!(
-                            "role '{}' inherits its provider's native tool policy, which an agent cannot bound; ask the operator to spawn it",
-                            role.name
-                        )));
-                    }
+                    let authorization = match preflight_role_spawn(
+                        &ledger,
+                        role,
+                        &ctx,
+                        surface,
+                        max_depth,
+                    )
+                    .await
+                    {
+                        Ok(authorization) => authorization,
+                        Err(refusal) => {
+                            return Ok(CallToolResult::error(refusal.to_string()));
+                        }
+                    };
                     let missing: Vec<&String> = role
                         .arguments
                         .iter()
@@ -451,29 +590,6 @@ pub fn tools_with_depth(
                             role.name
                         )));
                     }
-                    let grant = match crate::identity::grant_child_tools(
-                        &ledger,
-                        caller.as_deref(),
-                        role.allowed_tools.clone(),
-                    )
-                    .await
-                    {
-                        Ok(grant) => grant,
-                        Err(e) => return Ok(CallToolResult::error(e.to_string())),
-                    };
-                    if !grant.denied.is_empty() {
-                        return Ok(CallToolResult::error(format!(
-                            "role '{}' needs tools its parent does not hold: {}",
-                            role.name,
-                            grant.denied.join(", ")
-                        )));
-                    }
-                    if let Some(reason) =
-                        crate::server::depth_refusal(&ledger, spawned_by.as_deref(), max_depth)
-                            .await
-                    {
-                        return Ok(CallToolResult::error(reason));
-                    }
                     let mut def = roles.to_def(role, &args.arguments);
                     if let Some(name) = args.name {
                         def.name = name;
@@ -484,7 +600,10 @@ pub fn tools_with_depth(
                     if let Some(effort) = args.effort {
                         def.effort = Some(effort);
                     }
-                    match ledger.create_agent(&def, spawned_by.as_deref()).await {
+                    match ledger
+                        .create_agent(&def, authorization.spawned_by.as_deref())
+                        .await
+                    {
                         Ok(agent_id) => {
                             // The role's prompt may mention its own id;
                             // fill it in now that one exists.
@@ -572,7 +691,7 @@ pub fn prompts(roles: Roles) -> Vec<Prompt> {
 
 // --- plugin ---
 
-use crate::plugin::{BoxFut, Plugin, PluginContext, Surface};
+use crate::plugin::{BoxFut, Plugin, PluginContext};
 
 /// Roles as a plugin. Stateless: the config file is the truth, so
 /// `setup` only builds the loopback path into the catalog. Contributes
@@ -643,6 +762,9 @@ impl Plugin for RolesPlugin {
 mod surface_tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use tower_mcp::context::{Extensions, RequestContext};
+    use tower_mcp::protocol::RequestId;
 
     fn role(surface: Option<&str>) -> Role {
         Role {
@@ -663,6 +785,21 @@ mod surface_tests {
             arguments: Vec::new(),
             system_prompt: "s".into(),
         }
+    }
+
+    async fn ledger() -> Ledger {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        Ledger::setup(pool).await.expect("ledger")
+    }
+
+    fn context(agent_id: Option<&str>) -> RequestContext {
+        let mut extensions = Extensions::new();
+        if let Some(agent_id) = agent_id {
+            extensions.insert(AgentIdentity(agent_id.to_string()));
+        }
+        RequestContext::new(RequestId::Number(1)).with_extensions(Arc::new(extensions))
     }
 
     /// Which mount a role is pointed at is the whole of its authority,
@@ -723,5 +860,259 @@ mod surface_tests {
             .with_operator_mcp_config("operator.json");
         let def = roles.to_def(roles.get("r").unwrap(), &HashMap::new());
         assert_eq!(def.mcp_config.as_deref(), Some("agent.json"));
+    }
+
+    #[tokio::test]
+    async fn preflight_derives_parentage_from_the_trusted_context_and_surface() {
+        let ledger = ledger().await;
+        let parent = ledger
+            .create_agent(&AgentDef::new("parent", "s").allowed_tools(["Read"]), None)
+            .await
+            .expect("parent");
+        let requested = role(None);
+
+        let authenticated = preflight_role_spawn(
+            &ledger,
+            &requested,
+            &context(Some(&parent)),
+            Surface::Agent,
+            3,
+        )
+        .await
+        .expect("authenticated parent");
+        assert_eq!(authenticated.spawned_by.as_deref(), Some(parent.as_str()));
+
+        let anonymous =
+            preflight_role_spawn(&ledger, &requested, &context(None), Surface::Agent, 3).await;
+        assert_eq!(
+            anonymous,
+            Err(RoleSpawnRefusal::UnauthenticatedAgentSurface)
+        );
+
+        let operator =
+            preflight_role_spawn(&ledger, &requested, &context(None), Surface::Operator, 3)
+                .await
+                .expect("interactive operator");
+        assert_eq!(operator.spawned_by, None);
+    }
+
+    #[tokio::test]
+    async fn operator_claimed_parent_is_ignored_by_spawn_role() {
+        let ledger = ledger().await;
+        let claimed = ledger
+            .create_agent(&AgentDef::new("claimed parent", "s"), None)
+            .await
+            .expect("claimed parent");
+        let roles = Roles::new(vec![role(None)], "agent.json");
+        let spawn = tools_with_depth(roles, ledger.clone(), 3, true)
+            .into_iter()
+            .find(|tool| tool.definition().name == "spawn_role")
+            .expect("spawn_role");
+
+        let out = spawn
+            .call(json!({
+                "role": "r",
+                "arguments": {},
+                "spawned_by": claimed,
+            }))
+            .await;
+        let rendered = serde_json::to_string(&out).expect("render");
+        assert!(rendered.contains("\"agent_id\""), "got: {rendered}");
+
+        let created = ledger
+            .list_agents()
+            .await
+            .expect("agents")
+            .into_iter()
+            .find(|agent| agent.name == "r")
+            .expect("created role agent");
+        assert_eq!(created.spawned_by, None);
+    }
+
+    #[tokio::test]
+    async fn preflight_refuses_an_operator_surface_role_for_every_caller() {
+        let ledger = ledger().await;
+        let requested = role(Some("operator"));
+        let caller = ledger
+            .create_agent(&AgentDef::new("caller", "s"), None)
+            .await
+            .expect("caller");
+
+        assert_eq!(
+            preflight_role_spawn(
+                &ledger,
+                &requested,
+                &context(Some(&caller)),
+                Surface::Agent,
+                3,
+            )
+            .await,
+            Err(RoleSpawnRefusal::OperatorSurface { role: "r".into() })
+        );
+        assert_eq!(
+            preflight_role_spawn(&ledger, &requested, &context(None), Surface::Operator, 3,).await,
+            Err(RoleSpawnRefusal::OperatorSurface { role: "r".into() })
+        );
+    }
+
+    #[tokio::test]
+    async fn only_an_operator_may_choose_provider_native_inheritance() {
+        let ledger = ledger().await;
+        let mut requested = role(None);
+        requested.inherit_provider_tools = true;
+
+        assert!(
+            preflight_role_spawn(&ledger, &requested, &context(None), Surface::Operator, 3,)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            preflight_role_spawn(&ledger, &requested, &context(None), Surface::Agent, 3).await,
+            Err(RoleSpawnRefusal::UnauthenticatedAgentSurface)
+        );
+
+        let parent = ledger
+            .create_agent(&AgentDef::new("parent", "s"), None)
+            .await
+            .expect("parent");
+        assert_eq!(
+            preflight_role_spawn(
+                &ledger,
+                &requested,
+                &context(Some(&parent)),
+                Surface::Agent,
+                3,
+            )
+            .await,
+            Err(RoleSpawnRefusal::ProviderNativeTools { role: "r".into() })
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_enforces_named_tool_grants() {
+        let ledger = ledger().await;
+        let parent = ledger
+            .create_agent(&AgentDef::new("parent", "s").allowed_tools(["Read"]), None)
+            .await
+            .expect("parent");
+        let mut requested = role(None);
+        requested.allowed_tools = vec!["Read".into(), "Edit".into()];
+
+        assert_eq!(
+            preflight_role_spawn(
+                &ledger,
+                &requested,
+                &context(Some(&parent)),
+                Surface::Agent,
+                3,
+            )
+            .await,
+            Err(RoleSpawnRefusal::ChildTools {
+                role: "r".into(),
+                denied: vec!["Edit".into()],
+            })
+        );
+
+        requested.allowed_tools.pop();
+        assert!(
+            preflight_role_spawn(
+                &ledger,
+                &requested,
+                &context(Some(&parent)),
+                Surface::Agent,
+                3,
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_allows_the_depth_boundary_and_zero_is_unlimited() {
+        let ledger = ledger().await;
+        let root = ledger
+            .create_agent(&AgentDef::new("root", "s"), None)
+            .await
+            .expect("root");
+        let at_one = ledger
+            .create_agent(&AgentDef::new("one", "s"), Some(&root))
+            .await
+            .expect("one");
+        let at_two = ledger
+            .create_agent(&AgentDef::new("two", "s"), Some(&at_one))
+            .await
+            .expect("two");
+        let requested = role(None);
+
+        assert!(
+            preflight_role_spawn(
+                &ledger,
+                &requested,
+                &context(Some(&at_one)),
+                Surface::Agent,
+                2,
+            )
+            .await
+            .is_ok(),
+            "a child at exactly the limit is allowed"
+        );
+        assert_eq!(
+            preflight_role_spawn(
+                &ledger,
+                &requested,
+                &context(Some(&at_two)),
+                Surface::Agent,
+                2,
+            )
+            .await,
+            Err(RoleSpawnRefusal::Depth {
+                depth: 3,
+                max_depth: 2,
+            })
+        );
+        assert!(
+            preflight_role_spawn(
+                &ledger,
+                &requested,
+                &context(Some(&at_two)),
+                Surface::Agent,
+                0,
+            )
+            .await
+            .is_ok(),
+            "zero disables the ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_types_missing_callers_and_ledger_failures() {
+        let ledger = ledger().await;
+        let requested = role(None);
+        assert_eq!(
+            preflight_role_spawn(
+                &ledger,
+                &requested,
+                &context(Some("missing")),
+                Surface::Agent,
+                3,
+            )
+            .await,
+            Err(RoleSpawnRefusal::CallerNotFound {
+                agent_id: "missing".into(),
+            })
+        );
+
+        ledger.pool().close().await;
+        assert!(matches!(
+            preflight_role_spawn(
+                &ledger,
+                &requested,
+                &context(Some("claimed")),
+                Surface::Agent,
+                3,
+            )
+            .await,
+            Err(RoleSpawnRefusal::Ledger { .. })
+        ));
     }
 }

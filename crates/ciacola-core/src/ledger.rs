@@ -51,11 +51,10 @@ pub struct AgentRow {
     /// otherwise `idle`.
     pub state: String,
     pub turns: i64,
-    /// Who spawned this agent, if an agent did. Identity, not
-    /// definition, so it lives beside the def rather than in it.
-    /// Honor-system for now: the loopback has no caller identity (a
-    /// recorded gap), so orchestrators are instructed to pass their
-    /// own id.
+    /// Who spawned this agent, if an agent did. Identity, not definition, so
+    /// it lives beside the def rather than in it. Role-backed creation derives
+    /// this from authenticated request context; interactive operator-created
+    /// roots deliberately have no parent.
     pub spawned_by: Option<String>,
     pub retired: bool,
     /// When this agent last finished anything, unix seconds. Zero for

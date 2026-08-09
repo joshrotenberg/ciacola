@@ -81,15 +81,30 @@ pub async fn grant_child_tools(
     requested: Vec<String>,
 ) -> Result<ChildToolGrant, crate::agent::FlatError> {
     let Some(parent_id) = caller else {
-        return Ok(ChildToolGrant {
-            granted: requested,
-            denied: Vec::new(),
-        });
+        return Ok(grant_child_tools_from_parent(None, requested));
     };
     let parent = ledger
         .get_agent(parent_id)
         .await?
         .ok_or_else(|| format!("caller '{parent_id}' not found"))?;
+    Ok(grant_child_tools_from_parent(Some(&parent), requested))
+}
+
+/// Apply the named-tool ceiling once the trusted parent row has been read.
+///
+/// Role preflight needs to distinguish a missing authenticated caller from a
+/// ledger failure. Keeping the pure grant calculation here lets it do that
+/// without performing the same database lookup twice.
+pub(crate) fn grant_child_tools_from_parent(
+    parent: Option<&crate::ledger::AgentRow>,
+    requested: Vec<String>,
+) -> ChildToolGrant {
+    let Some(parent) = parent else {
+        return ChildToolGrant {
+            granted: requested,
+            denied: Vec::new(),
+        };
+    };
     let (granted, denied) = requested.into_iter().partition(|tool| {
         parent
             .def
@@ -97,7 +112,7 @@ pub async fn grant_child_tools(
             .iter()
             .any(|held| tool_covers(held, tool))
     });
-    Ok(ChildToolGrant { granted, denied })
+    ChildToolGrant { granted, denied }
 }
 
 #[cfg(test)]
