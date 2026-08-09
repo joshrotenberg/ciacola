@@ -143,6 +143,16 @@ repos = ["joshrotenberg/mdbook-lint"]
 # arguments = ["repo", "pr"]
 # system_prompt = "..."
 
+# Delegated supervisor authority has an intentionally parseable, closed shape,
+# but every configured policy currently stops startup: a provider process cannot
+# receive privileged authority safely until Ciacola has a process-isolated
+# delegation backend. Policies are separate from roles so neither persistent
+# agents nor `spawn_role` can inherit them implicitly. `surface = "operator"`
+# remains invalid and is not a migration path.
+# [delegation.roles."repo-manager"]
+# actions = ["repo-worker/open_pr", "repo-worker/finish_issue"]
+# scope = "descendant_assignments"
+
 # Persistent agents: upserted by name at every boot. The definition
 # follows this file; the identity and conversation persist.
 # [[agents]]
