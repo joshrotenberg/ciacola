@@ -78,6 +78,8 @@ pub use plugin::{
     apply_migrations, submit,
 };
 pub use polling::PollingExecutor;
-pub use roles::{Role, Roles, Runtime};
+pub use roles::{
+    Role, RoleSpawnAuthorization, RoleSpawnRefusal, Roles, Runtime, preflight_role_spawn,
+};
 pub use store::Store;
 pub use time::now_unix;
