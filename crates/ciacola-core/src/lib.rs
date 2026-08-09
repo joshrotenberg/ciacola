@@ -68,7 +68,7 @@ pub mod store;
 pub mod time;
 
 pub use agent::{Agent, AgentDef, Exchange, FlatError, Turn, prompt, run_exchange};
-pub use exec::{HandExecutor, TurnExecutor, run_turn};
+pub use exec::{DispatchReadiness, HandExecutor, TurnExecutor, run_turn};
 pub use identity::{AgentIdentity, ChildToolGrant, TOKEN_HEADER, grant_child_tools};
 pub use ledger::{AgentRow, Ledger, TurnRow};
 pub use limits::Limits;

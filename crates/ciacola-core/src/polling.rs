@@ -36,32 +36,20 @@ use std::time::Duration;
 
 use tokio::sync::{Notify, Semaphore};
 
-use crate::exec::{Kills, TurnExecutor, run_claimed_turn_cancellable};
+use crate::exec::{
+    DispatchReadiness, InflightGuard, Kills, TurnExecutor, run_claimed_turn_cancellable,
+};
 use crate::ledger::Ledger;
 use crate::notify::Notifier;
 use crate::plugin::BoxFut;
 
-/// A dispatch is in flight from the moment it owns a permit, not only
-/// after its task has been spawned and claimed the ledger row. Keeping
-/// that accounting in a drop guard closes the startup gap and makes
-/// every early return, cancellation, and panic release the count.
-struct InflightGuard(Arc<AtomicUsize>);
+#[cfg(test)]
+struct WorkerStopSignal(tokio_util::sync::CancellationToken);
 
-impl InflightGuard {
-    fn after_permit(stopping: &AtomicBool, inflight: Arc<AtomicUsize>) -> Option<InflightGuard> {
-        // Reserve before consulting `stopping`. If drain wins just
-        // before this increment it may observe zero and return, but the
-        // check below then observes stopping and refuses to dispatch. If
-        // this increment wins, drain observes one and waits for us.
-        let guard = InflightGuard(inflight);
-        guard.0.fetch_add(1, Ordering::SeqCst);
-        (!stopping.load(Ordering::SeqCst)).then_some(guard)
-    }
-}
-
-impl Drop for InflightGuard {
+#[cfg(test)]
+impl Drop for WorkerStopSignal {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.0.cancel();
     }
 }
 
@@ -72,6 +60,8 @@ pub struct PollingExecutor {
     kills: Kills,
     stopping: Arc<AtomicBool>,
     inflight: Arc<AtomicUsize>,
+    #[cfg(test)]
+    worker_stopped: tokio_util::sync::CancellationToken,
 }
 
 impl PollingExecutor {
@@ -81,16 +71,45 @@ impl PollingExecutor {
         concurrency: usize,
         interval: Duration,
     ) -> Arc<Self> {
+        let readiness = DispatchReadiness::closed();
+        readiness.open();
+        Self::start_gated(ledger, notify, concurrency, interval, readiness)
+    }
+
+    /// Construct a poller whose timer and submission nudges remain dormant
+    /// until `readiness` opens.
+    pub fn start_gated(
+        ledger: Ledger,
+        notify: Notifier,
+        concurrency: usize,
+        interval: Duration,
+        readiness: DispatchReadiness,
+    ) -> Arc<Self> {
+        #[cfg(test)]
+        let worker_stopped = tokio_util::sync::CancellationToken::new();
         let this = Arc::new(Self {
             nudge: Arc::new(Notify::new()),
             kills: Arc::new(Mutex::new(HashMap::new())),
             stopping: Arc::new(AtomicBool::new(false)),
             inflight: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            worker_stopped,
         });
 
         let (nudge, kills) = (this.nudge.clone(), this.kills.clone());
         let (stopping, inflight) = (this.stopping.clone(), this.inflight.clone());
+        #[cfg(test)]
+        let worker_stopped = this.worker_stopped.clone();
         tokio::spawn(async move {
+            #[cfg(test)]
+            let _worker_stop_signal = WorkerStopSignal(worker_stopped);
+            // The durable ledger can contain work before this executor is
+            // constructed, so gating only `submit` would be insufficient:
+            // the independent timer must not begin until startup is ready.
+            readiness.wait().await;
+            if stopping.load(Ordering::SeqCst) {
+                return;
+            }
             let limit = Arc::new(Semaphore::new(concurrency));
             loop {
                 tokio::select! {
@@ -147,6 +166,11 @@ impl PollingExecutor {
         });
         this
     }
+
+    #[cfg(test)]
+    async fn wait_until_worker_stopped(&self) {
+        self.worker_stopped.cancelled().await;
+    }
 }
 
 impl TurnExecutor for PollingExecutor {
@@ -193,12 +217,106 @@ impl TurnExecutor for PollingExecutor {
 mod tests {
     use super::*;
 
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ciacola_agent::Provider for CountingProvider {
+        fn key(&self) -> ciacola_agent::ProviderKey {
+            ciacola_agent::ProviderKey::new("poll-counting")
+        }
+
+        fn capabilities(&self) -> ciacola_agent::Capabilities {
+            let mut capabilities =
+                ciacola_agent::Capabilities::none(ciacola_agent::ProviderKey::new("poll-counting"));
+            capabilities.client_assigned_resume = true;
+            capabilities.allowed_tools = true;
+            capabilities.reports_cost = true;
+            capabilities.reports_token_usage = true;
+            capabilities.reports_provider_turns = true;
+            capabilities
+        }
+
+        fn run<'a>(
+            &'a self,
+            _intent: &'a ciacola_agent::TurnIntent,
+            _events: &'a dyn ciacola_agent::TurnEvents,
+        ) -> ciacola_agent::BoxFut<'a, Result<ciacola_agent::TurnOutcome, ciacola_agent::AgentError>>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(ciacola_agent::TurnOutcome {
+                    reply: "counted".to_string(),
+                    resume: None,
+                    cost: ciacola_agent::Cost::Reported { micro_usd: 0 },
+                    usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage::default()),
+                    provider_turns: Some(1),
+                    elapsed: Duration::from_millis(1),
+                    metadata: Default::default(),
+                    failure: None,
+                })
+            })
+        }
+
+        fn owns_process(&self, _ps_line: &str) -> bool {
+            false
+        }
+    }
+
+    async fn queued_counting_turn() -> (Ledger, String, i64, Notifier, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let providers = ciacola_agent::ProviderRegistry::new()
+            .with(Arc::new(CountingProvider {
+                calls: calls.clone(),
+            }))
+            .expect("provider");
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool)
+            .await
+            .expect("ledger")
+            .with_providers(providers);
+        let agent_id = ledger
+            .create_agent(
+                &crate::agent::AgentDef::new("readiness", "system").provider("poll-counting"),
+                None,
+            )
+            .await
+            .expect("agent");
+        let seq = ledger
+            .enqueue_turn(&agent_id, "wait for readiness")
+            .await
+            .expect("turn");
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+        (ledger, agent_id, seq, Notifier(tx), calls)
+    }
+
+    async fn wait_for_state(ledger: &Ledger, agent_id: &str, seq: i64, expected: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let turn = ledger
+                    .get_turn(agent_id, seq)
+                    .await
+                    .expect("turn query")
+                    .expect("turn");
+                if turn.state == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("turn never reached {expected}"));
+    }
+
     fn executor(stopping: Arc<AtomicBool>, inflight: Arc<AtomicUsize>) -> PollingExecutor {
         PollingExecutor {
             nudge: Arc::new(Notify::new()),
             kills: Arc::new(Mutex::new(HashMap::new())),
             stopping,
             inflight,
+            worker_stopped: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -225,5 +343,74 @@ mod tests {
 
         drop(reservation);
         assert_eq!(inflight.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn polling_and_recovery_stay_closed_then_dispatch_exactly_once_after_open() {
+        let (ledger, agent_id, seq, notify, calls) = queued_counting_turn().await;
+        let readiness = DispatchReadiness::closed();
+        let interval = Duration::from_millis(5);
+        let executor =
+            PollingExecutor::start_gated(ledger.clone(), notify, 1, interval, readiness.clone());
+        readiness.wait_until_worker_is_parked().await;
+
+        // More than one polling interval passes without a ledger scan or
+        // claim, proving the independent timer is behind the same gate as a
+        // submission nudge.
+        tokio::time::sleep(interval * 3).await;
+        let turn = ledger
+            .get_turn(&agent_id, seq)
+            .await
+            .expect("turn query")
+            .expect("turn");
+        assert_eq!(turn.state, "queued");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let report = crate::recover::recover(&ledger, executor.as_ref())
+            .await
+            .expect("recover while closed");
+        assert_eq!(report.resubmitted, 1);
+        executor.submit(agent_id.clone(), seq);
+        let turn = ledger
+            .get_turn(&agent_id, seq)
+            .await
+            .expect("turn query")
+            .expect("turn");
+        assert_eq!(turn.state, "queued");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        readiness.open();
+        wait_for_state(&ledger, &agent_id, seq, "ok").await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.drain(Duration::from_secs(1)).await, 0);
+    }
+
+    #[tokio::test]
+    async fn draining_a_closed_poller_prevents_a_later_open_from_claiming() {
+        let (ledger, agent_id, seq, notify, calls) = queued_counting_turn().await;
+        let readiness = DispatchReadiness::closed();
+        let executor = PollingExecutor::start_gated(
+            ledger.clone(),
+            notify,
+            1,
+            Duration::from_millis(5),
+            readiness.clone(),
+        );
+        readiness.wait_until_worker_is_parked().await;
+
+        assert_eq!(executor.drain(Duration::ZERO).await, 0);
+        readiness.open();
+        tokio::time::timeout(Duration::from_secs(1), executor.wait_until_worker_stopped())
+            .await
+            .expect("polling worker did not stop after readiness opened");
+
+        let turn = ledger
+            .get_turn(&agent_id, seq)
+            .await
+            .expect("turn query")
+            .expect("turn");
+        assert_eq!(turn.state, "queued");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

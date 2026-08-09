@@ -24,6 +24,12 @@ must never do. This was tested rather than assumed: an identical server
 was built on Apalis and on a hand-rolled executor, both were killed
 mid-run, and neither self-healed without the ledger. The production server
 now uses the hand-rolled channel or polling executor behind `TurnExecutor`.
+Both executors start behind a closed, process-local dispatch boundary. Startup
+assembles every plugin and router, binds and starts the complete loopback HTTP
+server, reconciles crash recovery while dispatch is still closed, and only
+then permits a turn to be claimed. A bad config, plugin failure, or occupied
+port therefore leaves durable queued work queued instead of spending a
+provider run against an unavailable MCP endpoint.
 
 ## Running it
 

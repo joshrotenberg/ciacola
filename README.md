@@ -27,6 +27,10 @@ must never do, and the durable record a queue would hold already exists:
 a turn is written to the ledger before anything is told to run it. The
 default executor polls that record, so a turn queued before a crash is
 picked up after one, with no queue and no recovery pass involved.
+At startup, dispatch stays closed until the complete loopback HTTP server is
+listening and crash recovery has reconciled the ledger. Configuration, plugin,
+or port-binding failures therefore leave queued work untouched and launch no
+provider.
 
 ## Six verbs
 
