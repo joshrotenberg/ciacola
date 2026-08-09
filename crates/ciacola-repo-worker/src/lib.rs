@@ -22,6 +22,7 @@
 //! [plugins.repo-worker]
 //! root = "~/.local/share/ciacola/repos"   # clones and worktrees
 //! repos = ["joshrotenberg/tower-mcp"]     # what may be worked on
+//! branch_templates = { "joshrotenberg/tower-mcp" = "fix/{slug}" }
 //! ```
 //!
 //! External writes are gated: `open_pr` is the only tool that can
@@ -32,6 +33,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::{collections::BTreeMap, fmt};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -53,6 +55,85 @@ const START_ISSUE_ROLE_ARGUMENTS: [&str; 3] = ["repo", "issue", "worktree"];
 /// notices what the implementer prompt got wrong, and that only turns
 /// into a better prompt if it is somebody's stated job.
 const MANAGER: &str = "repo-manager";
+const DEFAULT_BRANCH_TEMPLATE: &str = "agent/{slug}";
+
+#[derive(Clone, PartialEq, Eq)]
+struct BranchTemplate(String);
+
+impl fmt::Debug for BranchTemplate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("BranchTemplate").field(&self.0).finish()
+    }
+}
+
+impl BranchTemplate {
+    fn parse(value: String) -> Result<Self, String> {
+        if value.matches("{slug}").count() != 1 {
+            return Err(format!(
+                "branch template '{value}' must contain exactly one '{{slug}}' placeholder"
+            ));
+        }
+        let remainder = value.replace("{slug}", "");
+        if remainder.contains(['{', '}']) {
+            return Err(format!(
+                "branch template '{value}' contains an unsupported placeholder; only '{{slug}}' is allowed"
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    fn render(&self, slug: &str) -> String {
+        self.0.replace("{slug}", slug)
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BranchPolicies {
+    default: BranchTemplate,
+    configured: BTreeMap<String, BranchTemplate>,
+}
+
+impl Default for BranchPolicies {
+    fn default() -> Self {
+        Self {
+            default: BranchTemplate(DEFAULT_BRANCH_TEMPLATE.to_string()),
+            configured: BTreeMap::new(),
+        }
+    }
+}
+
+impl BranchPolicies {
+    fn new(allowed: &[String], configured: BTreeMap<String, String>) -> Result<Self, String> {
+        let mut parsed = BTreeMap::new();
+        for (repo, template) in configured {
+            if !allowed.iter().any(|allowed| allowed == &repo) {
+                return Err(format!(
+                    "branch template repository '{repo}' is not present in plugins.repo-worker.repos"
+                ));
+            }
+            parsed.insert(repo, BranchTemplate::parse(template)?);
+        }
+        Ok(Self {
+            default: BranchTemplate(DEFAULT_BRANCH_TEMPLATE.to_string()),
+            configured: parsed,
+        })
+    }
+
+    fn for_repo(&self, repo: &str) -> &BranchTemplate {
+        self.configured.get(repo).unwrap_or(&self.default)
+    }
+
+    fn configured_state(&self) -> BTreeMap<&str, &str> {
+        self.configured
+            .iter()
+            .map(|(repo, template)| (repo.as_str(), template.as_str()))
+            .collect()
+    }
+}
 
 /// `start_issue` owns this role's argument map. Configured overrides may
 /// change the prompt and provisioning, but cannot require values the tool has
@@ -209,6 +290,11 @@ const MIGRATIONS: &[Migration] = &[
                 ELSE 'none'
             END",
     ),
+    Migration::add_column(
+        "0016_branch_policy",
+        "ALTER TABLE repo_worker_assignments ADD COLUMN branch_policy TEXT NOT NULL
+             DEFAULT 'agent/{slug}'",
+    ),
 ];
 
 #[derive(Debug, Default, Deserialize)]
@@ -220,6 +306,10 @@ struct RepoWorkerConfig {
     /// means none: this plugin does not get to pick.
     #[serde(default)]
     repos: Vec<String>,
+    /// Per-repository branch templates. The only placeholder is `{slug}`,
+    /// which is required exactly once so every assignment remains unique.
+    #[serde(default)]
+    branch_templates: BTreeMap<String, String>,
 }
 
 fn expand(path: &str) -> PathBuf {
@@ -366,6 +456,22 @@ async fn git_predicate(dir: &Path, args: &[&str]) -> Result<bool, FlatError> {
         )
         .into()),
     }
+}
+
+async fn validate_branch_name(branch: &str) -> Result<(), FlatError> {
+    let output = tokio::process::Command::new("git")
+        .args(["check-ref-format", "--branch", branch])
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "branch template rendered invalid Git branch '{branch}': {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+    .into())
 }
 
 async fn worktree_is_clean(dir: &Path) -> Result<bool, FlatError> {
@@ -881,9 +987,16 @@ impl Repos {
         repo: &str,
         slug: &str,
         base: &str,
+        branch: &str,
     ) -> Result<(PathBuf, String), FlatError> {
-        self.add_worktree_from(repo, slug, base, &format!("https://github.com/{repo}.git"))
-            .await
+        self.add_worktree_from(
+            repo,
+            slug,
+            base,
+            branch,
+            &format!("https://github.com/{repo}.git"),
+        )
+        .await
     }
 
     async fn add_worktree_from(
@@ -891,14 +1004,14 @@ impl Repos {
         repo: &str,
         slug: &str,
         base: &str,
+        branch: &str,
         url: &str,
     ) -> Result<(PathBuf, String), FlatError> {
         let _guard = self.cloning.lock().await;
         let bare = self.ensure_clone_from_locked(repo, url).await?;
         let path = self.root.join(format!("wt-{slug}"));
-        let branch = format!("agent/{slug}");
         if path.exists() {
-            self.validate_worktree_at(&path, &branch, &bare).await?;
+            self.validate_worktree_at(&path, branch, &bare).await?;
             return Err(format!(
                 "worktree '{}' already exists without an active durable assignment",
                 path.display()
@@ -910,13 +1023,13 @@ impl Repos {
         // `main` in this clone would be a stale copy at best, and
         // nothing here creates one.
         let mut add = WorktreeCommand::add(&path);
-        add.new_branch(&branch).commit_ish(format!("origin/{base}"));
+        add.new_branch(branch).commit_ish(format!("origin/{base}"));
         bare_repo(&bare)
             .worktree(add)
             .execute()
             .await
             .map_err(|e| -> FlatError { format!("worktree add: {e}").into() })?;
-        Ok((path, branch))
+        Ok((path, branch.to_string()))
     }
 
     async fn remove_worktree_at(
@@ -1071,6 +1184,7 @@ struct FinishArgs {
 pub struct RepoWorkerPlugin {
     repos: Option<Repos>,
     ctx: Option<PluginContext>,
+    branch_policies: BranchPolicies,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1243,6 +1357,7 @@ struct Assignment {
     base_head: Option<String>,
     slug: String,
     branch: String,
+    branch_policy: String,
     worktree: String,
     bare_path: String,
     agent_id: Option<String>,
@@ -1292,6 +1407,7 @@ impl Assignment {
             base_head: row.try_get("base_head")?,
             slug: row.try_get("slug")?,
             branch: row.try_get("branch")?,
+            branch_policy: row.try_get("branch_policy")?,
             worktree: row.try_get("worktree")?,
             bare_path: row.try_get("bare_path")?,
             agent_id: row.try_get("agent_id")?,
@@ -1336,6 +1452,7 @@ impl Assignment {
             "base": self.base,
             "base_head": self.base_head,
             "branch": self.branch,
+            "branch_policy": self.branch_policy,
             "worktree": self.worktree,
             "expected_head": self.expected_head,
             "pushed_head": self.pushed_head,
@@ -1483,6 +1600,7 @@ impl AssignmentDb {
         issue: u64,
         requested_base: Option<&str>,
         repos: &Repos,
+        branch_template: &BranchTemplate,
         spawned_by: Option<&str>,
     ) -> Result<(Assignment, bool), FlatError> {
         let issue_sql = sqlite_u64(issue, "issue")?;
@@ -1491,15 +1609,16 @@ impl AssignmentDb {
         }
         let assignment_id = ulid::Ulid::new().to_string();
         let slug = assignment_slug(repo, issue, &assignment_id);
-        let branch = format!("agent/{slug}");
+        let branch = branch_template.render(&slug);
+        validate_branch_name(&branch).await?;
         let worktree = repos.root.join(format!("wt-{slug}")).display().to_string();
         let bare_path = repos.bare(repo).display().to_string();
         let now = ciacola_core::now_unix();
         let done = sqlx::query(
             "INSERT INTO repo_worker_assignments
                  (assignment_id, repo, issue_number, state, phase, base, slug, branch,
-                  worktree, bare_path, spawned_by, created_unix, updated_unix)
-             VALUES (?1, ?2, ?3, 'preparing', 'reserved', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+                  branch_policy, worktree, bare_path, spawned_by, created_unix, updated_unix)
+             VALUES (?1, ?2, ?3, 'preparing', 'reserved', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
              ON CONFLICT DO NOTHING",
         )
         .bind(&assignment_id)
@@ -1508,6 +1627,7 @@ impl AssignmentDb {
         .bind(requested_base)
         .bind(&slug)
         .bind(&branch)
+        .bind(branch_template.as_str())
         .bind(&worktree)
         .bind(&bare_path)
         .bind(spawned_by)
@@ -2957,6 +3077,8 @@ impl Plugin for RepoWorkerPlugin {
                 Some(value) => value.clone().try_into()?,
                 None => RepoWorkerConfig::default(),
             };
+            let branch_policies =
+                BranchPolicies::new(&config.repos, config.branch_templates.clone())?;
             let root = expand(
                 config
                     .root
@@ -2975,6 +3097,7 @@ impl Plugin for RepoWorkerPlugin {
                 cloning: Arc::new(tokio::sync::Mutex::new(())),
                 lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             });
+            self.branch_policies = branch_policies;
             self.ctx = Some(ctx.clone());
             let assignments = AssignmentDb::new(ctx.pool.clone());
             assignments
@@ -3188,9 +3311,15 @@ to do, on purpose."
         // Higher-level plugin wiring consumes the same configured catalog as
         // roles, spawn_role, completion, and persistent role agents.
         let roles = ctx.roles.clone();
+        let branch_policies = self.branch_policies.clone();
 
         let start = {
-            let (repos, ctx, roles) = (repos.clone(), ctx.clone(), roles.clone());
+            let (repos, ctx, roles, branch_policies) = (
+                repos.clone(),
+                ctx.clone(),
+                roles.clone(),
+                branch_policies.clone(),
+            );
             ToolBuilder::new("start_issue")
                 .description(
                     "Begin work on a GitHub issue: ensure the system's own \
@@ -3199,8 +3328,18 @@ to do, on purpose."
                 )
                 .non_destructive()
                 .extractor_handler(
-                    (repos.clone(), ctx.clone(), roles.clone()),
-                    move |State((repos, ctx, roles)): State<(Repos, PluginContext, Roles)>,
+                    (
+                        repos.clone(),
+                        ctx.clone(),
+                        roles.clone(),
+                        branch_policies.clone(),
+                    ),
+                    move |State((repos, ctx, roles, branch_policies)): State<(
+                        Repos,
+                        PluginContext,
+                        Roles,
+                        BranchPolicies,
+                    )>,
                           mcp: Context,
                           Json(args): Json<StartIssueArgs>| async move {
                         if !repos.allows(&args.repo) {
@@ -3240,6 +3379,7 @@ to do, on purpose."
                                 args.issue,
                                 args.base.as_deref(),
                                 &repos,
+                                branch_policies.for_repo(&args.repo),
                                 authorization.spawned_by.as_deref(),
                             )
                             .await
@@ -3434,7 +3574,12 @@ to do, on purpose."
                             return Ok(CallToolResult::error(format!("{error}{suffix}")));
                         }
                         let (worktree, branch) = match repos
-                            .add_worktree(&args.repo, &assignment.slug, &base)
+                            .add_worktree(
+                                &args.repo,
+                                &assignment.slug,
+                                &base,
+                                &assignment.branch,
+                            )
                             .await
                         {
                             Ok(pair) => pair,
@@ -3560,12 +3705,14 @@ to do, on purpose."
         let list = {
             let repos = repos.clone();
             let pool = ctx.pool.clone();
+            let branch_policies = branch_policies.clone();
             ToolBuilder::new("worktrees")
                 .description("Durable repository assignments and worktrees the system holds.")
                 .read_only()
                 .no_params_handler(move || {
                     let repos = repos.clone();
                     let pool = pool.clone();
+                    let branch_policies = branch_policies.clone();
                     async move {
                         let worktrees = match repos.worktrees() {
                             Ok(worktrees) => worktrees,
@@ -3582,6 +3729,8 @@ to do, on purpose."
                             .collect();
                         Ok(CallToolResult::json(json!({
                             "root": repos.root.display().to_string(),
+                            "default_branch_policy": DEFAULT_BRANCH_TEMPLATE,
+                            "branch_policies": branch_policies.configured_state(),
                             "worktrees": worktrees
                                 .iter()
                                 .map(|p| p.display().to_string())
@@ -3602,6 +3751,7 @@ to do, on purpose."
                                 "base": a.base,
                                 "base_head": a.base_head,
                                 "branch": a.branch,
+                                "branch_policy": a.branch_policy,
                                 "expected_head": a.expected_head,
                                 "pushed_head": a.pushed_head,
                                 "publication_state": a.publication_state.as_str(),
@@ -4045,7 +4195,7 @@ to do, on purpose."
             let ledger: Option<Ledger> = self.ctx.as_ref().map(|c| c.ledger.clone());
             let mut html = String::from(
                 "<table><tr><th>assignment</th><th>publication</th><th>cleanup</th>\
-                 <th>issue</th><th>agent</th><th>branch</th><th>pr</th>\
+                 <th>issue</th><th>agent</th><th>branch</th><th>policy</th><th>pr</th>\
                  <th>worktree</th><th>detail</th></tr>",
             );
             for a in &all {
@@ -4070,7 +4220,7 @@ to do, on purpose."
                 html.push_str(&format!(
                     "<tr><td>{state}</td><td>{publication}</td><td>{cleanup}</td>\
                      <td>{repo}#{issue}</td><td>{agent}</td>\
-                     <td class=\"mono\">{branch}</td><td>{pr}</td>\
+                     <td class=\"mono\">{branch}</td><td class=\"mono\">{policy}</td><td>{pr}</td>\
                      <td class=\"dim mono\">{wt}</td><td>{detail}</td></tr>",
                     state = ciacola_core::render::esc(a.state.as_str()),
                     publication = ciacola_core::render::esc(&match a.pr_state {
@@ -4083,6 +4233,7 @@ to do, on purpose."
                     issue = a.issue,
                     agent = agent,
                     branch = ciacola_core::render::esc(&a.branch),
+                    policy = ciacola_core::render::esc(&a.branch_policy),
                     pr = match (a.pr, a.pr_url.as_deref()) {
                         (Some(number), Some(url)) => format!(
                             "<a href=\"{}\">#{number}</a>",
@@ -4344,6 +4495,21 @@ mod tests {
         RepoWorkerPlugin {
             repos: Some(repos),
             ctx: Some(ctx),
+            branch_policies: BranchPolicies::default(),
+        }
+    }
+
+    fn configured_branch_plugin(
+        ctx: PluginContext,
+        repos: Repos,
+        template: &str,
+    ) -> RepoWorkerPlugin {
+        let allowed = vec!["local/repo".to_string()];
+        let configured = BTreeMap::from([("local/repo".to_string(), template.to_string())]);
+        RepoWorkerPlugin {
+            repos: Some(repos),
+            ctx: Some(ctx),
+            branch_policies: BranchPolicies::new(&allowed, configured).expect("branch policy"),
         }
     }
 
@@ -4543,6 +4709,34 @@ mod tests {
         (plugin(context(pool, ledger.clone()), repos), ledger)
     }
 
+    async fn memory_plugin_with_branch_template(
+        repos: Repos,
+        template: &str,
+    ) -> (RepoWorkerPlugin, Ledger) {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        sqlx::query(
+            "CREATE TABLE plugin_kv (
+                 plugin TEXT NOT NULL,
+                 key TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 updated_unix INTEGER NOT NULL,
+                 PRIMARY KEY (plugin, key))",
+        )
+        .execute(&pool)
+        .await
+        .expect("plugin store");
+        ciacola_core::plugin::apply_migrations(&pool, "repo-worker", MIGRATIONS)
+            .await
+            .expect("repo-worker migrations");
+        (
+            configured_branch_plugin(context(pool, ledger.clone()), repos, template),
+            ledger,
+        )
+    }
+
     struct AssignmentFixture<'a> {
         agent_id: &'a str,
         repo: &'a str,
@@ -4600,6 +4794,68 @@ mod tests {
             .await
             .expect("read assignment")
             .expect("assignment row")
+    }
+
+    #[test]
+    fn branch_policy_is_explicit_unique_and_repository_scoped() {
+        let config: RepoWorkerConfig = toml::from_str(
+            r#"
+repos = ["local/repo"]
+branch_templates = { "local/repo" = "fix/{slug}" }
+"#,
+        )
+        .expect("documented branch policy config");
+        let allowed = config.repos;
+        let policies =
+            BranchPolicies::new(&allowed, config.branch_templates).expect("configured policy");
+        assert_eq!(policies.for_repo("local/repo").as_str(), "fix/{slug}");
+        assert_eq!(
+            BranchPolicies::new(&allowed, BTreeMap::new())
+                .expect("default policy")
+                .for_repo("local/repo")
+                .as_str(),
+            DEFAULT_BRANCH_TEMPLATE
+        );
+
+        for template in ["fix/static", "fix/{slug}/{slug}", "fix/{issue}/{slug}"] {
+            assert!(
+                BranchPolicies::new(
+                    &allowed,
+                    BTreeMap::from([("local/repo".to_string(), template.to_string())]),
+                )
+                .is_err(),
+                "unsafe template must be rejected: {template}"
+            );
+        }
+        assert!(
+            BranchPolicies::new(
+                &allowed,
+                BTreeMap::from([("other/repo".to_string(), "fix/{slug}".to_string())]),
+            )
+            .expect_err("unknown repository")
+            .contains("not present")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_rendered_branch_is_refused_before_durable_or_git_mutation() {
+        let (tmp, repos) = local_repos("invalid-branch-policy").await;
+        let (plugin, ledger) =
+            memory_plugin_with_branch_template(repos.clone(), "fix/{slug}.lock").await;
+
+        let result = operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 77, "base": "main"}))
+            .await;
+        let rendered = serde_json::to_string(&result).expect("render refusal");
+
+        assert!(
+            rendered.contains("rendered invalid Git branch"),
+            "got: {rendered}"
+        );
+        assert!(plugin.assignments().await.expect("assignments").is_empty());
+        assert!(ledger.list_agents().await.expect("agents").is_empty());
+        assert!(repos.worktrees().expect("worktrees").is_empty());
+        std::fs::remove_dir_all(tmp).ok();
     }
 
     #[tokio::test]
@@ -4996,10 +5252,18 @@ mod tests {
             },
         )
         .await;
+        let policies = BranchPolicies::default();
         let (completed, _) = plugin
             .assignment_db()
             .expect("assignment db")
-            .reserve("local/repo", 2, Some("main"), &repos, None)
+            .reserve(
+                "local/repo",
+                2,
+                Some("main"),
+                &repos,
+                policies.for_repo("local/repo"),
+                None,
+            )
             .await
             .expect("completed reservation");
         std::fs::create_dir_all(&completed.worktree).expect("completed worktree");
@@ -5078,12 +5342,14 @@ mod tests {
         assert!(retained.base_head.is_none());
         assert!(retained.expected_head.is_none());
         assert!(retained.pr_state.is_none());
+        assert_eq!(retained.branch_policy, DEFAULT_BRANCH_TEMPLATE);
         let completed = rows
             .iter()
             .find(|row| row.assignment_id == "completed")
             .expect("completed row");
         assert_eq!(completed.publication_state, PublicationState::Unpublished);
         assert_eq!(completed.cleanup_state, CleanupState::Completed);
+        assert_eq!(completed.branch_policy, DEFAULT_BRANCH_TEMPLATE);
     }
 
     #[tokio::test]
@@ -5189,8 +5455,16 @@ mod tests {
             .begin_publication(&active.assignment_id, &approved)
             .await
             .expect("begin publication");
+        let policies = BranchPolicies::default();
         let (finishing, _) = assignments
-            .reserve("local/repo", 85, Some("main"), &repos, None)
+            .reserve(
+                "local/repo",
+                85,
+                Some("main"),
+                &repos,
+                policies.for_repo("local/repo"),
+                None,
+            )
             .await
             .expect("cleanup reservation");
         sqlx::query(
@@ -5259,7 +5533,7 @@ mod tests {
     #[tokio::test]
     async fn publication_pushes_the_approved_oid_and_records_one_pr_journey() {
         let (tmp, repos) = local_repos("publish-approved").await;
-        let (mut plugin, _ledger) = memory_plugin(repos).await;
+        let (mut plugin, _ledger) = memory_plugin_with_branch_template(repos, "fix/{slug}").await;
         let fake = FakeGh::new(&tmp);
         plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
         git(&tmp.join("origin"), &["branch", "develop"]).await;
@@ -5270,6 +5544,23 @@ mod tests {
         let started = serde_json::to_string(&started).expect("render start");
         assert!(started.contains("\"created\":true"), "got: {started}");
         let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        assert!(assignment.branch.starts_with("fix/"));
+        assert_eq!(assignment.branch_policy, "fix/{slug}");
+        assert_eq!(
+            git_output(
+                Path::new(&assignment.worktree),
+                &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            )
+            .await
+            .expect("worktree branch"),
+            assignment.branch
+        );
+        let state = operator_tool(&plugin, "worktrees").call(json!({})).await;
+        let state = serde_json::to_string(&state).expect("render worktree state");
+        assert!(state.contains("\"branch_policy\":\"fix/{slug}\""));
+        assert!(state.contains("\"local/repo\":\"fix/{slug}\""));
+        let board = plugin.board_section().await.expect("board section");
+        assert!(board.html.contains("fix/{slug}"));
         let worktree = Path::new(&assignment.worktree);
         let head = commit_change(worktree, "change", "published").await;
         git(
@@ -5339,6 +5630,49 @@ mod tests {
         let replay = serde_json::to_string(&replay).expect("render replay");
         assert!(replay.contains("\"created\":false"), "got: {replay}");
         assert_eq!(fake.log().matches("pr create").count(), 1);
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_deletes_the_exact_persisted_configured_branch() {
+        let (tmp, repos) = local_repos("configured-branch-cleanup").await;
+        let (mut plugin, _ledger) = memory_plugin_with_branch_template(repos, "fix/{slug}").await;
+        let fake = FakeGh::new(&tmp);
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary;
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 77, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        assert!(assignment.branch.starts_with("fix/"));
+        let head = commit_change(Path::new(&assignment.worktree), "change", "discarded").await;
+
+        let finished = operator_tool(&plugin, "finish_issue")
+            .call(json!({
+                "agent_id": assignment.agent_id,
+                "discard_head": head,
+            }))
+            .await;
+        let finished = serde_json::to_string(&finished).expect("render finish");
+        assert!(
+            finished.contains("\"state\":\"completed\""),
+            "got: {finished}"
+        );
+        assert!(!Path::new(&assignment.worktree).exists());
+        assert!(
+            !git_predicate(
+                Path::new(&assignment.bare_path),
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{}", assignment.branch),
+                ],
+            )
+            .await
+            .expect("inspect configured branch"),
+            "cleanup must delete the exact persisted configured branch"
+        );
         std::fs::remove_dir_all(tmp).ok();
     }
 
@@ -6232,7 +6566,12 @@ mod tests {
     async fn branch_cleanup_deletes_the_assignment_symref_not_its_target() {
         let (tmp, repos) = local_repos("cleanup-symref").await;
         let (worktree, branch) = repos
-            .add_worktree("local/repo", "cleanup-symref", "main")
+            .add_worktree(
+                "local/repo",
+                "cleanup-symref",
+                "main",
+                "agent/cleanup-symref",
+            )
             .await
             .expect("worktree");
         let bare = repos.bare("local/repo");
@@ -6290,7 +6629,7 @@ mod tests {
         let (tmp, repos) = local_repos("finish-running").await;
         let slug = "local-repo-42";
         let (worktree, branch) = repos
-            .add_worktree("local/repo", slug, "main")
+            .add_worktree("local/repo", slug, "main", &format!("agent/{slug}"))
             .await
             .expect("worktree");
         let (plugin, ledger) = memory_plugin(repos).await;
@@ -6597,7 +6936,13 @@ mod tests {
         let url = format!("file://{}", origin.display());
 
         let (worktree, _) = repos
-            .add_worktree_from("local/repo", "local-repo-1", "main", &url)
+            .add_worktree_from(
+                "local/repo",
+                "local-repo-1",
+                "main",
+                "agent/local-repo-1",
+                &url,
+            )
             .await
             .expect("the first add must not require a retry");
         let got = String::from_utf8_lossy(
@@ -6655,7 +7000,13 @@ mod tests {
 
         // One unit of work in flight, exactly as a batch has.
         let (_wt, branch) = repos
-            .add_worktree_from("local/repo", "local-repo-1", "main", &url)
+            .add_worktree_from(
+                "local/repo",
+                "local-repo-1",
+                "main",
+                "agent/local-repo-1",
+                &url,
+            )
             .await
             .expect("worktree");
 
@@ -6717,7 +7068,13 @@ mod tests {
             .expect("clone");
         let url = format!("file://{}", origin.display());
         repos
-            .add_worktree_from("local/repo", "local-repo-1", "main", &url)
+            .add_worktree_from(
+                "local/repo",
+                "local-repo-1",
+                "main",
+                "agent/local-repo-1",
+                &url,
+            )
             .await
             .expect("worktree");
 
