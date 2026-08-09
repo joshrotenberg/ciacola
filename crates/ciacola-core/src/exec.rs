@@ -23,6 +23,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(test)]
+use tokio::sync::Notify;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 use tower_mcp::LogLevel;
@@ -52,6 +54,82 @@ pub trait TurnExecutor: Send + Sync {
     /// minute agent run is simply lost.
     fn drain(&self, _grace: Duration) -> crate::plugin::BoxFut<'_, usize> {
         Box::pin(async { 0 })
+    }
+}
+
+/// A one-way startup boundary shared by an executor and its owner.
+///
+/// A closed gate is sticky: executor workers can be constructed and accept
+/// durable submissions, but they do not inspect or claim those submissions
+/// until [`open`](Self::open) is called. Opening is idempotent and permanent,
+/// which makes a clone safe to hand to exactly one startup coordinator while
+/// the worker retains another clone.
+#[derive(Clone, Debug)]
+pub struct DispatchReadiness {
+    ready: CancellationToken,
+    #[cfg(test)]
+    worker_waiting: Arc<AtomicBool>,
+    #[cfg(test)]
+    worker_waiting_notify: Arc<Notify>,
+}
+
+impl DispatchReadiness {
+    pub fn closed() -> Self {
+        Self {
+            ready: CancellationToken::new(),
+            #[cfg(test)]
+            worker_waiting: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            worker_waiting_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn open(&self) {
+        self.ready.cancel();
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.ready.is_cancelled()
+    }
+
+    pub(crate) async fn wait(&self) {
+        #[cfg(test)]
+        {
+            self.worker_waiting.store(true, Ordering::SeqCst);
+            self.worker_waiting_notify.notify_one();
+        }
+        self.ready.cancelled().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_until_worker_is_parked(&self) {
+        loop {
+            let notified = self.worker_waiting_notify.notified();
+            if self.worker_waiting.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// A dispatch is in flight from the moment it owns a concurrency permit, not
+/// only after it has claimed the ledger row. Reserving before consulting
+/// `stopping` makes drain and dispatch form a closed race: either drain sees
+/// this guard, or this guard sees drain and refuses the claim.
+pub(crate) struct InflightGuard(Arc<AtomicUsize>);
+
+impl InflightGuard {
+    pub(crate) fn after_permit(stopping: &AtomicBool, inflight: Arc<AtomicUsize>) -> Option<Self> {
+        let guard = Self(inflight);
+        guard.0.fetch_add(1, Ordering::SeqCst);
+        (!stopping.load(Ordering::SeqCst)).then_some(guard)
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -582,6 +660,19 @@ pub struct HandExecutor {
 
 impl HandExecutor {
     pub fn start(ledger: Ledger, notify: Notifier, concurrency: usize) -> Arc<Self> {
+        let readiness = DispatchReadiness::closed();
+        readiness.open();
+        Self::start_gated(ledger, notify, concurrency, readiness)
+    }
+
+    /// Construct a dispatcher that accepts submissions immediately but cannot
+    /// claim them until `readiness` opens.
+    pub fn start_gated(
+        ledger: Ledger,
+        notify: Notifier,
+        concurrency: usize,
+        readiness: DispatchReadiness,
+    ) -> Arc<Self> {
         let (tx, mut rx) = mpsc::unbounded_channel::<(String, i64)>();
         let kills: Kills = Arc::new(Mutex::new(HashMap::new()));
         let stopping = Arc::new(AtomicBool::new(false));
@@ -594,6 +685,14 @@ impl HandExecutor {
         });
 
         tokio::spawn(async move {
+            // Wait before consuming the channel, so submissions made during
+            // startup remain buffered without spawning one waiting task per
+            // turn. A drain that wins while readiness is closed leaves every
+            // durable row queued even if a caller later opens the gate.
+            readiness.wait().await;
+            if stopping.load(Ordering::SeqCst) {
+                return;
+            }
             let limit = Arc::new(Semaphore::new(concurrency));
             while let Some((agent_id, seq)) = rx.recv().await {
                 // The permit is acquired inside the task, so the
@@ -609,13 +708,13 @@ impl HandExecutor {
                     let Ok(_permit) = limit.acquire_owned().await else {
                         return;
                     };
-                    // Checked after the permit, not before: a turn that
-                    // waited behind a full pool while shutdown began
-                    // should stay queued for the next boot rather than
-                    // start a paid run nobody will collect.
-                    if stopping.load(Ordering::SeqCst) {
+                    // Reserve before re-checking shutdown. Drain therefore
+                    // either sees this pending claim or wins first and makes
+                    // the guard refuse it.
+                    let Some(_inflight) = InflightGuard::after_permit(&stopping, inflight.clone())
+                    else {
                         return;
-                    }
+                    };
                     // Claim before registering the kill token: only the
                     // winning delivery owns the kill entry.
                     match ledger.claim_turn(&agent_id, seq).await {
@@ -626,9 +725,7 @@ impl HandExecutor {
                             return;
                         }
                     }
-                    inflight.fetch_add(1, Ordering::SeqCst);
                     run_claimed_turn_cancellable(&ledger, &notify, kills, &agent_id, seq).await;
-                    inflight.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         });
@@ -852,6 +949,99 @@ mod config_injection_tests {
         fn owns_process(&self, _ps_line: &str) -> bool {
             false
         }
+    }
+
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ciacola_agent::Provider for CountingProvider {
+        fn key(&self) -> ciacola_agent::ProviderKey {
+            ciacola_agent::ProviderKey::new("counting")
+        }
+
+        fn capabilities(&self) -> ciacola_agent::Capabilities {
+            let mut capabilities =
+                ciacola_agent::Capabilities::none(ciacola_agent::ProviderKey::new("counting"));
+            capabilities.client_assigned_resume = true;
+            capabilities.allowed_tools = true;
+            capabilities.reports_cost = true;
+            capabilities.reports_token_usage = true;
+            capabilities.reports_provider_turns = true;
+            capabilities
+        }
+
+        fn run<'a>(
+            &'a self,
+            _intent: &'a ciacola_agent::TurnIntent,
+            _events: &'a dyn ciacola_agent::TurnEvents,
+        ) -> ciacola_agent::BoxFut<'a, Result<ciacola_agent::TurnOutcome, ciacola_agent::AgentError>>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(ciacola_agent::TurnOutcome {
+                    reply: "counted".to_string(),
+                    resume: None,
+                    cost: ciacola_agent::Cost::Reported { micro_usd: 0 },
+                    usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage::default()),
+                    provider_turns: Some(1),
+                    elapsed: Duration::from_millis(1),
+                    metadata: Default::default(),
+                    failure: None,
+                })
+            })
+        }
+
+        fn owns_process(&self, _ps_line: &str) -> bool {
+            false
+        }
+    }
+
+    async fn queued_counting_turn() -> (Ledger, String, i64, Notifier, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let providers = ciacola_agent::ProviderRegistry::new()
+            .with(Arc::new(CountingProvider {
+                calls: calls.clone(),
+            }))
+            .expect("provider");
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let ledger = Ledger::setup(pool)
+            .await
+            .expect("ledger")
+            .with_providers(providers);
+        let agent_id = ledger
+            .create_agent(
+                &crate::agent::AgentDef::new("readiness", "system").provider("counting"),
+                None,
+            )
+            .await
+            .expect("agent");
+        let seq = ledger
+            .enqueue_turn(&agent_id, "wait for readiness")
+            .await
+            .expect("turn");
+        let (tx, _rx) = tower_mcp::context::notification_channel(8);
+        (ledger, agent_id, seq, Notifier(tx), calls)
+    }
+
+    async fn wait_for_state(ledger: &Ledger, agent_id: &str, seq: i64, expected: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let turn = ledger
+                    .get_turn(agent_id, seq)
+                    .await
+                    .expect("turn query")
+                    .expect("turn");
+                if turn.state == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("turn never reached {expected}"));
     }
 
     fn endpoint<'a>(
@@ -1389,6 +1579,80 @@ mod config_injection_tests {
         assert_eq!(turn.cost_state, "unreported");
         assert_eq!(turn.reported_cost_micro_usd(), None);
         assert_eq!(executor.drain(Duration::from_secs(2)).await, 0);
+    }
+
+    #[tokio::test]
+    async fn hand_executor_buffers_duplicate_submissions_until_readiness_opens() {
+        let (ledger, agent_id, seq, notify, calls) = queued_counting_turn().await;
+        let readiness = DispatchReadiness::closed();
+        let executor = HandExecutor::start_gated(ledger.clone(), notify, 1, readiness.clone());
+
+        executor.submit(agent_id.clone(), seq);
+        executor.submit(agent_id.clone(), seq);
+        readiness.wait_until_worker_is_parked().await;
+
+        let turn = ledger
+            .get_turn(&agent_id, seq)
+            .await
+            .expect("turn query")
+            .expect("turn");
+        assert_eq!(turn.state, "queued");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!readiness.is_open());
+
+        readiness.open();
+        readiness.open();
+        assert!(readiness.is_open());
+        wait_for_state(&ledger, &agent_id, seq, "ok").await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.drain(Duration::from_secs(1)).await, 0);
+    }
+
+    #[tokio::test]
+    async fn draining_a_closed_hand_executor_prevents_a_later_open_from_claiming() {
+        let (ledger, agent_id, seq, notify, calls) = queued_counting_turn().await;
+        let readiness = DispatchReadiness::closed();
+        let executor = HandExecutor::start_gated(ledger.clone(), notify, 1, readiness.clone());
+        executor.submit(agent_id.clone(), seq);
+        readiness.wait_until_worker_is_parked().await;
+
+        assert_eq!(executor.drain(Duration::ZERO).await, 0);
+        readiness.open();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !executor.tx.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hand dispatcher did not stop after readiness opened");
+
+        let turn = ledger
+            .get_turn(&agent_id, seq)
+            .await
+            .expect("turn query")
+            .expect("turn");
+        assert_eq!(turn.state, "queued");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn hand_drain_observes_a_dispatch_reserved_before_claim() {
+        let stopping = Arc::new(AtomicBool::new(false));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let reservation = InflightGuard::after_permit(&stopping, inflight.clone())
+            .expect("dispatch reserved before claim");
+        let (tx, _rx) = mpsc::unbounded_channel::<(String, i64)>();
+        let executor = HandExecutor {
+            tx,
+            kills: Arc::new(Mutex::new(HashMap::new())),
+            stopping,
+            inflight: inflight.clone(),
+        };
+
+        assert_eq!(executor.drain(Duration::ZERO).await, 1);
+        drop(reservation);
+        assert_eq!(inflight.load(Ordering::SeqCst), 0);
     }
 
     /// The base names the surface and is shared; the token is secret

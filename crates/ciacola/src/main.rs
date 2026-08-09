@@ -34,7 +34,8 @@ use ciacola_core::health::{
 use ciacola_core::plugin::{Plugin, PluginContext, PluginHost, Surface};
 use ciacola_core::roles::RolesPlugin;
 use ciacola_core::{
-    HandExecutor, Ledger, Notifier, PollingExecutor, TurnExecutor, recover, server,
+    DispatchReadiness, HandExecutor, Ledger, Notifier, PollingExecutor, TurnExecutor, recover,
+    server,
 };
 use ciacola_findings::FindingsPlugin;
 use ciacola_git::GitPlugin;
@@ -293,37 +294,40 @@ async fn run(
         .with_runtime(declared_early.runtime.clone())?
         .with_providers(providers);
 
-    // Publish the internal endpoint before any executor or recovery worker can
-    // claim a turn and read it. The HTTP listener readiness gap is handled as
-    // a separate runtime-ordering issue; stale or redirected config is not.
+    // Publish the internal endpoint before constructing roles that carry it.
+    // This describes where the service will be; the closed dispatch boundary
+    // below is what prevents a provider from mistaking publication for HTTP
+    // readiness.
     let mcp_config_path = write_loopback_configs(&std::env::temp_dir(), port)?;
 
     let (tx, rx) = notification_channel(64);
     let notify = Notifier(tx);
+    let dispatch = DispatchReadiness::closed();
     // Two executors, one trait, and nothing above this line can tell
     // them apart. The polling one rereads the ledger, so a turn queued
     // before a crash is picked up on the next tick without help; the
-    // channel one is a little quicker off the mark. Default to durable.
+    // channel one is a little quicker off the mark. Both are constructed
+    // now for plugin dependency injection, but the shared boundary keeps
+    // them from claiming anything until the complete loopback router is
+    // listening and recovery has reconciled the durable ledger.
     let exec: std::sync::Arc<dyn TurnExecutor> =
         if std::env::var("CIACOLA_EXECUTOR").as_deref() == Ok("channel") {
-            HandExecutor::start(ledger.clone(), notify.clone(), concurrency)
+            HandExecutor::start_gated(
+                ledger.clone(),
+                notify.clone(),
+                concurrency,
+                dispatch.clone(),
+            )
         } else {
-            PollingExecutor::start(
+            PollingExecutor::start_gated(
                 ledger.clone(),
                 notify.clone(),
                 concurrency,
                 std::time::Duration::from_secs(2),
+                dispatch.clone(),
             )
         };
     let drain_exec = exec.clone();
-
-    if std::env::var("CIACOLA_NO_RECOVER").is_err() {
-        let report = recover::recover(&ledger, exec.as_ref()).await?;
-        eprintln!(
-            "[ciacola] recovery: {} resubmitted, {} orphaned, {} orphan processes killed, {} unverified",
-            report.resubmitted, report.orphaned, report.orphans_killed, report.orphans_unverified
-        );
-    }
 
     let declared = declared_early;
     declared.runtime.check_provider_homes();
@@ -459,7 +463,7 @@ async fn run(
     // one cannot be reused here.
     let mut operator_router = server::router_interactive_with_limits(
         ledger.clone(),
-        exec,
+        exec.clone(),
         notify,
         true,
         declared.limits.clone(),
@@ -508,12 +512,12 @@ async fn run(
         // The board is optional by construction: nothing in core knows
         // about it, so leaving it out is leaving out a merge.
         .merge(ciacola_board::router_with_limits(
-            ledger,
+            ledger.clone(),
             host,
             declared.limits,
             shutdown.clone(),
         ));
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    let listener = bind_loopback_before_dispatch(port, &dispatch).await?;
     let http_shutdown = shutdown.clone();
     let http_handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, http)
@@ -527,6 +531,21 @@ async fn run(
         "[ciacola] board at http://127.0.0.1:{port}/board, agents' tools at /mcp, \
          authenticated human operators at /mcp-operator"
     );
+
+    // The bound listener can now accept and queue loopback connections, but
+    // dispatch remains closed while recovery adjudicates pre-crash `running`
+    // rows and resubmits `queued` rows. Opening first would let the polling
+    // executor claim a queued turn while recovery is scanning `running`, and
+    // recovery could then mistake this process's live work for an orphan.
+    if std::env::var("CIACOLA_NO_RECOVER").is_err() {
+        let report = recover::recover(&ledger, exec.as_ref()).await?;
+        eprintln!(
+            "[ciacola] recovery: {} resubmitted, {} orphaned, {} orphan processes killed, {} unverified",
+            report.resubmitted, report.orphaned, report.orphans_killed, report.orphans_unverified
+        );
+    }
+    dispatch.open();
+    eprintln!("[ciacola] dispatch: ready ({})", exec.name());
 
     // Ctrl-C drains rather than kills. Without this, a signal ends a
     // twenty minute agent run mid-flight: recovery tidies up on the
@@ -570,6 +589,21 @@ async fn run(
         }
     }
     Ok(())
+}
+
+/// Bind the complete loopback surface while paid work is still unable to
+/// claim. Keeping the assertion beside the bind makes a future startup
+/// reorder fail closed instead of silently restoring the publication gap.
+async fn bind_loopback_before_dispatch(
+    port: u16,
+    dispatch: &DispatchReadiness,
+) -> std::io::Result<tokio::net::TcpListener> {
+    if dispatch.is_open() {
+        return Err(std::io::Error::other(
+            "dispatch readiness opened before the loopback listener was bound",
+        ));
+    }
+    tokio::net::TcpListener::bind(("127.0.0.1", port)).await
 }
 
 #[cfg(test)]
@@ -620,6 +654,22 @@ mod tests {
 
         assert_eq!(database.path, Path::new("/tmp/ciacola.db"));
         assert!(database.temporary_fallback);
+    }
+
+    #[tokio::test]
+    async fn an_occupied_loopback_port_leaves_dispatch_closed() {
+        let occupied = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("occupy a loopback port");
+        let port = occupied.local_addr().expect("occupied address").port();
+        let dispatch = DispatchReadiness::closed();
+
+        let error = bind_loopback_before_dispatch(port, &dispatch)
+            .await
+            .expect_err("a second listener must not bind the occupied port");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(!dispatch.is_open());
     }
 
     #[test]
