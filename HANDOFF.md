@@ -130,10 +130,16 @@ The opening replied `OPEN_ENV_CLEAN` in 10.538 seconds (32,099 input / 411
 output / 22,016 cached), and the resume replied `RESUME_ENV_CLEAN` in 9.191
 seconds (65,113 input / 697 output / 54,272 cached). Both retained provider
 session `019fe739-1c14-7af2-8014-8e74f52088ad`, and the model-launched shell
-observed the baseline `HOME`/`PATH` but none of the conflicting names. Claude's
-equivalent paid proof remains pending because the available Claude home reports
-`loggedIn: false`; deterministic fake opening/resume and the whole-binary Codex
-descriptor path are covered in-tree.
+observed the baseline `HOME`/`PATH` but none of the conflicting names.
+
+The equivalent paid Claude 2.1.220 proof is also green. With conflicting
+ambient Anthropic, Claude, OpenAI, Ciacola, and unrelated sentinel credentials,
+the opening replied `OPEN_ENV_CLEAN` and the resume replied
+`RESUME_ENV_CLEAN`. Both retained the same nonempty provider session; the
+model-launched shell saw `HOME`/`PATH` and none of the conflicting names.
+Deterministic fake opening/resume and the whole-binary Codex descriptor path
+remain covered in-tree. Credential values and run-specific accounting are not
+retained in this public handoff.
 
 ## Layout, and where the line falls
 
@@ -248,14 +254,14 @@ trust boundary.
    and nothing here changes.
 ## What to do next, roughly in order
 
-**Finish provider child isolation (#80), then design delegated supervision
-(#81).** The deterministic environment, FD-ingress, opening, resume, and whole
-binary paths are now covered, and the paid Codex proof above is green. Close
-#80 only after the equivalent authenticated Claude opening/resume proof. Then
-move to #81's ADR and threat model before restoring any provider-backed
-operator role: delegated authority needs a real process provenance boundary,
-attenuation, revocation, and sibling-steal tests rather than another bearer in
-the shared OS-user boundary.
+**Land provider child isolation (#80), then choose the delegated-supervision
+backend (#81).** The deterministic environment, FD-ingress, opening, resume,
+and whole-binary paths are covered, and both paid provider proofs above are
+green. Merge #91 and close #80. The #81 ADR and fail-closed policy seam are in
+draft #92; do not restore any provider-backed operator role until a human picks
+an isolation backend and adversarial dogfood proves process provenance,
+attenuation, revocation, and sibling-steal resistance rather than another
+bearer in the shared OS-user boundary.
 
 **Continue dogfooding the Codex provider.** The adapter is now a separate crate behind
 the same registry as Claude. It preserves Codex thread ids as soon as the
