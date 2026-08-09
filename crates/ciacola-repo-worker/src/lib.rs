@@ -25,9 +25,10 @@
 //! ```
 //!
 //! External writes are gated: `open_pr` is the only tool that can
-//! affect the outside world, and it is idempotent by construction (it
-//! looks for a pull request from the branch before creating one) because
-//! a resent or redelivered turn must not open a second one.
+//! affect the outside world. It durably pins an exact commit, publishes
+//! that object rather than a mutable branch tip, and reconciles existing
+//! pull-request state before creating anything. A resent or redelivered
+//! turn must neither publish a different commit nor open a second PR.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -53,9 +54,10 @@ const ROLE: &str = "issue-implementer";
 const MANAGER: &str = "repo-manager";
 
 const ASSIGNMENTS_TABLE: &str = "repo_worker_assignments";
-const MIGRATIONS: &[Migration] = &[Migration::new(
-    "0001_assignments",
-    "CREATE TABLE IF NOT EXISTS repo_worker_assignments (
+const MIGRATIONS: &[Migration] = &[
+    Migration::new(
+        "0001_assignments",
+        "CREATE TABLE IF NOT EXISTS repo_worker_assignments (
          assignment_id TEXT PRIMARY KEY,
          repo TEXT NOT NULL COLLATE NOCASE,
          issue_number INTEGER NOT NULL,
@@ -82,7 +84,84 @@ const MIGRATIONS: &[Migration] = &[Migration::new(
      CREATE UNIQUE INDEX IF NOT EXISTS repo_worker_owned_branch
          ON repo_worker_assignments(repo, branch)
          WHERE state IN ('preparing', 'active', 'finishing', 'retained');",
-)];
+    ),
+    Migration::add_column(
+        "0002_base_head",
+        "ALTER TABLE repo_worker_assignments ADD COLUMN base_head TEXT",
+    ),
+    Migration::add_column(
+        "0003_expected_head",
+        "ALTER TABLE repo_worker_assignments ADD COLUMN expected_head TEXT",
+    ),
+    Migration::add_column(
+        "0004_publication_state",
+        "ALTER TABLE repo_worker_assignments ADD COLUMN publication_state TEXT NOT NULL
+             DEFAULT 'unpublished' CHECK (
+                 publication_state IN ('unpublished', 'publishing', 'published', 'failed'))",
+    ),
+    Migration::add_column(
+        "0005_pr_url",
+        "ALTER TABLE repo_worker_assignments ADD COLUMN pr_url TEXT",
+    ),
+    Migration::add_column(
+        "0006_pr_state",
+        "ALTER TABLE repo_worker_assignments ADD COLUMN pr_state TEXT CHECK (
+             pr_state IS NULL OR pr_state IN ('open', 'closed', 'merged'))",
+    ),
+    Migration::add_column(
+        "0007_pr_draft",
+        "ALTER TABLE repo_worker_assignments ADD COLUMN pr_draft INTEGER CHECK (
+             pr_draft IS NULL OR pr_draft IN (0, 1))",
+    ),
+    Migration::add_column(
+        "0008_pr_head",
+        "ALTER TABLE repo_worker_assignments ADD COLUMN pr_head TEXT",
+    ),
+    Migration::add_column(
+        "0009_pr_base",
+        "ALTER TABLE repo_worker_assignments ADD COLUMN pr_base TEXT",
+    ),
+    Migration::add_column(
+        "0010_pr_checked_unix",
+        "ALTER TABLE repo_worker_assignments ADD COLUMN pr_checked_unix INTEGER",
+    ),
+    Migration::add_column(
+        "0011_cleanup_state",
+        "ALTER TABLE repo_worker_assignments ADD COLUMN cleanup_state TEXT NOT NULL
+             DEFAULT 'none' CHECK (
+                 cleanup_state IN ('none', 'retaining', 'retained', 'removing', 'completed', 'failed'))",
+    ),
+    Migration::add_column(
+        "0012_cleanup_head",
+        "ALTER TABLE repo_worker_assignments ADD COLUMN cleanup_head TEXT",
+    ),
+    Migration::add_column(
+        "0013_cleanup_reason",
+        "ALTER TABLE repo_worker_assignments ADD COLUMN cleanup_reason TEXT CHECK (
+             cleanup_reason IS NULL OR cleanup_reason IN ('absent', 'no_changes', 'merged', 'discarded'))",
+    ),
+    Migration::add_column(
+        "0014_pushed_head",
+        "ALTER TABLE repo_worker_assignments ADD COLUMN pushed_head TEXT",
+    ),
+    Migration::new(
+        "0015_journey_backfill",
+        "UPDATE repo_worker_assignments
+            SET publication_state = 'published'
+          WHERE pr IS NOT NULL;
+         UPDATE repo_worker_assignments
+            SET cleanup_state = CASE state
+                WHEN 'finishing' THEN CASE
+                    WHEN phase = 'finishing_keep' THEN 'retaining'
+                    ELSE 'removing'
+                END
+                WHEN 'retained' THEN 'retained'
+                WHEN 'completed' THEN 'completed'
+                WHEN 'stale' THEN 'failed'
+                ELSE 'none'
+            END",
+    ),
+];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -141,8 +220,11 @@ fn repo_storage_key(repo: &str) -> String {
 }
 
 fn github_origin_matches(repo: &str, origin: &str) -> bool {
-    let repo = repo.trim_end_matches(".git").to_ascii_lowercase();
-    let origin = origin.trim_end_matches(".git").to_ascii_lowercase();
+    let repo = repo.to_ascii_lowercase();
+    let origin = origin.to_ascii_lowercase();
+    // A transport URL normally has one optional `.git` suffix. The configured
+    // GitHub repository name is data, though, and may itself end in `.git`.
+    let origin = origin.strip_suffix(".git").unwrap_or(&origin);
     origin == format!("https://github.com/{repo}")
         || origin == format!("git@github.com:{repo}")
         || origin == format!("ssh://git@github.com/{repo}")
@@ -179,8 +261,8 @@ fn conventional_title(title: &str) -> bool {
     TYPES.contains(&ty)
 }
 
-async fn gh(dir: Option<&Path>, args: &[&str]) -> Result<String, FlatError> {
-    let mut command = tokio::process::Command::new("gh");
+async fn gh(binary: &Path, dir: Option<&Path>, args: &[&str]) -> Result<String, FlatError> {
+    let mut command = tokio::process::Command::new(binary);
     command.args(args).kill_on_drop(true);
     if let Some(dir) = dir {
         command.current_dir(dir);
@@ -195,6 +277,10 @@ async fn gh(dir: Option<&Path>, args: &[&str]) -> Result<String, FlatError> {
         .into());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn github_repo(repo: &str) -> String {
+    format!("github.com/{repo}")
 }
 
 async fn git_output(dir: &Path, args: &[&str]) -> Result<String, FlatError> {
@@ -215,10 +301,135 @@ async fn git_output(dir: &Path, args: &[&str]) -> Result<String, FlatError> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+async fn git_predicate(dir: &Path, args: &[&str]) -> Result<bool, FlatError> {
+    let out = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into()),
+    }
+}
+
+async fn worktree_is_clean(dir: &Path) -> Result<bool, FlatError> {
+    let out = tokio::process::Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ])
+        .current_dir(dir)
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(format!(
+            "git status: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
+    }
+    Ok(out.stdout.is_empty())
+}
+
+async fn stable_publication_url(dir: &Path, url: &str) -> Result<(), FlatError> {
+    let probe = format!(
+        "ciacola-publication-{}",
+        ulid::Ulid::new().to_string().to_ascii_lowercase()
+    );
+    let config = format!("remote.{probe}.url={url}");
+    // `remote get-url <name>` ignores remotes supplied only through `-c`, but
+    // `remote -v` includes and fully expands them in both fetch and push
+    // contexts. This second resolution catches chained insteadOf /
+    // pushInsteadOf rules before the snapshotted URL reaches `git push`.
+    let remotes = git_output(dir, &["-c", &config, "remote", "-v"]).await?;
+    let prefix = format!("{probe}\t");
+    let mut fetch = Vec::new();
+    let mut push = Vec::new();
+    for line in remotes.lines() {
+        let Some(value) = line.strip_prefix(&prefix) else {
+            continue;
+        };
+        if let Some(value) = value.strip_suffix(" (fetch)") {
+            fetch.push(value);
+        } else if let Some(value) = value.strip_suffix(" (push)") {
+            push.push(value);
+        }
+    }
+    if fetch.as_slice() != [url] || push.as_slice() != [url] {
+        return Err(format!(
+            "publication URL '{url}' is rewritten to fetch '{}' / push '{}'; refusing an unstable remote target",
+            fetch.join(", "),
+            push.join(", "),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeSnapshot {
+    head: String,
+    base_head: String,
+    push_url: String,
+    commits_ahead: u64,
+    has_material_delta: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPr {
+    number: u64,
+    url: String,
+    state: String,
+    is_draft: bool,
+    head_ref_name: String,
+    head_ref_oid: String,
+    base_ref_name: String,
+    #[serde(default)]
+    is_cross_repository: bool,
+    #[serde(default)]
+    merged_at: Option<String>,
+}
+
+impl GhPr {
+    fn parsed_state(&self) -> Result<PrState, FlatError> {
+        if self.merged_at.is_some() || self.state.eq_ignore_ascii_case("merged") {
+            return Ok(PrState::Merged);
+        }
+        if self.state.eq_ignore_ascii_case("open") {
+            Ok(PrState::Open)
+        } else if self.state.eq_ignore_ascii_case("closed") {
+            Ok(PrState::Closed)
+        } else {
+            Err(format!(
+                "pull request #{} has unknown state '{}'",
+                self.number, self.state
+            )
+            .into())
+        }
+    }
+}
+
+const GH_PR_FIELDS: &str =
+    "number,url,state,isDraft,headRefName,headRefOid,baseRefName,isCrossRepository,mergedAt";
+
 #[derive(Clone)]
 struct Repos {
     root: PathBuf,
     allowed: Arc<Vec<String>>,
+    gh_binary: PathBuf,
     /// Held across every mutation of a bare repository: clone, fetch,
     /// worktree add/remove, and local branch cleanup. Assignment ownership
     /// is durable in SQLite; this lock prevents unrelated assignments from
@@ -394,6 +605,228 @@ impl Repos {
         Ok(())
     }
 
+    async fn inspect_assignment_worktree(
+        &self,
+        assignment: &Assignment,
+    ) -> Result<WorktreeSnapshot, FlatError> {
+        let worktree = Path::new(&assignment.worktree);
+        let bare = Path::new(&assignment.bare_path);
+        self.validate_worktree_at(worktree, &assignment.branch, bare)
+            .await?;
+        let Some(base) = assignment.base.as_deref() else {
+            return Err("assignment has no durable base branch".into());
+        };
+        let Some(base_head) = assignment.base_head.as_deref() else {
+            return Err(
+                "assignment predates durable base-head tracking; retain it and inspect manually"
+                    .into(),
+            );
+        };
+        let origin = git_output(worktree, &["remote", "get-url", "origin"]).await?;
+        #[cfg(test)]
+        let origin_matches = github_origin_matches(&assignment.repo, &origin)
+            || git_output(worktree, &["config", "--get", "remote.origin.url"])
+                .await
+                .is_ok_and(|configured| github_origin_matches(&assignment.repo, &configured));
+        #[cfg(not(test))]
+        let origin_matches = github_origin_matches(&assignment.repo, &origin);
+        if !origin_matches {
+            return Err(format!(
+                "assigned worktree origin is '{origin}', expected GitHub repository '{}'",
+                assignment.repo
+            )
+            .into());
+        }
+        let resolved_push_origins = git_output(
+            worktree,
+            &["remote", "get-url", "--push", "--all", "origin"],
+        )
+        .await?;
+        #[cfg(test)]
+        let configured_push_origins =
+            match git_output(worktree, &["config", "--get-all", "remote.origin.pushurl"]).await {
+                Ok(configured) if !configured.is_empty() => configured,
+                _ => git_output(worktree, &["config", "--get-all", "remote.origin.url"]).await?,
+            };
+        let resolved_push_origins: Vec<&str> = resolved_push_origins
+            .lines()
+            .filter(|url| !url.trim().is_empty())
+            .collect();
+        #[cfg(not(test))]
+        let identity_push_origins = resolved_push_origins.clone();
+        #[cfg(test)]
+        let identity_push_origins: Vec<&str> = {
+            let configured: Vec<&str> = configured_push_origins
+                .lines()
+                .filter(|url| !url.trim().is_empty())
+                .collect();
+            if configured.len() == 1 && github_origin_matches(&assignment.repo, configured[0]) {
+                configured
+            } else {
+                resolved_push_origins.clone()
+            }
+        };
+        if resolved_push_origins.len() != 1
+            || identity_push_origins.len() != 1
+            || !github_origin_matches(&assignment.repo, identity_push_origins[0])
+        {
+            return Err(format!(
+                "assigned worktree push URLs are '{}', expected only GitHub repository '{}'",
+                identity_push_origins.join(", "),
+                assignment.repo,
+            )
+            .into());
+        }
+        let push_url = resolved_push_origins[0].to_string();
+        stable_publication_url(worktree, &push_url).await?;
+        if !git_predicate(bare, &["check-ref-format", "--branch", base]).await? {
+            return Err(format!("assignment base '{base}' is not a valid branch name").into());
+        }
+        if !git_predicate(bare, &["check-ref-format", "--branch", &assignment.branch]).await? {
+            return Err(format!(
+                "assignment branch '{}' is not a valid branch name",
+                assignment.branch
+            )
+            .into());
+        }
+        let head = git_output(worktree, &["rev-parse", "--verify", "HEAD^{commit}"]).await?;
+        let branch_head = git_output(
+            worktree,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{}^{{commit}}", assignment.branch),
+            ],
+        )
+        .await?;
+        if branch_head != head {
+            return Err(format!(
+                "assigned branch '{}' points at {branch_head}, but worktree HEAD is {head}",
+                assignment.branch
+            )
+            .into());
+        }
+        let canonical_base = git_output(
+            worktree,
+            &["rev-parse", "--verify", &format!("{base_head}^{{commit}}")],
+        )
+        .await?;
+        if canonical_base != base_head {
+            return Err(format!(
+                "durable base head '{base_head}' is not a full canonical commit OID"
+            )
+            .into());
+        }
+        if !git_predicate(worktree, &["merge-base", "--is-ancestor", base_head, &head]).await? {
+            return Err(format!(
+                "assigned branch head {head} is not descended from durable base {base_head}"
+            )
+            .into());
+        }
+        let commits_ahead = git_output(
+            worktree,
+            &["rev-list", "--count", &format!("{base_head}..{head}")],
+        )
+        .await?
+        .parse::<u64>()?;
+        let has_material_delta =
+            !git_predicate(worktree, &["diff", "--quiet", base_head, &head, "--"]).await?;
+        Ok(WorktreeSnapshot {
+            head,
+            base_head: base_head.to_string(),
+            push_url,
+            commits_ahead,
+            has_material_delta,
+        })
+    }
+
+    async fn remote_branch_head(
+        &self,
+        assignment: &Assignment,
+        push_url: &str,
+    ) -> Result<Option<String>, FlatError> {
+        let output = git_output(
+            Path::new(&assignment.worktree),
+            &[
+                "ls-remote",
+                "--heads",
+                push_url,
+                &format!("refs/heads/{}", assignment.branch),
+            ],
+        )
+        .await?;
+        if output.is_empty() {
+            return Ok(None);
+        }
+        let mut lines = output.lines();
+        let head = lines
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            .ok_or("remote branch query returned malformed output")?
+            .to_string();
+        if lines.next().is_some() {
+            return Err("remote branch query returned more than one exact ref".into());
+        }
+        Ok(Some(head))
+    }
+
+    async fn local_branch_head(
+        &self,
+        assignment: &Assignment,
+    ) -> Result<Option<String>, FlatError> {
+        let bare = Path::new(&assignment.bare_path);
+        if !bare.exists() {
+            return Ok(None);
+        }
+        let reference = format!("refs/heads/{}", assignment.branch);
+        if !git_predicate(bare, &["show-ref", "--verify", "--quiet", &reference]).await? {
+            return Ok(None);
+        }
+        Ok(Some(
+            git_output(
+                bare,
+                &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+            )
+            .await?,
+        ))
+    }
+
+    async fn push_exact(
+        &self,
+        assignment: &Assignment,
+        expected_head: &str,
+        expected_remote: Option<&str>,
+        push_url: &str,
+    ) -> Result<(), FlatError> {
+        let reference = format!("refs/heads/{}", assignment.branch);
+        let lease = format!(
+            "--force-with-lease={reference}:{}",
+            expected_remote.unwrap_or_default()
+        );
+        let refspec = format!("{expected_head}:{reference}");
+        git_output(
+            Path::new(&assignment.worktree),
+            &[
+                "push",
+                "--no-follow-tags",
+                "--no-verify",
+                "--recurse-submodules=no",
+                &lease,
+                push_url,
+                &refspec,
+            ],
+        )
+        .await?;
+        match self.remote_branch_head(assignment, push_url).await? {
+            Some(remote) if remote == expected_head => Ok(()),
+            Some(remote) => Err(format!(
+                "remote branch moved to {remote} while publishing expected head {expected_head}"
+            )
+            .into()),
+            None => Err("push returned success but the remote branch is absent".into()),
+        }
+    }
+
     /// A directory and a branch for one unit of work.
     async fn add_worktree(
         &self,
@@ -440,9 +873,10 @@ impl Repos {
 
     async fn remove_worktree_at(
         &self,
-        slug: &str,
+        branch: &str,
         path: &Path,
         bare: &Path,
+        expected_head: Option<&str>,
     ) -> Result<(), FlatError> {
         let _guard = self.cloning.lock().await;
         if !path.exists() && !bare.exists() {
@@ -460,15 +894,13 @@ impl Repos {
         // absent worktree is success. The branch deletion below is
         // deliberately idempotent as well.
         if path.exists() {
-            let mut remove = WorktreeCommand::remove(path);
-            remove.force();
+            let remove = WorktreeCommand::remove(path);
             bare_repo(bare)
                 .worktree(remove)
                 .execute()
                 .await
                 .map_err(|e| -> FlatError { format!("worktree remove: {e}").into() })?;
         }
-        let branch = format!("agent/{slug}");
         let exists = tokio::process::Command::new("git")
             .args([
                 "show-ref",
@@ -481,13 +913,38 @@ impl Repos {
             .status()
             .await?;
         if exists.success() {
-            bare_repo(bare)
-                .branch()
-                .delete(&branch)
-                .force_delete()
-                .execute()
-                .await
-                .map_err(|e| -> FlatError { format!("branch delete {branch}: {e}").into() })?;
+            let expected_head = expected_head.ok_or_else(|| -> FlatError {
+                format!("refusing to delete local branch '{branch}' without an expected commit")
+                    .into()
+            })?;
+            git_output(
+                bare,
+                &[
+                    "update-ref",
+                    "--no-deref",
+                    "-d",
+                    &format!("refs/heads/{branch}"),
+                    expected_head,
+                ],
+            )
+            .await
+            .map_err(|e| -> FlatError { format!("branch delete {branch}: {e}").into() })?;
+            if git_predicate(
+                bare,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ],
+            )
+            .await?
+            {
+                return Err(format!(
+                    "local branch '{branch}' moved before compare-and-swap deletion"
+                )
+                .into());
+            }
         } else if exists.code() != Some(1) {
             return Err(format!("cannot inspect branch '{branch}' in '{}'", bare.display()).into());
         }
@@ -533,7 +990,14 @@ struct StartIssueArgs {
 struct OpenPrArgs {
     /// The agent whose worktree holds the work.
     agent_id: String,
+    /// Full commit OID reviewed for publication. The current assigned branch
+    /// must still point at this exact commit before Ciacola will push it. For
+    /// compatibility, omitting it on the first call pins the current clean
+    /// HEAD; later omissions reuse that durable pin and refuse a moved branch.
+    expected_head: Option<String>,
+    /// Conventional-commit title used only when a PR must be created.
     title: String,
+    /// Body used only when a PR must be created.
     body: String,
     /// Open as a draft. Default true, because a machine-authored pull
     /// request should wait for a person by default.
@@ -550,6 +1014,9 @@ struct FinishArgs {
     assignment_id: Option<String>,
     /// Keep the worktree for inspection instead of removing it.
     keep: Option<bool>,
+    /// Explicitly authorize discarding unpublished or unmerged committed
+    /// work at this exact full commit OID. Dirty work is never discarded.
+    discard_head: Option<String>,
 }
 
 #[derive(Default)]
@@ -594,6 +1061,129 @@ impl AssignmentState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PublicationState {
+    Unpublished,
+    Publishing,
+    Published,
+    Failed,
+}
+
+impl PublicationState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unpublished => "unpublished",
+            Self::Publishing => "publishing",
+            Self::Published => "published",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, FlatError> {
+        match value {
+            "unpublished" => Ok(Self::Unpublished),
+            "publishing" => Ok(Self::Publishing),
+            "published" => Ok(Self::Published),
+            "failed" => Ok(Self::Failed),
+            _ => Err(format!("invalid repo-worker publication state '{value}'").into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PrState {
+    Open,
+    Closed,
+    Merged,
+}
+
+impl PrState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::Merged => "merged",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, FlatError> {
+        match value {
+            "open" => Ok(Self::Open),
+            "closed" => Ok(Self::Closed),
+            "merged" => Ok(Self::Merged),
+            _ => Err(format!("invalid repo-worker pull-request state '{value}'").into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CleanupState {
+    None,
+    Retaining,
+    Retained,
+    Removing,
+    Completed,
+    Failed,
+}
+
+impl CleanupState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Retaining => "retaining",
+            Self::Retained => "retained",
+            Self::Removing => "removing",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, FlatError> {
+        match value {
+            "none" => Ok(Self::None),
+            "retaining" => Ok(Self::Retaining),
+            "retained" => Ok(Self::Retained),
+            "removing" => Ok(Self::Removing),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            _ => Err(format!("invalid repo-worker cleanup state '{value}'").into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CleanupReason {
+    Absent,
+    NoChanges,
+    Merged,
+    Discarded,
+}
+
+impl CleanupReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::NoChanges => "no_changes",
+            Self::Merged => "merged",
+            Self::Discarded => "discarded",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, FlatError> {
+        match value {
+            "absent" => Ok(Self::Absent),
+            "no_changes" => Ok(Self::NoChanges),
+            "merged" => Ok(Self::Merged),
+            "discarded" => Ok(Self::Discarded),
+            _ => Err(format!("invalid repo-worker cleanup reason '{value}'").into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Assignment {
     assignment_id: String,
@@ -602,6 +1192,7 @@ struct Assignment {
     state: AssignmentState,
     phase: String,
     base: Option<String>,
+    base_head: Option<String>,
     slug: String,
     branch: String,
     worktree: String,
@@ -609,14 +1200,26 @@ struct Assignment {
     agent_id: Option<String>,
     related_agent_ids: Vec<String>,
     spawned_by: Option<String>,
+    expected_head: Option<String>,
+    pushed_head: Option<String>,
+    publication_state: PublicationState,
     pr: Option<u64>,
+    pr_url: Option<String>,
+    pr_state: Option<PrState>,
+    pr_draft: Option<bool>,
+    pr_head: Option<String>,
+    pr_base: Option<String>,
+    pr_checked_unix: Option<i64>,
+    cleanup_state: CleanupState,
+    cleanup_head: Option<String>,
+    cleanup_reason: Option<CleanupReason>,
     last_error: Option<String>,
     created_unix: i64,
     updated_unix: i64,
     terminal_unix: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LegacyAssignment {
     repo: String,
     issue: u64,
@@ -638,6 +1241,7 @@ impl Assignment {
             state: AssignmentState::parse(row.try_get("state")?)?,
             phase: row.try_get("phase")?,
             base: row.try_get("base")?,
+            base_head: row.try_get("base_head")?,
             slug: row.try_get("slug")?,
             branch: row.try_get("branch")?,
             worktree: row.try_get("worktree")?,
@@ -645,7 +1249,27 @@ impl Assignment {
             agent_id: row.try_get("agent_id")?,
             related_agent_ids: serde_json::from_str(&related)?,
             spawned_by: row.try_get("spawned_by")?,
+            expected_head: row.try_get("expected_head")?,
+            pushed_head: row.try_get("pushed_head")?,
+            publication_state: PublicationState::parse(row.try_get("publication_state")?)?,
             pr: pr.map(u64::try_from).transpose()?,
+            pr_url: row.try_get("pr_url")?,
+            pr_state: row
+                .try_get::<Option<&str>, _>("pr_state")?
+                .map(PrState::parse)
+                .transpose()?,
+            pr_draft: row
+                .try_get::<Option<i64>, _>("pr_draft")?
+                .map(|value| value != 0),
+            pr_head: row.try_get("pr_head")?,
+            pr_base: row.try_get("pr_base")?,
+            pr_checked_unix: row.try_get("pr_checked_unix")?,
+            cleanup_state: CleanupState::parse(row.try_get("cleanup_state")?)?,
+            cleanup_head: row.try_get("cleanup_head")?,
+            cleanup_reason: row
+                .try_get::<Option<&str>, _>("cleanup_reason")?
+                .map(CleanupReason::parse)
+                .transpose()?,
             last_error: row.try_get("last_error")?,
             created_unix: row.try_get("created_unix")?,
             updated_unix: row.try_get("updated_unix")?,
@@ -662,8 +1286,22 @@ impl Assignment {
             "state": self.state.as_str(),
             "created": created,
             "base": self.base,
+            "base_head": self.base_head,
             "branch": self.branch,
             "worktree": self.worktree,
+            "expected_head": self.expected_head,
+            "pushed_head": self.pushed_head,
+            "publication_state": self.publication_state.as_str(),
+            "pr": self.pr,
+            "url": self.pr_url,
+            "pr_state": self.pr_state.map(PrState::as_str),
+            "pr_draft": self.pr_draft,
+            "pr_head": self.pr_head,
+            "pr_base": self.pr_base,
+            "pr_checked_unix": self.pr_checked_unix,
+            "cleanup_state": self.cleanup_state.as_str(),
+            "cleanup_head": self.cleanup_head,
+            "cleanup_reason": self.cleanup_reason.map(CleanupReason::as_str),
         })
     }
 
@@ -930,11 +1568,31 @@ impl AssignmentDb {
         Ok(())
     }
 
+    async fn set_base_head(&self, assignment_id: &str, base_head: &str) -> Result<(), FlatError> {
+        let done = sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET base_head = ?2, phase = 'worktree_ready', updated_unix = ?3
+             WHERE assignment_id = ?1 AND state = 'preparing'",
+        )
+        .bind(assignment_id)
+        .bind(base_head)
+        .bind(ciacola_core::now_unix())
+        .execute(&self.pool)
+        .await?;
+        if done.rows_affected() != 1 {
+            return Err("assignment stopped preparing before its base head was recorded".into());
+        }
+        Ok(())
+    }
+
     async fn stale(&self, assignment_id: &str, phase: &str, error: &str) -> Result<(), FlatError> {
         let now = ciacola_core::now_unix();
         let done = sqlx::query(
             "UPDATE repo_worker_assignments
              SET state = 'stale', phase = ?2, last_error = ?3,
+                 cleanup_state = CASE WHEN state = 'finishing'
+                     OR cleanup_state IN ('retaining', 'removing')
+                     THEN 'failed' ELSE cleanup_state END,
                  updated_unix = ?4, terminal_unix = ?4
              WHERE assignment_id = ?1 AND state IN ('preparing', 'active', 'finishing', 'retained')",
         )
@@ -961,6 +1619,10 @@ impl AssignmentDb {
         let done = sqlx::query(
             "UPDATE repo_worker_assignments
              SET state = ?2, phase = ?3, last_error = ?4,
+                 cleanup_state = CASE ?2
+                     WHEN 'retained' THEN 'retained'
+                     WHEN 'completed' THEN 'completed'
+                     ELSE cleanup_state END,
                  updated_unix = ?5, terminal_unix = ?5
              WHERE assignment_id = ?1 AND state = 'finishing'",
         )
@@ -977,7 +1639,13 @@ impl AssignmentDb {
         Ok(())
     }
 
-    async fn begin_finish(&self, assignment: &Assignment, keep: bool) -> Result<bool, FlatError> {
+    async fn begin_finish(
+        &self,
+        assignment: &Assignment,
+        keep: bool,
+        cleanup_head: Option<&str>,
+        cleanup_reason: Option<CleanupReason>,
+    ) -> Result<bool, FlatError> {
         let phase = if keep {
             "finishing_keep"
         } else if assignment.state == AssignmentState::Retained
@@ -994,22 +1662,44 @@ impl AssignmentDb {
             "finishing_remove"
         };
         if assignment.state == AssignmentState::Finishing {
-            return Ok(if keep {
+            let same_mode = if keep {
                 assignment.phase == "finishing_keep"
             } else {
                 matches!(
                     assignment.phase.as_str(),
                     "finishing_remove" | "finishing_remove_retained" | "finishing_remove_stale"
                 )
-            });
+            };
+            if !same_mode {
+                return Ok(false);
+            }
+            if keep {
+                return Ok(true);
+            }
+            let done = sqlx::query(
+                "UPDATE repo_worker_assignments
+                 SET cleanup_state = 'removing', cleanup_head = ?2,
+                     cleanup_reason = ?3, last_error = NULL, updated_unix = ?4
+                 WHERE assignment_id = ?1 AND state = 'finishing' AND phase = ?5",
+            )
+            .bind(&assignment.assignment_id)
+            .bind(cleanup_head)
+            .bind(cleanup_reason.map(CleanupReason::as_str))
+            .bind(ciacola_core::now_unix())
+            .bind(&assignment.phase)
+            .execute(&self.pool)
+            .await?;
+            return Ok(done.rows_affected() == 1);
         }
         let allowed = if keep {
             assignment.state == AssignmentState::Active
                 || (assignment.state == AssignmentState::Stale
-                    && matches!(
+                    && (matches!(
                         assignment.phase.as_str(),
                         "finishing_keep" | "finish_terminal_keep"
-                    ))
+                    ) || (assignment.cleanup_state == CleanupState::Failed
+                        && assignment.cleanup_reason.is_none()
+                        && assignment.phase.starts_with("finish_agent_"))))
         } else {
             matches!(
                 assignment.state,
@@ -1021,12 +1711,17 @@ impl AssignmentDb {
         }
         let done = sqlx::query(
             "UPDATE repo_worker_assignments
-             SET state = 'finishing', phase = ?3, last_error = NULL, updated_unix = ?4
+             SET state = 'finishing', phase = ?3, last_error = NULL,
+                 cleanup_state = ?4, cleanup_head = ?5, cleanup_reason = ?6,
+                 updated_unix = ?7
              WHERE assignment_id = ?1 AND state = ?2",
         )
         .bind(&assignment.assignment_id)
         .bind(assignment.state.as_str())
         .bind(phase)
+        .bind(if keep { "retaining" } else { "removing" })
+        .bind(cleanup_head)
+        .bind(cleanup_reason.map(CleanupReason::as_str))
         .bind(ciacola_core::now_unix())
         .execute(&self.pool)
         .await?;
@@ -1036,13 +1731,18 @@ impl AssignmentDb {
     async fn restore_after_busy(&self, assignment: &Assignment) -> Result<(), FlatError> {
         let done = sqlx::query(
             "UPDATE repo_worker_assignments
-             SET state = ?2, phase = ?3, last_error = ?4, updated_unix = ?5
+             SET state = ?2, phase = ?3, last_error = ?4,
+                 cleanup_state = ?5, cleanup_head = ?6, cleanup_reason = ?7,
+                 updated_unix = ?8
              WHERE assignment_id = ?1 AND state = 'finishing'",
         )
         .bind(&assignment.assignment_id)
         .bind(assignment.state.as_str())
         .bind(&assignment.phase)
         .bind(&assignment.last_error)
+        .bind(assignment.cleanup_state.as_str())
+        .bind(&assignment.cleanup_head)
+        .bind(assignment.cleanup_reason.map(CleanupReason::as_str))
         .bind(ciacola_core::now_unix())
         .execute(&self.pool)
         .await?;
@@ -1052,19 +1752,108 @@ impl AssignmentDb {
         Ok(())
     }
 
-    async fn update_pr(&self, assignment_id: &str, pr: u64) -> Result<(), FlatError> {
-        let pr = sqlite_u64(pr, "pull request")?;
+    async fn begin_publication(
+        &self,
+        assignment_id: &str,
+        expected_head: &str,
+    ) -> Result<(), FlatError> {
         let done = sqlx::query(
-            "UPDATE repo_worker_assignments SET pr = ?2, updated_unix = ?3
-             WHERE assignment_id = ?1 AND state = 'active'",
+            "UPDATE repo_worker_assignments
+             SET expected_head = ?2, publication_state = 'publishing',
+                 phase = 'publishing', last_error = NULL, updated_unix = ?3
+             WHERE assignment_id = ?1 AND state IN ('active', 'retained')",
         )
         .bind(assignment_id)
-        .bind(pr)
+        .bind(expected_head)
         .bind(ciacola_core::now_unix())
         .execute(&self.pool)
         .await?;
         if done.rows_affected() != 1 {
-            return Err("assignment disappeared while recording pull request".into());
+            return Err("assignment is not publishable while recording its expected head".into());
+        }
+        Ok(())
+    }
+
+    async fn record_branch_pushed(
+        &self,
+        assignment_id: &str,
+        expected_head: &str,
+    ) -> Result<(), FlatError> {
+        let done = sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET phase = 'branch_pushed', pushed_head = ?2, updated_unix = ?3
+             WHERE assignment_id = ?1 AND state IN ('active', 'retained')
+               AND publication_state = 'publishing' AND expected_head = ?2",
+        )
+        .bind(assignment_id)
+        .bind(expected_head)
+        .bind(ciacola_core::now_unix())
+        .execute(&self.pool)
+        .await?;
+        if done.rows_affected() != 1 {
+            return Err("assignment changed after its branch was pushed".into());
+        }
+        Ok(())
+    }
+
+    async fn publication_failed(&self, assignment_id: &str, error: &str) -> Result<(), FlatError> {
+        let done = sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET publication_state = 'failed', phase = 'publication_failed',
+                 last_error = ?2, updated_unix = ?3
+             WHERE assignment_id = ?1",
+        )
+        .bind(assignment_id)
+        .bind(error)
+        .bind(ciacola_core::now_unix())
+        .execute(&self.pool)
+        .await?;
+        if done.rows_affected() != 1 {
+            return Err("assignment changed while recording publication failure".into());
+        }
+        Ok(())
+    }
+
+    async fn record_pr_observation(
+        &self,
+        assignment_id: &str,
+        pr: &GhPr,
+        validation_error: Option<&str>,
+    ) -> Result<(), FlatError> {
+        let number = sqlite_u64(pr.number, "pull request")?;
+        let state = pr.parsed_state()?;
+        let now = ciacola_core::now_unix();
+        let done = sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET pr = ?2, pr_url = ?3, pr_state = ?4, pr_draft = ?5,
+                 pr_head = ?6, pr_base = ?7, pr_checked_unix = ?8,
+                 publication_state = CASE WHEN ?9 IS NULL
+                     THEN 'published' ELSE 'failed' END,
+                 phase = CASE
+                     WHEN ?9 IS NOT NULL AND state IN ('active', 'retained')
+                         THEN 'publication_failed'
+                     WHEN state IN ('active', 'retained') THEN 'pr_' || ?4
+                     ELSE phase END,
+                 last_error = CASE
+                     WHEN ?9 IS NOT NULL AND state IN ('active', 'retained') THEN ?9
+                     WHEN state IN ('active', 'retained') THEN NULL
+                     ELSE last_error END,
+                 updated_unix = ?8
+             WHERE assignment_id = ?1",
+        )
+        .bind(assignment_id)
+        .bind(number)
+        .bind(&pr.url)
+        .bind(state.as_str())
+        .bind(i64::from(pr.is_draft))
+        .bind(&pr.head_ref_oid)
+        .bind(&pr.base_ref_name)
+        .bind(now)
+        .bind(validation_error)
+        .execute(&self.pool)
+        .await?;
+        if done.rows_affected() != 1 {
+            return Err("assignment disappeared while recording pull request state".into());
         }
         Ok(())
     }
@@ -1343,10 +2132,10 @@ impl AssignmentDb {
             sqlx::query(
                 "INSERT INTO repo_worker_assignments
                      (assignment_id, repo, issue_number, state, phase, base, slug, branch,
-                      worktree, bare_path, agent_id, related_agent_ids, spawned_by, pr, last_error,
-                      created_unix, updated_unix, terminal_unix)
+                      worktree, bare_path, agent_id, related_agent_ids, spawned_by, pr,
+                      publication_state, last_error, created_unix, updated_unix, terminal_unix)
                  VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                         ?13, ?14, ?15, ?15, ?16)",
+                         ?13, ?14, ?15, ?16, ?16, ?17)",
             )
             .bind(&assignment_id)
             .bind(&repo)
@@ -1361,6 +2150,11 @@ impl AssignmentDb {
             .bind(&related)
             .bind(&spawned_by)
             .bind(pr_sql)
+            .bind(if first.pr.is_some() {
+                PublicationState::Published.as_str()
+            } else {
+                PublicationState::Unpublished.as_str()
+            })
             .bind(&error)
             .bind(now)
             .bind(terminal)
@@ -1385,9 +2179,20 @@ impl AssignmentDb {
         sqlx::query(
             "UPDATE repo_worker_assignments
              SET state = 'stale',
+                 cleanup_state = 'failed',
                  last_error = 'server restarted before finish completed; inspect resources before cleanup',
                  updated_unix = ?1, terminal_unix = ?1
              WHERE state = 'finishing'",
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET publication_state = 'failed', phase = 'publication_interrupted',
+                 last_error = 'server restarted before publication completed; reconcile before retry',
+                 updated_unix = ?1
+             WHERE publication_state = 'publishing'",
         )
         .bind(now)
         .execute(&self.pool)
@@ -1463,6 +2268,613 @@ impl AssignmentDb {
     }
 }
 
+async fn record_validated_pr(
+    assignments: &AssignmentDb,
+    assignment: &Assignment,
+    pr: &GhPr,
+) -> Result<(), FlatError> {
+    let identity = validate_pr_identity(assignment, pr);
+    let expected_mismatch = assignment
+        .expected_head
+        .as_deref()
+        .filter(|expected| *expected != pr.head_ref_oid);
+    let retry_baseline = identity.is_ok()
+        && expected_mismatch.is_some()
+        && matches!(
+            assignment.publication_state,
+            PublicationState::Publishing | PublicationState::Failed
+        )
+        && assignment.pr_head.as_deref() == Some(pr.head_ref_oid.as_str());
+    let validation = identity.and_then(|()| {
+        if let Some(expected) = expected_mismatch
+            && !retry_baseline
+        {
+            return Err(format!(
+                "pull request #{} head {} drifted from durable expected head {expected}",
+                pr.number, pr.head_ref_oid
+            )
+            .into());
+        }
+        Ok(())
+    });
+    let message = validation
+        .as_ref()
+        .err()
+        .map(ToString::to_string)
+        .or_else(|| {
+            retry_baseline.then(|| {
+                format!(
+                    "publication update to expected head {} is pending; pull request #{} remains at {}",
+                    assignment.expected_head.as_deref().unwrap_or("<unknown>"),
+                    pr.number,
+                    pr.head_ref_oid
+                )
+            })
+        });
+    assignments
+        .record_pr_observation(&assignment.assignment_id, pr, message.as_deref())
+        .await?;
+    validation
+}
+
+async fn discover_pr(repos: &Repos, assignment: &Assignment) -> Result<Option<GhPr>, FlatError> {
+    let repository = github_repo(&assignment.repo);
+    if let Some(number) = assignment.pr {
+        let number = number.to_string();
+        let output = gh(
+            &repos.gh_binary,
+            None,
+            &[
+                "pr",
+                "view",
+                &number,
+                "--repo",
+                &repository,
+                "--json",
+                GH_PR_FIELDS,
+            ],
+        )
+        .await?;
+        return Ok(Some(serde_json::from_str(&output).map_err(
+            |e| -> FlatError { format!("cannot parse pull request #{number}: {e}").into() },
+        )?));
+    }
+
+    let output = gh(
+        &repos.gh_binary,
+        None,
+        &[
+            "pr",
+            "list",
+            "--repo",
+            &repository,
+            "--head",
+            &assignment.branch,
+            "--state",
+            "all",
+            "--limit",
+            "100",
+            "--json",
+            GH_PR_FIELDS,
+        ],
+    )
+    .await?;
+    let candidates: Vec<GhPr> = serde_json::from_str(&output)
+        .map_err(|e| -> FlatError { format!("cannot parse pull request list: {e}").into() })?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut same_repo: Vec<GhPr> = candidates
+        .into_iter()
+        .filter(|pr| !pr.is_cross_repository && pr.head_ref_name == assignment.branch)
+        .collect();
+    if same_repo.is_empty() {
+        return Err(format!(
+            "pull requests exist for branch '{}', but none belongs to the assigned repository head",
+            assignment.branch
+        )
+        .into());
+    }
+    let open_count = same_repo
+        .iter()
+        .filter(|pr| pr.parsed_state().is_ok_and(|state| state == PrState::Open))
+        .count();
+    if open_count > 1 {
+        return Err(format!(
+            "more than one open pull request exists for assigned branch '{}'",
+            assignment.branch
+        )
+        .into());
+    }
+    same_repo.sort_by_key(|pr| pr.number);
+    Ok(same_repo
+        .iter()
+        .find(|pr| pr.parsed_state().is_ok_and(|state| state == PrState::Open))
+        .cloned()
+        .or_else(|| same_repo.pop()))
+}
+
+fn validate_pr_identity(assignment: &Assignment, pr: &GhPr) -> Result<(), FlatError> {
+    let base = assignment
+        .base
+        .as_deref()
+        .ok_or("assignment has no durable base branch")?;
+    if pr.is_cross_repository {
+        return Err(format!(
+            "pull request #{} uses a cross-repository head; expected '{}'",
+            pr.number, assignment.branch
+        )
+        .into());
+    }
+    if pr.head_ref_name != assignment.branch {
+        return Err(format!(
+            "pull request #{} uses head '{}', expected '{}'",
+            pr.number, pr.head_ref_name, assignment.branch
+        )
+        .into());
+    }
+    if pr.base_ref_name != base {
+        return Err(format!(
+            "pull request #{} targets base '{}', expected '{}'",
+            pr.number, pr.base_ref_name, base
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn pr_response(
+    assignment: &Assignment,
+    pr: &GhPr,
+    created: bool,
+) -> Result<serde_json::Value, FlatError> {
+    Ok(json!({
+        "assignment_id": assignment.assignment_id,
+        "pr": pr.number,
+        "url": pr.url,
+        "created": created,
+        "pr_state": pr.parsed_state()?.as_str(),
+        "draft": pr.is_draft,
+        "base": assignment.base,
+        "pr_base": pr.base_ref_name,
+        "expected_head": assignment.expected_head,
+        "pushed_head": assignment.pushed_head,
+        "pr_head": pr.head_ref_oid,
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct CleanupPlan {
+    head: Option<String>,
+    reason: CleanupReason,
+}
+
+async fn validate_cleanup_resources(
+    repos: &Repos,
+    assignment: &Assignment,
+    plan: &CleanupPlan,
+) -> Result<(), FlatError> {
+    let worktree = Path::new(&assignment.worktree);
+    if worktree.exists() {
+        repos
+            .validate_worktree_at(
+                worktree,
+                &assignment.branch,
+                Path::new(&assignment.bare_path),
+            )
+            .await?;
+        if !worktree_is_clean(worktree).await? {
+            return Err(
+                "assigned worktree is dirty; retain it or commit/clean it before cleanup".into(),
+            );
+        }
+        let current = git_output(worktree, &["rev-parse", "--verify", "HEAD^{commit}"]).await?;
+        if plan.head.as_deref() != Some(current.as_str()) {
+            return Err(format!(
+                "assigned worktree moved to {current} after cleanup was authorized at {}",
+                plan.head.as_deref().unwrap_or("<no branch>")
+            )
+            .into());
+        }
+    }
+    if let Some(current) = repos.local_branch_head(assignment).await?
+        && plan.head.as_deref() != Some(current.as_str())
+    {
+        return Err(format!(
+            "assigned branch moved to {current} after cleanup was authorized at {}",
+            plan.head.as_deref().unwrap_or("<no branch>")
+        )
+        .into());
+    }
+    Ok(())
+}
+
+async fn cleanup_plan(
+    assignments: &AssignmentDb,
+    repos: &Repos,
+    assignment: &Assignment,
+    discard_head: Option<&str>,
+) -> Result<CleanupPlan, FlatError> {
+    if matches!(
+        assignment.cleanup_state,
+        CleanupState::Removing | CleanupState::Failed
+    ) && let Some(reason) = assignment.cleanup_reason
+        && discard_head.is_none_or(|discard| assignment.cleanup_head.as_deref() == Some(discard))
+    {
+        let plan = CleanupPlan {
+            head: assignment.cleanup_head.clone(),
+            reason,
+        };
+        validate_cleanup_resources(repos, assignment, &plan).await?;
+        return Ok(plan);
+    }
+
+    let worktree = Path::new(&assignment.worktree);
+    let branch_head = repos.local_branch_head(assignment).await?;
+    if !worktree.exists() && branch_head.is_none() {
+        return Ok(CleanupPlan {
+            head: None,
+            reason: CleanupReason::Absent,
+        });
+    }
+
+    let head = if worktree.exists() {
+        repos
+            .validate_worktree_at(
+                worktree,
+                &assignment.branch,
+                Path::new(&assignment.bare_path),
+            )
+            .await?;
+        if !worktree_is_clean(worktree).await? {
+            return Err(
+                "assigned worktree is dirty; retain it or commit/clean it before cleanup".into(),
+            );
+        }
+        let head = git_output(worktree, &["rev-parse", "--verify", "HEAD^{commit}"]).await?;
+        if let Some(branch_head) = branch_head.as_deref()
+            && branch_head != head
+        {
+            return Err(
+                format!("assigned branch is {branch_head}, but worktree HEAD is {head}").into(),
+            );
+        }
+        head
+    } else {
+        branch_head.ok_or("assignment branch disappeared during cleanup inspection")?
+    };
+
+    let no_changes = assignment.base_head.as_deref() == Some(head.as_str());
+    let reason = if no_changes {
+        CleanupReason::NoChanges
+    } else if let Some(discard) = discard_head {
+        let canonical = if worktree.exists() {
+            git_output(
+                worktree,
+                &["rev-parse", "--verify", &format!("{discard}^{{commit}}")],
+            )
+            .await?
+        } else {
+            git_output(
+                Path::new(&assignment.bare_path),
+                &["rev-parse", "--verify", &format!("{discard}^{{commit}}")],
+            )
+            .await?
+        };
+        if canonical != discard || canonical != head {
+            return Err(format!(
+                "discard_head must be the full current assigned commit OID '{head}'"
+            )
+            .into());
+        }
+        CleanupReason::Discarded
+    } else {
+        let pr = discover_pr(repos, assignment).await?;
+        if let Some(pr) = pr.as_ref() {
+            record_validated_pr(assignments, assignment, pr).await?;
+        }
+        let merged = pr.as_ref().is_some_and(|pr| {
+            pr.parsed_state().ok() == Some(PrState::Merged)
+                && pr.head_ref_oid == head
+                && assignment.expected_head.as_deref() == Some(head.as_str())
+                && assignment.base.as_deref() == Some(pr.base_ref_name.as_str())
+        });
+        if merged {
+            CleanupReason::Merged
+        } else {
+            let pr_state = pr
+                .as_ref()
+                .and_then(|pr| pr.parsed_state().ok())
+                .map(PrState::as_str)
+                .unwrap_or("unpublished");
+            return Err(format!(
+                "cleanup would discard {pr_state} work at {head}; review it and retry with discard_head='{head}', or keep=true"
+            )
+            .into());
+        }
+    };
+    Ok(CleanupPlan {
+        head: Some(head),
+        reason,
+    })
+}
+
+async fn canonical_approved_head(
+    assignment: &Assignment,
+    snapshot: &WorktreeSnapshot,
+    requested: Option<&str>,
+) -> Result<String, FlatError> {
+    let worktree = Path::new(&assignment.worktree);
+    match requested {
+        Some(requested) => {
+            let canonical = git_output(
+                worktree,
+                &["rev-parse", "--verify", &format!("{requested}^{{commit}}")],
+            )
+            .await?;
+            if canonical != requested {
+                return Err(format!(
+                    "expected_head must be the full canonical commit OID '{canonical}'"
+                )
+                .into());
+            }
+            if canonical != snapshot.head {
+                return Err(format!(
+                    "assigned branch moved: expected_head is {canonical}, current head is {}",
+                    snapshot.head
+                )
+                .into());
+            }
+            Ok(canonical)
+        }
+        None => match assignment.expected_head.as_deref() {
+            Some(expected) if expected == snapshot.head => Ok(expected.to_string()),
+            Some(expected) => Err(format!(
+                "assigned branch moved from durable expected head {expected} to {}; review it and retry with expected_head='{}'",
+                snapshot.head, snapshot.head
+            )
+            .into()),
+            None => Ok(snapshot.head.clone()),
+        },
+    }
+}
+
+async fn publish_assignment(
+    ctx: &PluginContext,
+    repos: &Repos,
+    args: &OpenPrArgs,
+) -> Result<serde_json::Value, FlatError> {
+    let assignments = AssignmentDb::new(ctx.pool.clone());
+    let Some(mut assignment) = assignments.get_by_agent(&args.agent_id).await? else {
+        if !conventional_title(&args.title) {
+            return Err(format!(
+                "title '{}' is not conventional-commit form. Use type(scope): subject, e.g. 'fix: ...' or 'feat(board): ...'; types are build, chore, ci, docs, feat, fix, perf, refactor, revert, style, test.",
+                args.title
+            )
+            .into());
+        }
+        return Err(format!("no assignment for '{}'", args.agent_id).into());
+    };
+
+    let existing = discover_pr(repos, &assignment).await?;
+    if let Some(pr) = existing.as_ref() {
+        record_validated_pr(&assignments, &assignment, pr).await?;
+        let pr_state = pr.parsed_state()?;
+        if pr_state != PrState::Open
+            || !matches!(
+                assignment.state,
+                AssignmentState::Active | AssignmentState::Retained
+            )
+        {
+            if let Some(expected) = args.expected_head.as_deref()
+                && expected != pr.head_ref_oid
+            {
+                return Err(format!(
+                    "pull request #{} records head {}, not supplied expected head {expected}",
+                    pr.number, pr.head_ref_oid
+                )
+                .into());
+            }
+            if let Some(expected) = args.expected_head.as_deref()
+                && matches!(
+                    assignment.state,
+                    AssignmentState::Active | AssignmentState::Retained
+                )
+            {
+                assignments
+                    .begin_publication(&assignment.assignment_id, expected)
+                    .await?;
+                assignments
+                    .record_pr_observation(&assignment.assignment_id, pr, None)
+                    .await?;
+                assignment.expected_head = Some(expected.to_string());
+            }
+            return pr_response(&assignment, pr, false);
+        }
+        let requested_changes_head = args
+            .expected_head
+            .as_deref()
+            .is_some_and(|expected| expected != pr.head_ref_oid);
+        if !requested_changes_head {
+            if assignment.expected_head.is_none()
+                && let Some(expected) = args.expected_head.as_deref()
+            {
+                assignments
+                    .begin_publication(&assignment.assignment_id, expected)
+                    .await?;
+                assignments
+                    .record_pr_observation(&assignment.assignment_id, pr, None)
+                    .await?;
+                assignment.expected_head = Some(expected.to_string());
+            }
+            return pr_response(&assignment, pr, false);
+        }
+    }
+
+    if !matches!(
+        assignment.state,
+        AssignmentState::Active | AssignmentState::Retained
+    ) {
+        return Err(assignment.conflict(None).into());
+    }
+    if existing.is_none() && !conventional_title(&args.title) {
+        return Err(format!(
+            "title '{}' is not conventional-commit form. Use type(scope): subject, e.g. 'fix: ...' or 'feat(board): ...'; types are build, chore, ci, docs, feat, fix, perf, refactor, revert, style, test.",
+            args.title
+        )
+        .into());
+    }
+    let snapshot = repos.inspect_assignment_worktree(&assignment).await?;
+    if !worktree_is_clean(Path::new(&assignment.worktree)).await? {
+        return Err("assigned worktree is dirty; commit or retain it before publication".into());
+    }
+    if snapshot.commits_ahead == 0 || !snapshot.has_material_delta {
+        return Err(format!(
+            "assigned branch has no committed material delta from base {}",
+            snapshot.base_head
+        )
+        .into());
+    }
+    let approved =
+        canonical_approved_head(&assignment, &snapshot, args.expected_head.as_deref()).await?;
+
+    let remote_before = repos
+        .remote_branch_head(&assignment, &snapshot.push_url)
+        .await?;
+    if let Some(remote) = remote_before.as_deref()
+        && remote != approved
+    {
+        let expected_previous = existing
+            .as_ref()
+            .map(|pr| pr.head_ref_oid.as_str())
+            .or(assignment.pr_head.as_deref())
+            .or(assignment.pushed_head.as_deref())
+            .or(assignment.expected_head.as_deref());
+        if expected_previous != Some(remote)
+            || !git_predicate(
+                Path::new(&assignment.worktree),
+                &["merge-base", "--is-ancestor", remote, &approved],
+            )
+            .await?
+        {
+            return Err(format!(
+                "remote branch moved to {remote}; refusing to overwrite it with approved head {approved}"
+            )
+            .into());
+        }
+    }
+
+    assignments
+        .begin_publication(&assignment.assignment_id, &approved)
+        .await?;
+    assignment.expected_head = Some(approved.clone());
+    assignment.publication_state = PublicationState::Publishing;
+    let result: Result<serde_json::Value, FlatError> = async {
+        if remote_before.as_deref() != Some(approved.as_str()) {
+            repos
+                .push_exact(
+                    &assignment,
+                    &approved,
+                    remote_before.as_deref(),
+                    &snapshot.push_url,
+                )
+                .await
+                .map_err(|error| -> FlatError { format!("push: {error}").into() })?;
+        }
+        assignments
+            .record_branch_pushed(&assignment.assignment_id, &approved)
+            .await?;
+        assignment.pushed_head = Some(approved.clone());
+
+        if let Some(pr) = existing {
+            let refreshed = discover_pr(
+                repos,
+                &Assignment {
+                    pr: Some(pr.number),
+                    ..assignment.clone()
+                },
+            )
+            .await?;
+            let refreshed = refreshed.ok_or("published pull request disappeared during refresh")?;
+            record_validated_pr(&assignments, &assignment, &refreshed).await?;
+            if refreshed.head_ref_oid != approved {
+                return Err(format!(
+                    "pull request #{} still reports head {}, expected published head {approved}",
+                    refreshed.number, refreshed.head_ref_oid
+                )
+                .into());
+            }
+            return pr_response(&assignment, &refreshed, false);
+        }
+
+        let base = assignment
+            .base
+            .as_deref()
+            .ok_or("assignment has no durable base branch")?;
+        let draft = args.draft.unwrap_or(true);
+        let repository = github_repo(&assignment.repo);
+        let mut command = vec![
+            "pr",
+            "create",
+            "--repo",
+            &repository,
+            "--head",
+            &assignment.branch,
+            "--base",
+            base,
+            "--title",
+            &args.title,
+            "--body",
+            &args.body,
+        ];
+        if draft {
+            command.push("--draft");
+        }
+        let created = gh(
+            &repos.gh_binary,
+            Some(Path::new(&assignment.worktree)),
+            &command,
+        )
+        .await;
+        let reconciled = discover_pr(repos, &assignment).await?;
+        match reconciled {
+            Some(pr) => {
+                record_validated_pr(&assignments, &assignment, &pr).await?;
+                if pr.head_ref_oid != approved {
+                    return Err(format!(
+                        "created pull request #{} reports head {}, expected {approved}",
+                        pr.number, pr.head_ref_oid
+                    )
+                    .into());
+                }
+                pr_response(&assignment, &pr, created.is_ok())
+            }
+            None => Err(created
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "gh reported success but no pull request is discoverable".into())
+                .into()),
+        }
+    }
+    .await;
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let message = error.to_string();
+            if let Err(persistence) = assignments
+                .publication_failed(&assignment.assignment_id, &message)
+                .await
+            {
+                return Err(format!(
+                    "{message}; recording the publication failure also failed: {persistence}"
+                )
+                .into());
+            }
+            Err(error)
+        }
+    }
+}
+
 impl RepoWorkerPlugin {
     fn assignment_db(&self) -> Option<AssignmentDb> {
         Some(AssignmentDb::new(self.ctx.as_ref()?.pool.clone()))
@@ -1511,6 +2923,7 @@ impl Plugin for RepoWorkerPlugin {
             self.repos = Some(Repos {
                 root,
                 allowed: Arc::new(config.repos),
+                gh_binary: PathBuf::from("gh"),
                 cloning: Arc::new(tokio::sync::Mutex::new(())),
                 lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             });
@@ -1704,9 +3117,12 @@ Numbered steps, in order:
    changed and why without editorializing. Do not push; the server \
    handles that.
 8. Reply with, in this order: what you changed and why; the files; the \
-   exact command you verified with and its output; then a pull request \
+   exact command you verified with and its output; the full commit OID from \
+   `git rev-parse HEAD`; then a pull request \
    title on one line, in conventional-commit form like the commit \
-   (open_pr refuses any other shape), and a pull request body whose last line is \
+   (open_pr refuses any other shape and publishes only the reviewed, durably \
+   pinned OID), \
+   and a pull request body whose last line is \
    Closes #{{issue}} and nothing else. Those two go to open_pr exactly \
    as given, so write them to be used rather than edited.
 
@@ -1888,54 +3304,58 @@ to do, on purpose."
 
                         let base = match &args.base {
                             Some(base) => base.clone(),
-                            None => match gh(
-                                None,
-                                &[
-                                    "repo",
-                                    "view",
-                                    &args.repo,
-                                    "--json",
-                                    "defaultBranchRef",
-                                    "--jq",
-                                    ".defaultBranchRef.name",
-                                ],
-                            )
-                            .await
-                            {
-                                Ok(base) if !base.is_empty() => base,
-                                Ok(_) => {
-                                    let error = "default branch lookup returned an empty name";
-                                    let persistence = assignments
-                                        .record_pre_resource_failure(
-                                            &assignment.assignment_id,
-                                            "default_branch",
-                                            error,
-                                        )
-                                        .await;
-                                    return Ok(CallToolResult::error(match persistence {
-                                        Ok(()) => error.to_string(),
-                                        Err(e) => format!("{error}; {e}"),
-                                    }));
+                            None => {
+                                let repository = github_repo(&args.repo);
+                                match gh(
+                                    &repos.gh_binary,
+                                    None,
+                                    &[
+                                        "repo",
+                                        "view",
+                                        &repository,
+                                        "--json",
+                                        "defaultBranchRef",
+                                        "--jq",
+                                        ".defaultBranchRef.name",
+                                    ],
+                                )
+                                .await
+                                {
+                                    Ok(base) if !base.is_empty() => base,
+                                    Ok(_) => {
+                                        let error = "default branch lookup returned an empty name";
+                                        let persistence = assignments
+                                            .record_pre_resource_failure(
+                                                &assignment.assignment_id,
+                                                "default_branch",
+                                                error,
+                                            )
+                                            .await;
+                                        return Ok(CallToolResult::error(match persistence {
+                                            Ok(()) => error.to_string(),
+                                            Err(e) => format!("{error}; {e}"),
+                                        }));
+                                    }
+                                    Err(e) => {
+                                        let error = e.to_string();
+                                        let persistence = assignments
+                                            .record_pre_resource_failure(
+                                                &assignment.assignment_id,
+                                                "default_branch",
+                                                &error,
+                                            )
+                                            .await;
+                                        return Ok(CallToolResult::error(match persistence {
+                                            Ok(()) => {
+                                                format!("default branch lookup failed: {error}")
+                                            }
+                                            Err(e) => format!(
+                                                "default branch lookup failed: {error}; {e}"
+                                            ),
+                                        }));
+                                    }
                                 }
-                                Err(e) => {
-                                    let error = e.to_string();
-                                    let persistence = assignments
-                                        .record_pre_resource_failure(
-                                            &assignment.assignment_id,
-                                            "default_branch",
-                                            &error,
-                                        )
-                                        .await;
-                                    return Ok(CallToolResult::error(match persistence {
-                                        Ok(()) => {
-                                            format!("default branch lookup failed: {error}")
-                                        }
-                                        Err(e) => format!(
-                                            "default branch lookup failed: {error}; {e}"
-                                        ),
-                                    }));
-                                }
-                            },
+                            }
                         };
                         if let Err(e) = assignments.set_base(&assignment.assignment_id, &base).await
                         {
@@ -1988,6 +3408,31 @@ to do, on purpose."
                                 .await;
                             return Ok(CallToolResult::error(error.to_string()));
                         }
+                        let base_head = match git_output(
+                            &worktree,
+                            &["rev-parse", "--verify", "HEAD^{commit}"],
+                        )
+                        .await
+                        {
+                            Ok(head) => head,
+                            Err(e) => {
+                                let error = format!("cannot capture assignment base commit: {e}");
+                                let _ = assignments
+                                    .stale(&assignment.assignment_id, "base_head", &error)
+                                    .await;
+                                return Ok(CallToolResult::error(error));
+                            }
+                        };
+                        if let Err(e) = assignments
+                            .set_base_head(&assignment.assignment_id, &base_head)
+                            .await
+                        {
+                            let error = e.to_string();
+                            let _ = assignments
+                                .stale(&assignment.assignment_id, "persist_base_head", &error)
+                                .await;
+                            return Ok(CallToolResult::error(error));
+                        }
                         let args_map = std::collections::HashMap::from([
                             ("repo".to_string(), args.repo.clone()),
                             ("issue".to_string(), args.issue.to_string()),
@@ -2010,12 +3455,13 @@ to do, on purpose."
                             let done = sqlx::query(
                                 "UPDATE repo_worker_assignments
                                  SET state = 'active', phase = 'ready', agent_id = ?2,
-                                     related_agent_ids = ?3, updated_unix = ?4
+                                     related_agent_ids = ?3, base_head = ?4, updated_unix = ?5
                                  WHERE assignment_id = ?1 AND state = 'preparing'",
                             )
                             .bind(&assignment.assignment_id)
                             .bind(&agent_id)
                             .bind(related)
+                            .bind(&base_head)
                             .bind(ciacola_core::now_unix())
                             .execute(&mut *tx)
                             .await?;
@@ -2103,7 +3549,21 @@ to do, on purpose."
                                 "agent_id": a.agent_id,
                                 "spawned_by": a.spawned_by,
                                 "base": a.base,
+                                "base_head": a.base_head,
                                 "branch": a.branch,
+                                "expected_head": a.expected_head,
+                                "pushed_head": a.pushed_head,
+                                "publication_state": a.publication_state.as_str(),
+                                "pr": a.pr,
+                                "pr_url": a.pr_url,
+                                "pr_state": a.pr_state.map(PrState::as_str),
+                                "pr_draft": a.pr_draft,
+                                "pr_head": a.pr_head,
+                                "pr_base": a.pr_base,
+                                "pr_checked_unix": a.pr_checked_unix,
+                                "cleanup_state": a.cleanup_state.as_str(),
+                                "cleanup_head": a.cleanup_head,
+                                "cleanup_reason": a.cleanup_reason.map(CleanupReason::as_str),
                                 "worktree": a.worktree,
                                 "bare_path": a.bare_path,
                                 "last_error": a.last_error,
@@ -2129,140 +3589,19 @@ to do, on purpose."
             tools.push(
                 ToolBuilder::new("open_pr")
                     .description(
-                        "Push the agent's branch and open a draft pull \
-                         request. Idempotent: if one already exists from \
-                         this branch it is returned rather than duplicated.",
+                        "Publish one exact, durably pinned commit and open or \
+                         reconcile its pull request. Existing open, closed, or \
+                         merged PRs are returned rather than duplicated.",
                     )
                     .destructive()
                     .handler(move |args: OpenPrArgs| {
                         let ctx = ctx_pr.clone();
                         let repos = repos_pr.clone();
                         async move {
-                            // The title gate is the preflight: keep it
-                            // ahead of assignment lookup, gh, git, and
-                            // especially push so every rejection is
-                            // side-effect free.
-                            if !conventional_title(&args.title) {
-                                return Ok(CallToolResult::error(format!(
-                                    "title '{}' is not conventional-commit form. \
-                                     Use type(scope): subject, e.g. 'fix: ...' or \
-                                     'feat(board): ...'; types are build, chore, ci, \
-                                     docs, feat, fix, perf, refactor, revert, style, test.",
-                                    args.title
-                                )));
-                            }
                             let _lifecycle = repos.lifecycle.lock().await;
-                            let assignments = AssignmentDb::new(ctx.pool.clone());
-                            let a = match assignments.get_by_agent(&args.agent_id).await {
-                                Ok(Some(a)) => a,
-                                Ok(None) => {
-                                    return Ok(CallToolResult::error(format!(
-                                        "no assignment for '{}'",
-                                        args.agent_id
-                                    )));
-                                }
-                                Err(e) => return Ok(CallToolResult::error(e.to_string())),
-                            };
-                            if a.state != AssignmentState::Active {
-                                return Ok(CallToolResult::error(a.conflict(None)));
-                            }
-                            let worktree = PathBuf::from(&a.worktree);
-
-                            // Idempotency, the whole point of this being
-                            // a mechanical step: ask GitHub before
-                            // creating, so a resent turn cannot open a
-                            // second pull request.
-                            if let Ok(existing) = gh(
-                                Some(&worktree),
-                                &[
-                                    "pr",
-                                    "list",
-                                    "--repo",
-                                    &a.repo,
-                                    "--head",
-                                    &a.branch,
-                                    "--state",
-                                    "all",
-                                    "--json",
-                                    "number",
-                                    "--jq",
-                                    ".[0].number",
-                                ],
-                            )
-                            .await
-                            {
-                                if let Ok(number) = existing.trim().parse::<u64>() {
-                                    if let Err(e) = assignments
-                                        .update_pr(&a.assignment_id, number)
-                                        .await
-                                    {
-                                        return Ok(CallToolResult::error(e.to_string()));
-                                    }
-                                    return Ok(CallToolResult::json(json!({
-                                        "pr": number,
-                                        "created": false,
-                                        "note": "already open from this branch",
-                                    })));
-                                }
-                            }
-
-                            let pushed = match Repository::open(&worktree) {
-                                Ok(repo) => repo
-                                    .push()
-                                    .remote("origin")
-                                    .refspec(&a.branch)
-                                    .set_upstream()
-                                    .execute()
-                                    .await
-                                    .map_err(|e| e.to_string()),
-                                Err(e) => Err(e.to_string()),
-                            };
-                            if let Err(e) = pushed {
-                                return Ok(CallToolResult::error(format!("push: {e}")));
-                            }
-                            let draft = args.draft.unwrap_or(true);
-                            let mut cmd = vec![
-                                "pr",
-                                "create",
-                                "--repo",
-                                &a.repo,
-                                "--head",
-                                &a.branch,
-                                "--title",
-                                &args.title,
-                                "--body",
-                                &args.body,
-                            ];
-                            if draft {
-                                cmd.push("--draft");
-                            }
-                            match gh(Some(&worktree), &cmd).await {
-                                Ok(url) => {
-                                    let number = url
-                                        .rsplit('/')
-                                        .next()
-                                        .and_then(|n| n.trim().parse::<u64>().ok());
-                                    let Some(number) = number else {
-                                        return Ok(CallToolResult::error(format!(
-                                            "pull request was created but its number could not be parsed from '{url}'; retry to reconcile it"
-                                        )));
-                                    };
-                                    if let Err(e) = assignments
-                                        .update_pr(&a.assignment_id, number)
-                                        .await
-                                    {
-                                        return Ok(CallToolResult::error(format!(
-                                            "pull request #{number} exists, but recording it failed: {e}"
-                                        )));
-                                    }
-                                    Ok(CallToolResult::json(json!({
-                                        "pr": number,
-                                        "url": url,
-                                        "created": true,
-                                        "draft": draft,
-                                    })))
-                                }
-                                Err(e) => Ok(CallToolResult::error(e.to_string())),
+                            match publish_assignment(&ctx, &repos, &args).await {
+                                Ok(value) => Ok(CallToolResult::json(value)),
+                                Err(error) => Ok(CallToolResult::error(error.to_string())),
                             }
                         }
                     })
@@ -2273,7 +3612,11 @@ to do, on purpose."
             let repos_fin = repos.clone();
             tools.push(
                 ToolBuilder::new("finish_issue")
-                    .description("Retire the agent and remove its worktree.")
+                    .description(
+                        "Retire the agent, then retain its worktree or remove \
+                         only work proven merged/unchanged or confirmed by an \
+                         exact discard_head.",
+                    )
                     .destructive()
                     .handler(move |args: FinishArgs| {
                         let (ctx, repos) = (ctx_fin.clone(), repos_fin.clone());
@@ -2304,6 +3647,11 @@ to do, on purpose."
                                 Err(e) => return Ok(CallToolResult::error(e.to_string())),
                             };
                             let keep = args.keep.unwrap_or(false);
+                            if keep && args.discard_head.is_some() {
+                                return Ok(CallToolResult::error(
+                                    "keep=true cannot be combined with discard_head".to_string(),
+                                ));
+                            }
                             match a.state {
                                 AssignmentState::Retained if keep => {
                                     return Ok(CallToolResult::json(json!({
@@ -2312,6 +3660,9 @@ to do, on purpose."
                                         "worktree_removed": false,
                                         "agent_retired": true,
                                         "pr": a.pr,
+                                        "cleanup_state": a.cleanup_state.as_str(),
+                                        "cleanup_head": a.cleanup_head,
+                                        "cleanup_reason": a.cleanup_reason.map(CleanupReason::as_str),
                                     })));
                                 }
                                 AssignmentState::Completed if !keep => {
@@ -2319,8 +3670,12 @@ to do, on purpose."
                                         "assignment_id": a.assignment_id,
                                         "state": "completed",
                                         "worktree_removed": true,
+                                        "branch_removed": true,
                                         "agent_retired": true,
                                         "pr": a.pr,
+                                        "cleanup_state": a.cleanup_state.as_str(),
+                                        "cleanup_head": a.cleanup_head,
+                                        "cleanup_reason": a.cleanup_reason.map(CleanupReason::as_str),
                                     })));
                                 }
                                 AssignmentState::Active
@@ -2350,6 +3705,23 @@ to do, on purpose."
                                     a.related_agent_ids.join(", ")
                                 )));
                             }
+                            let plan = if keep {
+                                None
+                            } else {
+                                match cleanup_plan(
+                                    &assignments,
+                                    &repos,
+                                    &a,
+                                    args.discard_head.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(plan) => Some(plan),
+                                    Err(error) => {
+                                        return Ok(CallToolResult::error(error.to_string()));
+                                    }
+                                }
+                            };
                             let prior_state = if a.state == AssignmentState::Retained
                                 || a.phase == "finishing_remove_retained"
                             {
@@ -2359,7 +3731,15 @@ to do, on purpose."
                             } else {
                                 AssignmentState::Active
                             };
-                            match assignments.begin_finish(&a, keep).await {
+                            match assignments
+                                .begin_finish(
+                                    &a,
+                                    keep,
+                                    plan.as_ref().and_then(|plan| plan.head.as_deref()),
+                                    plan.as_ref().map(|plan| plan.reason),
+                                )
+                                .await
+                            {
                                 Ok(true) => {}
                                 Ok(false) => {
                                     let current = assignments
@@ -2395,11 +3775,13 @@ to do, on purpose."
                                                 | "finishing_remove_stale"
                                         ));
                                 if resumable_remove && !keep {
+                                    let plan = plan.as_ref().expect("remove has cleanup plan");
                                     let removed = match repos
                                         .remove_worktree_at(
-                                            &a.slug,
+                                            &a.branch,
                                             Path::new(&a.worktree),
                                             Path::new(&a.bare_path),
+                                            plan.head.as_deref(),
                                         )
                                         .await
                                     {
@@ -2429,8 +3811,12 @@ to do, on purpose."
                                         "assignment_id": a.assignment_id,
                                         "state": "completed",
                                         "worktree_removed": removed,
+                                        "branch_removed": true,
                                         "agent_retired": false,
                                         "pr": a.pr,
+                                        "cleanup_state": "completed",
+                                        "cleanup_head": plan.head,
+                                        "cleanup_reason": plan.reason.as_str(),
                                     })));
                                 }
                                 return Ok(CallToolResult::error(
@@ -2501,14 +3887,28 @@ to do, on purpose."
                                         .to_string(),
                                 ));
                             }
+                            if let Some(plan) = plan.as_ref()
+                                && let Err(error) =
+                                    validate_cleanup_resources(&repos, &a, plan).await
+                            {
+                                let message = error.to_string();
+                                let _ = assignments
+                                    .stale(&a.assignment_id, "cleanup_recheck", &message)
+                                    .await;
+                                return Ok(CallToolResult::error(format!(
+                                    "agent retired, but cleanup authorization is stale: {message}"
+                                )));
+                            }
                             let removed = if keep {
                                 false
                             } else {
+                                let plan = plan.as_ref().expect("remove has cleanup plan");
                                 if let Err(e) = repos
                                     .remove_worktree_at(
-                                        &a.slug,
+                                        &a.branch,
                                         Path::new(&a.worktree),
                                         Path::new(&a.bare_path),
+                                        plan.head.as_deref(),
                                     )
                                     .await
                                 {
@@ -2559,8 +3959,12 @@ to do, on purpose."
                                 "assignment_id": a.assignment_id,
                                 "state": state.as_str(),
                                 "worktree_removed": removed,
+                                "branch_removed": !keep,
                                 "agent_retired": retired,
                                 "pr": a.pr,
+                                "cleanup_state": if keep { "retained" } else { "completed" },
+                                "cleanup_head": plan.as_ref().and_then(|plan| plan.head.as_deref()),
+                                "cleanup_reason": plan.as_ref().map(|plan| plan.reason.as_str()),
                             })))
                         }
                     })
@@ -2589,8 +3993,9 @@ to do, on purpose."
             }
             let ledger: Option<Ledger> = self.ctx.as_ref().map(|c| c.ledger.clone());
             let mut html = String::from(
-                "<table><tr><th>state</th><th>issue</th><th>agent</th><th>branch</th>\
-                 <th>pr</th><th>worktree</th><th>detail</th></tr>",
+                "<table><tr><th>assignment</th><th>publication</th><th>cleanup</th>\
+                 <th>issue</th><th>agent</th><th>branch</th><th>pr</th>\
+                 <th>worktree</th><th>detail</th></tr>",
             );
             for a in &all {
                 let agent = match (&ledger, a.agent_id.as_deref()) {
@@ -2612,17 +4017,42 @@ to do, on purpose."
                     _ => "-".into(),
                 };
                 html.push_str(&format!(
-                    "<tr><td>{state}</td><td>{repo}#{issue}</td><td>{agent}</td>\
+                    "<tr><td>{state}</td><td>{publication}</td><td>{cleanup}</td>\
+                     <td>{repo}#{issue}</td><td>{agent}</td>\
                      <td class=\"mono\">{branch}</td><td>{pr}</td>\
                      <td class=\"dim mono\">{wt}</td><td>{detail}</td></tr>",
                     state = ciacola_core::render::esc(a.state.as_str()),
+                    publication = ciacola_core::render::esc(&match a.pr_state {
+                        Some(pr_state) =>
+                            format!("{} / {}", a.publication_state.as_str(), pr_state.as_str()),
+                        None => a.publication_state.as_str().to_string(),
+                    }),
+                    cleanup = ciacola_core::render::esc(a.cleanup_state.as_str()),
                     repo = ciacola_core::render::esc(&a.repo),
                     issue = a.issue,
                     agent = agent,
                     branch = ciacola_core::render::esc(&a.branch),
-                    pr = a.pr.map(|n| format!("#{n}")).unwrap_or_else(|| "-".into()),
+                    pr = match (a.pr, a.pr_url.as_deref()) {
+                        (Some(number), Some(url)) => format!(
+                            "<a href=\"{}\">#{number}</a>",
+                            ciacola_core::render::esc(url)
+                        ),
+                        (Some(number), None) => format!("#{number}"),
+                        (None, _) => "-".into(),
+                    },
                     wt = ciacola_core::render::esc(&a.worktree),
-                    detail = ciacola_core::render::esc(a.last_error.as_deref().unwrap_or(&a.phase)),
+                    detail =
+                        ciacola_core::render::esc(a.last_error.as_deref().unwrap_or_else(|| {
+                            if matches!(
+                                a.state,
+                                AssignmentState::Active | AssignmentState::Retained
+                            ) && a.base_head.is_none()
+                            {
+                                "missing durable base-head provenance; retain and inspect"
+                            } else {
+                                &a.phase
+                            }
+                        }),),
                 ));
             }
             html.push_str("</table>");
@@ -2663,6 +4093,21 @@ to do, on purpose."
                 .iter()
                 .filter(|a| a.state == AssignmentState::Stale)
                 .count();
+            let publication_failed = all
+                .iter()
+                .filter(|a| a.publication_state == PublicationState::Failed)
+                .count();
+            let unresolved_publication_failed = all
+                .iter()
+                .filter(|a| {
+                    a.publication_state == PublicationState::Failed
+                        && a.state != AssignmentState::Completed
+                })
+                .count();
+            let cleanup_failed = all
+                .iter()
+                .filter(|a| a.cleanup_state == CleanupState::Failed)
+                .count();
             let missing_owned = all
                 .iter()
                 .filter(|a| {
@@ -2678,6 +4123,13 @@ to do, on purpose."
                 .iter()
                 .filter(|a| {
                     a.state == AssignmentState::Completed && Path::new(&a.worktree).exists()
+                })
+                .count();
+            let missing_journey_provenance = all
+                .iter()
+                .filter(|a| {
+                    matches!(a.state, AssignmentState::Active | AssignmentState::Retained)
+                        && (a.base.is_none() || a.base_head.is_none())
                 })
                 .count();
             let mut agent_state_drift = 0;
@@ -2702,9 +4154,12 @@ to do, on purpose."
                 }
             }
             let degraded = stale_count > 0
+                || unresolved_publication_failed > 0
+                || cleanup_failed > 0
                 || orphan_count > 0
                 || missing_owned > 0
                 || completed_with_worktree > 0
+                || missing_journey_provenance > 0
                 || agent_state_drift > 0
                 || agent_query_error.is_some();
             json!({
@@ -2717,11 +4172,32 @@ to do, on purpose."
                 "completed": all.iter().filter(|a| a.state == AssignmentState::Completed).count(),
                 "stale": stale_count,
                 "with_pr": all.iter().filter(|a| a.pr.is_some()).count(),
+                "publication": {
+                    "unpublished": all.iter().filter(|a| a.publication_state == PublicationState::Unpublished).count(),
+                    "publishing": all.iter().filter(|a| a.publication_state == PublicationState::Publishing).count(),
+                    "published": all.iter().filter(|a| a.publication_state == PublicationState::Published).count(),
+                    "failed": publication_failed,
+                    "unresolved_failed": unresolved_publication_failed,
+                },
+                "pr": {
+                    "open": all.iter().filter(|a| a.pr_state == Some(PrState::Open)).count(),
+                    "closed": all.iter().filter(|a| a.pr_state == Some(PrState::Closed)).count(),
+                    "merged": all.iter().filter(|a| a.pr_state == Some(PrState::Merged)).count(),
+                },
+                "cleanup": {
+                    "none": all.iter().filter(|a| a.cleanup_state == CleanupState::None).count(),
+                    "retaining": all.iter().filter(|a| a.cleanup_state == CleanupState::Retaining).count(),
+                    "retained": all.iter().filter(|a| a.cleanup_state == CleanupState::Retained).count(),
+                    "removing": all.iter().filter(|a| a.cleanup_state == CleanupState::Removing).count(),
+                    "completed": all.iter().filter(|a| a.cleanup_state == CleanupState::Completed).count(),
+                    "failed": cleanup_failed,
+                },
                 "worktrees": worktrees.len(),
                 "orphans": orphan_count,
                 "missing_active_worktrees": missing_active,
                 "missing_owned_worktrees": missing_owned,
                 "completed_with_worktree": completed_with_worktree,
+                "missing_journey_provenance": missing_journey_provenance,
                 "agent_state_drift": agent_state_drift,
                 "agent_query_error": agent_query_error,
             })
@@ -2842,6 +4318,7 @@ mod tests {
         let repos = Repos {
             root: tmp.join("root"),
             allowed: Arc::new(vec!["local/repo".into()]),
+            gh_binary: PathBuf::from("gh"),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -2854,6 +4331,140 @@ mod tests {
             .expect("clone");
         configure_local_transport(&repos.bare("local/repo"), &origin, "local/repo").await;
         (tmp, repos)
+    }
+
+    #[cfg(unix)]
+    struct FakeGh {
+        binary: PathBuf,
+        list: PathBuf,
+        view: PathBuf,
+        created_list: PathBuf,
+        created_view: PathBuf,
+        fail_list: PathBuf,
+        log: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl FakeGh {
+        fn new(root: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = root.join("fake-gh");
+            std::fs::create_dir_all(&dir).expect("fake gh dir");
+            let fake = Self {
+                binary: dir.join("gh"),
+                list: dir.join("list.json"),
+                view: dir.join("view.json"),
+                created_list: dir.join("created-list.json"),
+                created_view: dir.join("created-view.json"),
+                fail_list: dir.join("fail-list"),
+                log: dir.join("argv.log"),
+            };
+            std::fs::write(&fake.list, "[]").expect("empty PR list");
+            std::fs::write(&fake.created_list, "[]").expect("empty created list");
+            std::fs::write(&fake.created_view, "{}").expect("empty created view");
+            let script = format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> '{}'\n\
+                 if [ \"$1 $2\" = 'pr list' ]; then\n\
+                   if [ -f '{}' ]; then echo 'injected list failure' >&2; exit 1; fi\n\
+                   cat '{}'; exit 0\n\
+                 fi\n\
+                 if [ \"$1 $2\" = 'pr view' ]; then\n\
+                   if [ -f '{}' ]; then cat '{}'; exit 0; fi\n\
+                   echo 'missing fake PR' >&2; exit 1\n\
+                 fi\n\
+                 if [ \"$1 $2\" = 'pr create' ]; then\n\
+                   cp '{}' '{}'; cp '{}' '{}';\n\
+                   printf 'https://github.com/local/repo/pull/41\\n'; exit 0\n\
+                 fi\n\
+                 if [ \"$1 $2\" = 'repo view' ]; then printf 'main\\n'; exit 0; fi\n\
+                 echo \"unsupported fake gh invocation: $*\" >&2; exit 2\n",
+                fake.log.display(),
+                fake.fail_list.display(),
+                fake.list.display(),
+                fake.view.display(),
+                fake.view.display(),
+                fake.created_list.display(),
+                fake.list.display(),
+                fake.created_view.display(),
+                fake.view.display(),
+            );
+            std::fs::write(&fake.binary, script).expect("fake gh script");
+            let mut permissions = std::fs::metadata(&fake.binary)
+                .expect("fake gh metadata")
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&fake.binary, permissions).expect("fake gh executable");
+            fake
+        }
+
+        fn pr(
+            &self,
+            number: u64,
+            state: &str,
+            draft: bool,
+            branch: &str,
+            head: &str,
+            base: &str,
+        ) -> serde_json::Value {
+            json!({
+                "number": number,
+                "url": format!("https://github.com/local/repo/pull/{number}"),
+                "state": state,
+                "isDraft": draft,
+                "headRefName": branch,
+                "headRefOid": head,
+                "baseRefName": base,
+                "isCrossRepository": false,
+                "mergedAt": if state.eq_ignore_ascii_case("merged") {
+                    Some("2026-08-09T00:00:00Z")
+                } else {
+                    None
+                },
+            })
+        }
+
+        fn set_existing(&self, pr: Option<&serde_json::Value>) {
+            match pr {
+                Some(pr) => {
+                    std::fs::write(&self.list, json!([pr]).to_string()).expect("fake PR list");
+                    std::fs::write(&self.view, pr.to_string()).expect("fake PR view");
+                }
+                None => {
+                    std::fs::write(&self.list, "[]").expect("empty PR list");
+                    std::fs::remove_file(&self.view).ok();
+                }
+            }
+        }
+
+        fn set_created(&self, pr: &serde_json::Value) {
+            std::fs::write(&self.created_list, json!([pr]).to_string()).expect("created PR list");
+            std::fs::write(&self.created_view, pr.to_string()).expect("created PR view");
+        }
+
+        fn set_created_list_raw(&self, contents: &str) {
+            std::fs::write(&self.created_list, contents).expect("raw created PR list");
+        }
+
+        fn fail_list(&self) {
+            std::fs::write(&self.fail_list, "fail").expect("fail list marker");
+        }
+
+        fn log(&self) -> String {
+            std::fs::read_to_string(&self.log).unwrap_or_default()
+        }
+    }
+
+    async fn commit_change(worktree: &Path, name: &str, contents: &str) -> String {
+        git(worktree, &["config", "user.email", "t@example.com"]).await;
+        git(worktree, &["config", "user.name", "t"]).await;
+        std::fs::write(worktree.join(name), contents).expect("write change");
+        git(worktree, &["add", name]).await;
+        git(worktree, &["commit", "-qm", "fix: test change"]).await;
+        git_output(worktree, &["rev-parse", "--verify", "HEAD^{commit}"])
+            .await
+            .expect("commit head")
     }
 
     async fn memory_plugin(repos: Repos) -> (RepoWorkerPlugin, Ledger) {
@@ -2904,15 +4515,22 @@ mod tests {
             .bare(fixture.repo)
             .display()
             .to_string();
+        let base_head = git_output(
+            fixture.worktree,
+            &["rev-parse", "--verify", "HEAD^{commit}"],
+        )
+        .await
+        .ok();
         sqlx::query(
             "INSERT INTO repo_worker_assignments
-                 (assignment_id, repo, issue_number, state, phase, base, slug, branch,
+                 (assignment_id, repo, issue_number, state, phase, base, base_head, slug, branch,
                   worktree, bare_path, agent_id, related_agent_ids, pr, created_unix, updated_unix)
-             VALUES (?1, ?2, ?3, 'active', 'ready', 'main', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+             VALUES (?1, ?2, ?3, 'active', 'ready', 'main', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
         )
         .bind(&assignment_id)
         .bind(fixture.repo)
         .bind(sqlite_u64(fixture.issue, "issue").expect("issue range"))
+        .bind(base_head)
         .bind(fixture.slug)
         .bind(fixture.branch)
         .bind(fixture.worktree.display().to_string())
@@ -3208,6 +4826,7 @@ mod tests {
         let repos = Repos {
             root: root.clone(),
             allowed: Arc::new(Vec::new()),
+            gh_binary: PathBuf::from("gh"),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -3303,6 +4922,7 @@ mod tests {
         let repos = Repos {
             root: root.clone(),
             allowed: Arc::new(Vec::new()),
+            gh_binary: PathBuf::from("gh"),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -3348,7 +4968,214 @@ mod tests {
         assert_eq!(health["agent_state_drift"], 1);
         assert_eq!(health["completed_with_worktree"], 1);
         assert_eq!(health["orphans"], 1);
+        assert_eq!(health["missing_journey_provenance"], 1);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn pre_journey_assignments_upgrade_without_inventing_commit_provenance() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        ciacola_core::plugin::apply_migrations(&pool, "repo-worker", &MIGRATIONS[..1])
+            .await
+            .expect("legacy assignment migration");
+        for (id, repo, state, phase, pr) in [
+            (
+                "retained",
+                "local/retained",
+                "retained",
+                "retained",
+                Some(4_i64),
+            ),
+            (
+                "completed",
+                "local/completed",
+                "completed",
+                "cleanup_complete",
+                None,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO repo_worker_assignments
+                     (assignment_id, repo, issue_number, state, phase, base, slug,
+                      branch, worktree, bare_path, pr, created_unix, updated_unix)
+                 VALUES (?1, ?2, 1, ?3, ?4, 'main', ?1,
+                         'agent/' || ?1, '/tmp/wt-' || ?1, '/tmp/bare-' || ?1,
+                         ?5, 1, 1)",
+            )
+            .bind(id)
+            .bind(repo)
+            .bind(state)
+            .bind(phase)
+            .bind(pr)
+            .execute(&pool)
+            .await
+            .expect("legacy row");
+        }
+
+        ciacola_core::plugin::apply_migrations(&pool, "repo-worker", MIGRATIONS)
+            .await
+            .expect("journey migration");
+        let rows = AssignmentDb::new(pool).list().await.expect("upgraded rows");
+        let retained = rows
+            .iter()
+            .find(|row| row.assignment_id == "retained")
+            .expect("retained row");
+        assert_eq!(retained.publication_state, PublicationState::Published);
+        assert_eq!(retained.cleanup_state, CleanupState::Retained);
+        assert!(retained.base_head.is_none());
+        assert!(retained.expected_head.is_none());
+        assert!(retained.pr_state.is_none());
+        let completed = rows
+            .iter()
+            .find(|row| row.assignment_id == "completed")
+            .expect("completed row");
+        assert_eq!(completed.publication_state, PublicationState::Unpublished);
+        assert_eq!(completed.cleanup_state, CleanupState::Completed);
+    }
+
+    #[tokio::test]
+    async fn partially_applied_journey_columns_resume_safely() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        ciacola_core::plugin::apply_migrations(&pool, "repo-worker", &MIGRATIONS[..1])
+            .await
+            .expect("assignment table");
+        // Simulate a process dying after SQLite committed ALTER TABLE but
+        // before the migration marker was inserted.
+        sqlx::query("ALTER TABLE repo_worker_assignments ADD COLUMN base_head TEXT")
+            .execute(&pool)
+            .await
+            .expect("partial base-head migration");
+        sqlx::query("ALTER TABLE repo_worker_assignments ADD COLUMN expected_head TEXT")
+            .execute(&pool)
+            .await
+            .expect("partial expected-head migration");
+
+        ciacola_core::plugin::apply_migrations(&pool, "repo-worker", MIGRATIONS)
+            .await
+            .expect("resumed journey migrations");
+        let columns: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM pragma_table_info('repo_worker_assignments') ORDER BY cid",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("columns");
+        let columns: std::collections::HashSet<String> =
+            columns.into_iter().map(|(name,)| name).collect();
+        for expected in [
+            "base_head",
+            "expected_head",
+            "publication_state",
+            "pr_url",
+            "pr_state",
+            "pr_draft",
+            "pr_head",
+            "pr_base",
+            "pr_checked_unix",
+            "cleanup_state",
+            "cleanup_head",
+            "cleanup_reason",
+            "pushed_head",
+        ] {
+            assert!(columns.contains(expected), "missing column {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_legacy_store_import_preserves_known_pr_publication() {
+        let root = std::env::temp_dir().join(format!("ciacola-legacy-pr-{}", ulid::Ulid::new()));
+        let repos = Repos {
+            root: root.clone(),
+            allowed: Arc::new(Vec::new()),
+            gh_binary: PathBuf::from("gh"),
+            cloning: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let (plugin, ledger) = memory_plugin(repos.clone()).await;
+        let value = serde_json::to_string(&LegacyAssignment {
+            repo: "local/legacy".into(),
+            issue: 76,
+            slug: "local-legacy-76".into(),
+            branch: "agent/local-legacy-76".into(),
+            worktree: root.join("wt-local-legacy-76").display().to_string(),
+            pr: Some(76),
+        })
+        .expect("legacy assignment");
+        sqlx::query(
+            "INSERT INTO plugin_kv (plugin, key, value, updated_unix)
+             VALUES ('repo-worker', 'agent/missing-legacy-agent', ?1, 1)",
+        )
+        .bind(value)
+        .execute(&plugin.ctx.as_ref().expect("context").pool)
+        .await
+        .expect("legacy Store row");
+        let assignments = plugin.assignment_db().expect("assignment db");
+        assignments
+            .import_legacy(&ledger, &repos)
+            .await
+            .expect("legacy import");
+        let imported = assignments.list().await.expect("assignments");
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].pr, Some(76));
+        assert_eq!(imported[0].publication_state, PublicationState::Published);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_publication_and_cleanup_recovery_fences() {
+        let (tmp, repos) = local_repos("journey-restart").await;
+        let (plugin, ledger) = memory_plugin(repos.clone()).await;
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 84, "base": "main"}))
+            .await;
+        let active = plugin.assignments().await.expect("assignments")[0].clone();
+        let approved = active.base_head.clone().expect("base head");
+        let assignments = plugin.assignment_db().expect("assignment db");
+        assignments
+            .begin_publication(&active.assignment_id, &approved)
+            .await
+            .expect("begin publication");
+        let (finishing, _) = assignments
+            .reserve("local/repo", 85, Some("main"), &repos, None)
+            .await
+            .expect("cleanup reservation");
+        sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET state = 'finishing', phase = 'removing_branch',
+                 cleanup_state = 'removing', cleanup_head = 'deadbeef',
+                 cleanup_reason = 'discarded'
+             WHERE assignment_id = ?1",
+        )
+        .bind(&finishing.assignment_id)
+        .execute(&plugin.ctx.as_ref().expect("context").pool)
+        .await
+        .expect("seed interrupted cleanup");
+
+        assignments
+            .reconcile_on_start(&ledger, &repos)
+            .await
+            .expect("reconcile");
+        let active = assignments
+            .get_by_id(&active.assignment_id)
+            .await
+            .expect("active query")
+            .expect("active row");
+        assert_eq!(active.state, AssignmentState::Active);
+        assert_eq!(active.publication_state, PublicationState::Failed);
+        assert_eq!(active.expected_head.as_deref(), Some(approved.as_str()));
+        let finishing = assignments
+            .get_by_id(&finishing.assignment_id)
+            .await
+            .expect("cleanup query")
+            .expect("cleanup row");
+        assert_eq!(finishing.state, AssignmentState::Stale);
+        assert_eq!(finishing.cleanup_state, CleanupState::Failed);
+        assert_eq!(finishing.cleanup_head.as_deref(), Some("deadbeef"));
+        assert_eq!(finishing.cleanup_reason, Some(CleanupReason::Discarded));
+        std::fs::remove_dir_all(tmp).ok();
     }
 
     #[tokio::test]
@@ -3357,6 +5184,7 @@ mod tests {
         let repos = Repos {
             root: root.clone(),
             allowed: Arc::new(Vec::new()),
+            gh_binary: PathBuf::from("gh"),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -3374,6 +5202,1036 @@ mod tests {
         assert!(rendered.contains("not conventional-commit form"));
         assert!(!rendered.contains("no assignment"));
         assert!(!root.exists(), "preflight must not create repository state");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_pushes_the_approved_oid_and_records_one_pr_journey() {
+        let (tmp, repos) = local_repos("publish-approved").await;
+        let (mut plugin, _ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        git(&tmp.join("origin"), &["branch", "develop"]).await;
+
+        let started = operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 76, "base": "develop"}))
+            .await;
+        let started = serde_json::to_string(&started).expect("render start");
+        assert!(started.contains("\"created\":true"), "got: {started}");
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let worktree = Path::new(&assignment.worktree);
+        let head = commit_change(worktree, "change", "published").await;
+        git(
+            worktree,
+            &["tag", "-a", "secret-tag", "-m", "not approved", &head],
+        )
+        .await;
+        git(worktree, &["config", "push.followTags", "true"]).await;
+        git(worktree, &["config", "push.recurseSubmodules", "on-demand"]).await;
+        let pre_push = Path::new(&assignment.bare_path).join("hooks/pre-push");
+        std::fs::write(&pre_push, "#!/bin/sh\nexit 1\n").expect("write rejecting pre-push hook");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pre_push, std::fs::Permissions::from_mode(0o700))
+            .expect("make pre-push executable");
+        let pr = fake.pr(41, "OPEN", true, &assignment.branch, &head, "develop");
+        fake.set_created(&pr);
+
+        let args = json!({
+            "agent_id": assignment.agent_id,
+            "title": "fix: publish exact head",
+            "body": "Closes #76"
+        });
+        let opened = operator_tool(&plugin, "open_pr").call(args.clone()).await;
+        let opened = serde_json::to_string(&opened).expect("render open");
+        assert!(opened.contains("\"created\":true"), "got: {opened}");
+        assert!(opened.contains("\"pr_state\":\"open\""), "got: {opened}");
+
+        let remote = git_output(
+            &tmp.join("origin"),
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{}^{{commit}}", assignment.branch),
+            ],
+        )
+        .await
+        .expect("remote branch");
+        assert_eq!(remote, head);
+        assert!(
+            !git_predicate(
+                &tmp.join("origin"),
+                &["show-ref", "--verify", "--quiet", "refs/tags/secret-tag"],
+            )
+            .await
+            .expect("inspect remote tag"),
+            "publication must not follow reachable tags from ambient Git config"
+        );
+        let durable = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(durable.expected_head.as_deref(), Some(head.as_str()));
+        assert_eq!(durable.pushed_head.as_deref(), Some(head.as_str()));
+        assert_eq!(durable.pr, Some(41));
+        assert_eq!(durable.pr_state, Some(PrState::Open));
+        assert_eq!(durable.pr_head.as_deref(), Some(head.as_str()));
+        assert_eq!(durable.pr_base.as_deref(), Some("develop"));
+        assert!(durable.pr_checked_unix.is_some());
+        let log = fake.log();
+        assert!(log.contains("pr create"), "gh log: {log}");
+        assert!(
+            log.contains("--repo github.com/local/repo"),
+            "gh host must be explicit: {log}"
+        );
+        assert!(log.contains("--base develop"), "gh log: {log}");
+
+        std::fs::write(Path::new(&assignment.worktree).join("later-dirty"), "dirty")
+            .expect("dirty post-publication worktree");
+        let replay = operator_tool(&plugin, "open_pr").call(args).await;
+        let replay = serde_json::to_string(&replay).expect("render replay");
+        assert!(replay.contains("\"created\":false"), "got: {replay}");
+        assert_eq!(fake.log().matches("pr create").count(), 1);
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_open_pr_update_retries_from_the_previous_remote_fence() {
+        let (tmp, repos) = local_repos("pr-update-retry").await;
+        let (mut plugin, _ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 92, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let worktree = Path::new(&assignment.worktree);
+        let first = commit_change(worktree, "first", "one").await;
+        let first_pr = fake.pr(47, "OPEN", false, &assignment.branch, &first, "main");
+        fake.set_created(&first_pr);
+        let args = |head: &str| {
+            json!({
+                "agent_id": assignment.agent_id,
+                "expected_head": head,
+                "title": "fix: retry exact PR updates",
+                "body": "Closes #92"
+            })
+        };
+        let opened = operator_tool(&plugin, "open_pr").call(args(&first)).await;
+        assert!(
+            serde_json::to_string(&opened)
+                .expect("render first publication")
+                .contains("\"pr_state\":\"open\"")
+        );
+
+        let second = commit_change(worktree, "second", "two").await;
+        let lock = tmp
+            .join("origin/.git/refs/heads")
+            .join(format!("{}.lock", assignment.branch));
+        std::fs::create_dir_all(lock.parent().expect("remote lock parent"))
+            .expect("remote lock parent");
+        std::fs::write(&lock, "locked").expect("remote ref lock");
+        let failed = operator_tool(&plugin, "open_pr").call(args(&second)).await;
+        let failed = serde_json::to_string(&failed).expect("render failed update");
+        assert!(failed.contains("cannot lock ref"), "got: {failed}");
+        let durable = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(durable.expected_head.as_deref(), Some(second.as_str()));
+        assert_eq!(durable.pushed_head.as_deref(), Some(first.as_str()));
+        assert_eq!(durable.pr_head.as_deref(), Some(first.as_str()));
+        assert_eq!(durable.publication_state, PublicationState::Failed);
+
+        std::fs::remove_file(&lock).expect("remove remote ref lock");
+        let advanced = operator_tool(&plugin, "open_pr").call(args(&second)).await;
+        let advanced = serde_json::to_string(&advanced).expect("render advanced update");
+        assert!(advanced.contains("still reports head"), "got: {advanced}");
+        let durable = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(durable.pushed_head.as_deref(), Some(second.as_str()));
+        assert_eq!(durable.publication_state, PublicationState::Failed);
+
+        let second_pr = fake.pr(47, "OPEN", false, &assignment.branch, &second, "main");
+        fake.set_existing(Some(&second_pr));
+        let reconciled = operator_tool(&plugin, "open_pr").call(args(&second)).await;
+        let reconciled = serde_json::to_string(&reconciled).expect("render reconciled update");
+        assert!(
+            reconciled.contains("\"created\":false"),
+            "got: {reconciled}"
+        );
+        let durable = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(durable.publication_state, PublicationState::Published);
+        assert_eq!(durable.expected_head.as_deref(), Some(second.as_str()));
+        assert_eq!(durable.pushed_head.as_deref(), Some(second.as_str()));
+        assert_eq!(durable.pr_head.as_deref(), Some(second.as_str()));
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_preflight_refuses_zero_dirty_moved_and_wrong_branch_work() {
+        let (tmp, repos) = local_repos("publish-preflight").await;
+        let (mut plugin, _ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 77, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let worktree = Path::new(&assignment.worktree);
+        let open = |head: &str| {
+            json!({
+                "agent_id": assignment.agent_id,
+                "expected_head": head,
+                "title": "fix: guarded publication",
+                "body": "Closes #77"
+            })
+        };
+
+        let zero = operator_tool(&plugin, "open_pr")
+            .call(open(assignment.base_head.as_deref().expect("base head")))
+            .await;
+        assert!(
+            serde_json::to_string(&zero)
+                .expect("render zero")
+                .contains("no committed material delta")
+        );
+
+        let first = commit_change(worktree, "first", "one").await;
+        std::fs::write(worktree.join("untracked"), "dirty").expect("dirty file");
+        let dirty = operator_tool(&plugin, "open_pr").call(open(&first)).await;
+        assert!(
+            serde_json::to_string(&dirty)
+                .expect("render dirty")
+                .contains("worktree is dirty")
+        );
+        std::fs::remove_file(worktree.join("untracked")).expect("clean fixture");
+
+        let second = commit_change(worktree, "second", "two").await;
+        let moved = operator_tool(&plugin, "open_pr").call(open(&first)).await;
+        assert!(
+            serde_json::to_string(&moved)
+                .expect("render moved")
+                .contains("assigned branch moved")
+        );
+        git(worktree, &["switch", "-qc", "wrong-branch"]).await;
+        let wrong = operator_tool(&plugin, "open_pr").call(open(&second)).await;
+        assert!(
+            serde_json::to_string(&wrong)
+                .expect("render wrong")
+                .contains("expected")
+        );
+        assert!(!fake.log().contains("pr create"));
+        assert!(
+            !git_predicate(
+                &tmp.join("origin"),
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{}", assignment.branch),
+                ],
+            )
+            .await
+            .expect("remote ref predicate")
+        );
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn github_lookup_failure_cannot_fall_through_to_push_or_create() {
+        let (tmp, repos) = local_repos("gh-query-failure").await;
+        let (mut plugin, _ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        fake.fail_list();
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 81, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let head = commit_change(Path::new(&assignment.worktree), "change", "query").await;
+        let out = operator_tool(&plugin, "open_pr")
+            .call(json!({
+                "agent_id": assignment.agent_id,
+                "expected_head": head,
+                "title": "fix: fail closed on lookup",
+                "body": "Closes #81"
+            }))
+            .await;
+        let out = serde_json::to_string(&out).expect("render failure");
+        assert!(out.contains("injected list failure"), "got: {out}");
+        assert!(!fake.log().contains("pr create"));
+        assert!(
+            !git_predicate(
+                &tmp.join("origin"),
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{}", assignment.branch),
+                ],
+            )
+            .await
+            .expect("remote ref predicate")
+        );
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_push_reconciliation_failure_settles_publication_as_failed() {
+        let (tmp, repos) = local_repos("post-push-reconciliation").await;
+        let (mut plugin, _ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        fake.set_created_list_raw("not json");
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 84, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let head = commit_change(Path::new(&assignment.worktree), "change", "reconcile").await;
+
+        let out = operator_tool(&plugin, "open_pr")
+            .call(json!({
+                "agent_id": assignment.agent_id,
+                "expected_head": head,
+                "title": "fix: settle reconciliation failures",
+                "body": "Closes #84"
+            }))
+            .await;
+        let out = serde_json::to_string(&out).expect("render reconciliation failure");
+        assert!(out.contains("cannot parse pull request list"), "got: {out}");
+        let durable = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(durable.publication_state, PublicationState::Failed);
+        assert_eq!(durable.expected_head.as_deref(), Some(head.as_str()));
+        assert!(
+            durable
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("cannot parse pull request list"))
+        );
+        assert_eq!(plugin.health().await["status"], "degraded");
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_refuses_an_unrecognized_remote_branch_head() {
+        let (tmp, repos) = local_repos("remote-head-drift").await;
+        let (mut plugin, _ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 82, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let head = commit_change(Path::new(&assignment.worktree), "change", "local").await;
+        git(&tmp.join("origin"), &["branch", &assignment.branch, "main"]).await;
+
+        let out = operator_tool(&plugin, "open_pr")
+            .call(json!({
+                "agent_id": assignment.agent_id,
+                "expected_head": head,
+                "title": "fix: refuse remote drift",
+                "body": "Closes #82"
+            }))
+            .await;
+        let out = serde_json::to_string(&out).expect("render drift");
+        assert!(out.contains("remote branch moved"), "got: {out}");
+        let remote = git_output(
+            &tmp.join("origin"),
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{}^{{commit}}", assignment.branch),
+            ],
+        )
+        .await
+        .expect("remote head");
+        assert_eq!(remote, assignment.base_head.expect("base head"));
+        assert!(!fake.log().contains("pr create"));
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_rejects_multiple_push_destinations() {
+        let (tmp, repos) = local_repos("multiple-pushurls").await;
+        let (mut plugin, _ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 86, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let worktree = Path::new(&assignment.worktree);
+        let head = commit_change(worktree, "change", "push urls").await;
+        let unintended = tmp.join("unintended.git");
+        std::fs::create_dir_all(&unintended).expect("unintended dir");
+        git(&unintended, &["init", "--bare", "-q"]).await;
+        git(
+            worktree,
+            &[
+                "config",
+                "--add",
+                "remote.origin.pushurl",
+                "https://github.com/local/repo.git",
+            ],
+        )
+        .await;
+        git(
+            worktree,
+            &[
+                "config",
+                "--add",
+                "remote.origin.pushurl",
+                &format!("file://{}", unintended.display()),
+            ],
+        )
+        .await;
+
+        let refused = operator_tool(&plugin, "open_pr")
+            .call(json!({
+                "agent_id": assignment.agent_id,
+                "expected_head": head,
+                "title": "fix: reject extra push destinations",
+                "body": "Closes #86"
+            }))
+            .await;
+        let refused = serde_json::to_string(&refused).expect("render push URL refusal");
+        assert!(
+            refused.contains("expected only GitHub repository"),
+            "got: {refused}"
+        );
+        assert!(!fake.log().contains("pr create"));
+        assert!(
+            !git_predicate(
+                &unintended,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{}", assignment.branch),
+                ],
+            )
+            .await
+            .expect("unintended ref predicate")
+        );
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_rejects_a_chained_push_url_rewrite() {
+        let (tmp, repos) = local_repos("chained-push-rewrite").await;
+        let (mut plugin, _ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 96, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let worktree = Path::new(&assignment.worktree);
+        let head = commit_change(worktree, "change", "rewrite").await;
+        let origin_url = format!("file://{}", tmp.join("origin").display());
+        git(
+            worktree,
+            &[
+                "config",
+                "--unset-all",
+                &format!("url.{origin_url}.insteadOf"),
+            ],
+        )
+        .await;
+        let unintended = tmp.join("rewrite-target.git");
+        std::fs::create_dir_all(&unintended).expect("unintended dir");
+        git(&unintended, &["init", "--bare", "-q"]).await;
+        git(worktree, &["config", "remote.origin.url", "alias://repo"]).await;
+        git(
+            worktree,
+            &[
+                "config",
+                "url.https://github.com/local/repo.git.insteadOf",
+                "alias://repo",
+            ],
+        )
+        .await;
+        git(
+            worktree,
+            &[
+                "config",
+                &format!("url.file://{}.pushInsteadOf", unintended.display()),
+                "https://github.com/local/repo.git",
+            ],
+        )
+        .await;
+
+        let refused = operator_tool(&plugin, "open_pr")
+            .call(json!({
+                "agent_id": assignment.agent_id,
+                "expected_head": head,
+                "title": "fix: reject chained URL rewrites",
+                "body": "Closes #96"
+            }))
+            .await;
+        let refused = serde_json::to_string(&refused).expect("render rewrite refusal");
+        assert!(refused.contains("unstable remote target"), "got: {refused}");
+        assert!(!fake.log().contains("pr create"));
+        assert!(
+            !git_predicate(
+                &unintended,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{}", assignment.branch),
+                ],
+            )
+            .await
+            .expect("unintended ref predicate")
+        );
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_push_lease_closes_remote_check_race() {
+        let (tmp, repos) = local_repos("push-lease-race").await;
+        let (plugin, _ledger) = memory_plugin(repos.clone()).await;
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 87, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let head = commit_change(Path::new(&assignment.worktree), "change", "lease").await;
+        let snapshot = repos
+            .inspect_assignment_worktree(&assignment)
+            .await
+            .expect("snapshot");
+
+        // Simulate another actor creating the branch after our absent-ref
+        // observation but before push. The explicit empty lease must refuse
+        // even though an ordinary non-force push would fast-forward it.
+        git(&tmp.join("origin"), &["branch", &assignment.branch, "main"]).await;
+        let error = repos
+            .push_exact(&assignment, &head, None, &snapshot.push_url)
+            .await
+            .expect_err("stale absent-ref lease must refuse");
+        assert!(error.to_string().contains("stale info"), "got: {error}");
+        let remote = git_output(
+            &tmp.join("origin"),
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{}^{{commit}}", assignment.branch),
+            ],
+        )
+        .await
+        .expect("remote head");
+        assert_eq!(remote, assignment.base_head.expect("base head"));
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_request_base_drift_is_observed_but_never_accepted() {
+        let (tmp, repos) = local_repos("pr-base-drift").await;
+        let (mut plugin, _ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 83, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let head = commit_change(Path::new(&assignment.worktree), "change", "base drift").await;
+        let drifted = fake.pr(44, "OPEN", false, &assignment.branch, &head, "develop");
+        fake.set_existing(Some(&drifted));
+
+        let out = operator_tool(&plugin, "open_pr")
+            .call(json!({
+                "agent_id": assignment.agent_id,
+                "expected_head": head,
+                "title": "fix: reject base drift",
+                "body": "Closes #83"
+            }))
+            .await;
+        let out = serde_json::to_string(&out).expect("render drift");
+        assert!(out.contains("targets base 'develop'"), "got: {out}");
+        let durable = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(durable.pr, Some(44));
+        assert_eq!(durable.pr_state, Some(PrState::Open));
+        assert_eq!(durable.pr_base.as_deref(), Some("develop"));
+        assert_eq!(durable.publication_state, PublicationState::Failed);
+        assert!(
+            durable
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("targets base 'develop'"))
+        );
+        assert_eq!(plugin.health().await["status"], "degraded");
+        assert!(!fake.log().contains("pr create"));
+
+        // An exact discard is a local destruction authorization, so cleanup
+        // must remain possible even when the mismatched PR can no longer be
+        // queried or validated.
+        std::fs::remove_file(&fake.view).ok();
+        let finished = operator_tool(&plugin, "finish_issue")
+            .call(json!({
+                "agent_id": assignment.agent_id,
+                "discard_head": head,
+            }))
+            .await;
+        let finished = serde_json::to_string(&finished).expect("render discard");
+        assert!(
+            finished.contains("\"state\":\"completed\""),
+            "got: {finished}"
+        );
+        assert!(
+            finished.contains("\"cleanup_reason\":\"discarded\""),
+            "got: {finished}"
+        );
+        assert_eq!(plugin.health().await["status"], "ok");
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_request_head_drift_is_durable_and_degraded() {
+        let (tmp, repos) = local_repos("pr-head-drift").await;
+        let (mut plugin, _ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 85, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let reviewed = commit_change(Path::new(&assignment.worktree), "change", "reviewed").await;
+        let original = fake.pr(45, "OPEN", false, &assignment.branch, &reviewed, "main");
+        fake.set_existing(Some(&original));
+        let opened = operator_tool(&plugin, "open_pr")
+            .call(json!({
+                "agent_id": assignment.agent_id,
+                "expected_head": reviewed,
+                "title": "fix: publish reviewed head",
+                "body": "Closes #85"
+            }))
+            .await;
+        assert!(
+            serde_json::to_string(&opened)
+                .expect("render open")
+                .contains("\"pr_state\":\"open\"")
+        );
+
+        let drifted_head = assignment.base_head.as_deref().expect("base head");
+        let drifted = fake.pr(45, "OPEN", false, &assignment.branch, drifted_head, "main");
+        fake.set_existing(Some(&drifted));
+        let refused = operator_tool(&plugin, "open_pr")
+            .call(json!({
+                "agent_id": assignment.agent_id,
+                "expected_head": reviewed,
+                "title": "fix: publish reviewed head",
+                "body": "Closes #85"
+            }))
+            .await;
+        let refused = serde_json::to_string(&refused).expect("render head drift");
+        assert!(
+            refused.contains("drifted from durable expected head"),
+            "got: {refused}"
+        );
+        let durable = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(durable.expected_head.as_deref(), Some(reviewed.as_str()));
+        assert_eq!(durable.pr_head.as_deref(), Some(drifted_head));
+        assert_eq!(durable.publication_state, PublicationState::Failed);
+        assert_eq!(plugin.health().await["status"], "degraded");
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_pr_observation_is_one_atomic_database_write() {
+        let (tmp, repos) = local_repos("pr-observation-atomic").await;
+        let (mut plugin, _ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 91, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let head = commit_change(Path::new(&assignment.worktree), "change", "atomic").await;
+        let drifted = fake.pr(46, "OPEN", false, &assignment.branch, &head, "develop");
+        fake.set_existing(Some(&drifted));
+        sqlx::query(
+            "CREATE TRIGGER fail_pr_observation
+             BEFORE UPDATE OF pr ON repo_worker_assignments
+             BEGIN SELECT RAISE(ABORT, 'injected observation failure'); END",
+        )
+        .execute(&plugin.ctx.as_ref().expect("context").pool)
+        .await
+        .expect("observation failure trigger");
+
+        let refused = operator_tool(&plugin, "open_pr")
+            .call(json!({
+                "agent_id": assignment.agent_id,
+                "expected_head": head,
+                "title": "fix: keep observation atomic",
+                "body": "Closes #91"
+            }))
+            .await;
+        let refused = serde_json::to_string(&refused).expect("render trigger failure");
+        assert!(
+            refused.contains("injected observation failure"),
+            "got: {refused}"
+        );
+        let durable = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(durable.pr, None);
+        assert_eq!(durable.pr_base, None);
+        assert_eq!(durable.pr_head, None);
+        assert_eq!(durable.publication_state, PublicationState::Unpublished);
+        assert_eq!(durable.last_error, None);
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closed_and_merged_prs_are_distinct_and_merged_cleanup_is_safe() {
+        let (tmp, repos) = local_repos("pr-states").await;
+        let (mut plugin, ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 78, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let head = commit_change(Path::new(&assignment.worktree), "change", "states").await;
+        let closed = fake.pr(42, "CLOSED", false, &assignment.branch, &head, "main");
+        fake.set_existing(Some(&closed));
+        let args = json!({
+            "agent_id": assignment.agent_id,
+            "expected_head": head,
+            "title": "fix: reconcile state",
+            "body": "Closes #78"
+        });
+        let observed = operator_tool(&plugin, "open_pr").call(args.clone()).await;
+        let observed = serde_json::to_string(&observed).expect("render closed");
+        assert!(
+            observed.contains("\"pr_state\":\"closed\""),
+            "got: {observed}"
+        );
+
+        let merged = fake.pr(42, "MERGED", false, &assignment.branch, &head, "main");
+        fake.set_existing(Some(&merged));
+        let observed = operator_tool(&plugin, "open_pr").call(args).await;
+        let observed = serde_json::to_string(&observed).expect("render merged");
+        assert!(
+            observed.contains("\"pr_state\":\"merged\""),
+            "got: {observed}"
+        );
+
+        let finished = operator_tool(&plugin, "finish_issue")
+            .call(json!({"agent_id": assignment.agent_id}))
+            .await;
+        let finished = serde_json::to_string(&finished).expect("render finish");
+        assert!(
+            finished.contains("\"state\":\"completed\""),
+            "got: {finished}"
+        );
+        assert!(
+            finished.contains("\"cleanup_reason\":\"merged\""),
+            "got: {finished}"
+        );
+        assert!(!Path::new(&assignment.worktree).exists());
+        assert!(
+            ledger
+                .get_agent(assignment.agent_id.as_deref().expect("agent"))
+                .await
+                .expect("agent query")
+                .expect("agent row")
+                .retired
+        );
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_work_can_be_published_without_unretiring_its_agent() {
+        let (tmp, repos) = local_repos("retained-publish").await;
+        let (mut plugin, ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 79, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let head = commit_change(Path::new(&assignment.worktree), "change", "retained").await;
+        let retained = operator_tool(&plugin, "finish_issue")
+            .call(json!({"agent_id": assignment.agent_id, "keep": true}))
+            .await;
+        assert!(
+            serde_json::to_string(&retained)
+                .expect("render retain")
+                .contains("\"state\":\"retained\"")
+        );
+        let pr = fake.pr(43, "OPEN", true, &assignment.branch, &head, "main");
+        fake.set_created(&pr);
+        let opened = operator_tool(&plugin, "open_pr")
+            .call(json!({
+                "agent_id": assignment.agent_id,
+                "expected_head": head,
+                "title": "fix: publish retained work",
+                "body": "Closes #79"
+            }))
+            .await;
+        let opened = serde_json::to_string(&opened).expect("render open");
+        assert!(opened.contains("\"created\":true"), "got: {opened}");
+        assert!(
+            ledger
+                .get_agent(assignment.agent_id.as_deref().expect("agent"))
+                .await
+                .expect("agent query")
+                .expect("agent row")
+                .retired,
+            "publication must not reactivate retained work"
+        );
+        assert_eq!(
+            plugin.assignments().await.expect("assignments")[0].state,
+            AssignmentState::Retained
+        );
+        let merged = fake.pr(43, "MERGED", false, &assignment.branch, &head, "main");
+        fake.set_existing(Some(&merged));
+        let cleaned = operator_tool(&plugin, "finish_issue")
+            .call(json!({"assignment_id": assignment.assignment_id}))
+            .await;
+        let cleaned = serde_json::to_string(&cleaned).expect("render retained cleanup");
+        assert!(
+            cleaned.contains("\"state\":\"completed\""),
+            "got: {cleaned}"
+        );
+        assert!(
+            cleaned.contains("\"cleanup_reason\":\"merged\""),
+            "got: {cleaned}"
+        );
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_discard_survives_branch_delete_failure_and_retries() {
+        let (tmp, repos) = local_repos("discard-retry").await;
+        let (mut plugin, ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 80, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let head = commit_change(Path::new(&assignment.worktree), "change", "discard").await;
+
+        let refused = operator_tool(&plugin, "finish_issue")
+            .call(json!({"agent_id": assignment.agent_id}))
+            .await;
+        let refused = serde_json::to_string(&refused).expect("render refusal");
+        assert!(refused.contains(&head), "got: {refused}");
+        assert!(refused.contains("discard_head"), "got: {refused}");
+        std::fs::write(Path::new(&assignment.worktree).join("dirty"), "dirty")
+            .expect("dirty fixture");
+        let dirty = operator_tool(&plugin, "finish_issue")
+            .call(json!({"agent_id": assignment.agent_id, "discard_head": head}))
+            .await;
+        assert!(
+            serde_json::to_string(&dirty)
+                .expect("render dirty")
+                .contains("worktree is dirty")
+        );
+        std::fs::remove_file(Path::new(&assignment.worktree).join("dirty")).expect("clean fixture");
+
+        let lock = Path::new(&assignment.bare_path)
+            .join("refs/heads")
+            .join(format!("{}.lock", assignment.branch));
+        std::fs::create_dir_all(lock.parent().expect("lock parent")).expect("lock parent");
+        std::fs::write(&lock, "locked").expect("lock ref");
+        let failed = operator_tool(&plugin, "finish_issue")
+            .call(json!({"agent_id": assignment.agent_id, "discard_head": head}))
+            .await;
+        let failed = serde_json::to_string(&failed).expect("render failed cleanup");
+        assert!(failed.contains("cleanup failed"), "got: {failed}");
+        assert!(!Path::new(&assignment.worktree).exists());
+        let durable = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(durable.state, AssignmentState::Stale);
+        assert_eq!(durable.cleanup_state, CleanupState::Failed);
+        assert_eq!(durable.cleanup_head.as_deref(), Some(head.as_str()));
+        assert_eq!(durable.cleanup_reason, Some(CleanupReason::Discarded));
+        assert!(
+            ledger
+                .get_agent(assignment.agent_id.as_deref().expect("agent"))
+                .await
+                .expect("agent query")
+                .expect("agent row")
+                .retired
+        );
+
+        std::fs::remove_file(lock).expect("unlock ref");
+        let retried = operator_tool(&plugin, "finish_issue")
+            .call(json!({"assignment_id": assignment.assignment_id}))
+            .await;
+        let retried = serde_json::to_string(&retried).expect("render retry");
+        assert!(
+            retried.contains("\"state\":\"completed\""),
+            "got: {retried}"
+        );
+        assert!(
+            retried.contains("\"cleanup_reason\":\"discarded\""),
+            "got: {retried}"
+        );
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_cleanup_can_be_reauthorized_at_a_moved_branch_head() {
+        let (tmp, repos) = local_repos("discard-reauthorize").await;
+        let (plugin, _ledger) = memory_plugin(repos).await;
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 89, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let head = commit_change(Path::new(&assignment.worktree), "change", "discard").await;
+        let base = assignment.base_head.as_deref().expect("base head");
+        let lock = Path::new(&assignment.bare_path)
+            .join("refs/heads")
+            .join(format!("{}.lock", assignment.branch));
+        std::fs::create_dir_all(lock.parent().expect("lock parent")).expect("lock parent");
+        std::fs::write(&lock, "locked").expect("lock ref");
+        let failed = operator_tool(&plugin, "finish_issue")
+            .call(json!({"agent_id": assignment.agent_id, "discard_head": head}))
+            .await;
+        assert!(
+            serde_json::to_string(&failed)
+                .expect("render failed cleanup")
+                .contains("cleanup failed")
+        );
+        std::fs::remove_file(lock).expect("unlock ref");
+        git_output(
+            Path::new(&assignment.bare_path),
+            &[
+                "update-ref",
+                &format!("refs/heads/{}", assignment.branch),
+                base,
+                &head,
+            ],
+        )
+        .await
+        .expect("move branch after failed authorization");
+
+        let retried = operator_tool(&plugin, "finish_issue")
+            .call(json!({
+                "assignment_id": assignment.assignment_id,
+                "discard_head": base,
+            }))
+            .await;
+        let retried = serde_json::to_string(&retried).expect("render reauthorized cleanup");
+        assert!(
+            retried.contains("\"state\":\"completed\""),
+            "got: {retried}"
+        );
+        assert!(
+            retried.contains("\"cleanup_head\":") && retried.contains(base),
+            "got: {retried}"
+        );
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_process_cleanup_reauthorization_replaces_the_durable_fence() {
+        let (tmp, repos) = local_repos("discard-reauthorize-finishing").await;
+        let (plugin, _ledger) = memory_plugin(repos).await;
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 90, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let first = commit_change(Path::new(&assignment.worktree), "first", "one").await;
+        let assignments = plugin.assignment_db().expect("assignment db");
+        assert!(
+            assignments
+                .begin_finish(
+                    &assignment,
+                    false,
+                    Some(&first),
+                    Some(CleanupReason::Discarded),
+                )
+                .await
+                .expect("persist first cleanup intent")
+        );
+        // This models an external branch update after intent was stored and
+        // the operator request was cancelled, but before retirement/removal.
+        let second = commit_change(Path::new(&assignment.worktree), "second", "two").await;
+
+        let finished = operator_tool(&plugin, "finish_issue")
+            .call(json!({
+                "assignment_id": assignment.assignment_id,
+                "discard_head": second,
+            }))
+            .await;
+        let finished = serde_json::to_string(&finished).expect("render reauthorized finish");
+        assert!(
+            finished.contains("\"state\":\"completed\""),
+            "got: {finished}"
+        );
+        let durable = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(durable.cleanup_head.as_deref(), Some(second.as_str()));
+        assert_eq!(durable.cleanup_reason, Some(CleanupReason::Discarded));
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn branch_cleanup_deletes_the_assignment_symref_not_its_target() {
+        let (tmp, repos) = local_repos("cleanup-symref").await;
+        let (worktree, branch) = repos
+            .add_worktree("local/repo", "cleanup-symref", "main")
+            .await
+            .expect("worktree");
+        let bare = repos.bare("local/repo");
+        bare_repo(&bare)
+            .worktree(WorktreeCommand::remove(&worktree))
+            .execute()
+            .await
+            .expect("remove fixture worktree");
+        let main = git_output(
+            &bare,
+            &["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"],
+        )
+        .await
+        .expect("main commit");
+        git_output(&bare, &["update-ref", "refs/heads/main", &main])
+            .await
+            .expect("local main ref");
+        git_output(
+            &bare,
+            &[
+                "symbolic-ref",
+                &format!("refs/heads/{branch}"),
+                "refs/heads/main",
+            ],
+        )
+        .await
+        .expect("replace assignment ref with symref");
+
+        repos
+            .remove_worktree_at(&branch, &worktree, &bare, Some(&main))
+            .await
+            .expect("CAS-delete assignment symref");
+        assert_eq!(
+            git_output(
+                &bare,
+                &["rev-parse", "--verify", "refs/heads/main^{commit}"]
+            )
+            .await
+            .expect("main survives"),
+            main
+        );
+        assert!(
+            !git_predicate(
+                &bare,
+                &["symbolic-ref", "--quiet", &format!("refs/heads/{branch}")],
+            )
+            .await
+            .expect("assignment symref predicate")
+        );
+        std::fs::remove_dir_all(tmp).ok();
     }
 
     #[tokio::test]
@@ -3434,6 +6292,7 @@ mod tests {
         let repos = Repos {
             root: root.clone(),
             allowed: Arc::new(Vec::new()),
+            gh_binary: PathBuf::from("gh"),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -3471,13 +6330,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_failure_keeps_a_retryable_assignment() {
+    async fn interrupted_retention_is_retryable_after_agent_query_failure() {
+        let (tmp, repos) = local_repos("retain-retry").await;
+        let (plugin, ledger) = memory_plugin(repos).await;
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 88, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        sqlx::query(
+            "UPDATE repo_worker_assignments
+             SET state = 'stale', phase = 'finish_agent_read',
+                 cleanup_state = 'failed', last_error = 'transient ledger read failure'
+             WHERE assignment_id = ?1",
+        )
+        .bind(&assignment.assignment_id)
+        .execute(&plugin.ctx.as_ref().expect("context").pool)
+        .await
+        .expect("interrupted retention fixture");
+        plugin
+            .assignment_db()
+            .expect("assignment db")
+            .record_pr_observation(
+                &assignment.assignment_id,
+                &GhPr {
+                    number: 99,
+                    url: "https://github.com/local/repo/pull/99".into(),
+                    state: "OPEN".into(),
+                    is_draft: true,
+                    head_ref_name: assignment.branch.clone(),
+                    head_ref_oid: "unexpected".into(),
+                    base_ref_name: "wrong-base".into(),
+                    is_cross_repository: false,
+                    merged_at: None,
+                },
+                Some("observed PR identity drift"),
+            )
+            .await
+            .expect("record PR observation without erasing cleanup recovery");
+        let interrupted = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(interrupted.phase, "finish_agent_read");
+        assert_eq!(
+            interrupted.last_error.as_deref(),
+            Some("transient ledger read failure")
+        );
+
+        let retained = operator_tool(&plugin, "finish_issue")
+            .call(json!({"assignment_id": assignment.assignment_id, "keep": true}))
+            .await;
+        let retained = serde_json::to_string(&retained).expect("render retained retry");
+        assert!(
+            retained.contains("\"state\":\"retained\""),
+            "got: {retained}"
+        );
+        assert!(
+            ledger
+                .get_agent(assignment.agent_id.as_deref().expect("agent"))
+                .await
+                .expect("agent query")
+                .expect("agent")
+                .retired
+        );
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn cleanup_refuses_an_invalid_worktree_before_retiring_the_agent() {
         let root = std::env::temp_dir().join(format!("ciacola-finish-retry-{}", ulid::Ulid::new()));
         let worktree = root.join("wt-local-repo-42");
         std::fs::create_dir_all(&worktree).expect("worktree");
         let repos = Repos {
             root: root.clone(),
             allowed: Arc::new(Vec::new()),
+            gh_binary: PathBuf::from("gh"),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -3503,12 +6427,11 @@ mod tests {
         let finish = operator_tool(&plugin, "finish_issue");
         let failed = finish.call(json!({"agent_id": agent_id})).await;
         let failed = serde_json::to_string(&failed).expect("render");
-        assert!(failed.contains("assignment is stale"), "got: {failed}");
-        assert!(ledger.get_agent(&agent_id).await.unwrap().unwrap().retired);
+        assert!(failed.contains("not a git repository"), "got: {failed}");
+        assert!(!ledger.get_agent(&agent_id).await.unwrap().unwrap().retired);
         let assignments = plugin.assignments().await.expect("assignments");
         assert_eq!(assignments.len(), 1);
-        assert_eq!(assignments[0].state, AssignmentState::Stale);
-        assert!(assignments[0].last_error.is_some());
+        assert_eq!(assignments[0].state, AssignmentState::Active);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -3535,6 +6458,7 @@ mod tests {
         let repos = Repos {
             root: tmp.join("root"),
             allowed: Arc::new(vec!["local/repo".into()]),
+            gh_binary: PathBuf::from("gh"),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -3615,6 +6539,7 @@ mod tests {
         let repos = Repos {
             root: tmp.join("root"),
             allowed: Arc::new(vec!["local/repo".into()]),
+            gh_binary: PathBuf::from("gh"),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -3663,6 +6588,7 @@ mod tests {
         let repos = Repos {
             root: tmp.join("root"),
             allowed: Arc::new(vec!["local/repo".into()]),
+            gh_binary: PathBuf::from("gh"),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -3726,6 +6652,7 @@ mod tests {
         let repos = Repos {
             root: tmp.join("root"),
             allowed: Arc::new(vec!["local/repo".into()]),
+            gh_binary: PathBuf::from("gh"),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -3750,6 +6677,20 @@ mod tests {
         let refreshed = repos.ensure_clone_from("local/repo", &url).await;
         std::fs::remove_dir_all(&tmp).ok();
         refreshed.expect("refresh must not be blocked by a live worktree");
+    }
+
+    /// Repository names may legitimately end in `.git`; only the transport
+    /// URL suffix is optional syntax.
+    #[test]
+    fn github_repository_names_are_not_transport_suffixes() {
+        assert!(github_origin_matches(
+            "owner/foo.git",
+            "https://github.com/owner/foo.git.git"
+        ));
+        assert!(!github_origin_matches(
+            "owner/foo.git",
+            "https://github.com/owner/foo.git"
+        ));
     }
 
     /// The title gate is a pure function; the closed set and both
@@ -3854,6 +6795,7 @@ mod tests {
         let repos = Repos {
             root: root_path.clone(),
             allowed: Arc::new(vec!["local/repo".into()]),
+            gh_binary: PathBuf::from("gh"),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -3946,6 +6888,7 @@ mod tests {
         let repos = Repos {
             root: root.clone(),
             allowed: Arc::new(vec!["local/repo".into()]),
+            gh_binary: PathBuf::from("gh"),
             cloning: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         };
