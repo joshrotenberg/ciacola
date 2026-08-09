@@ -15,3 +15,16 @@ pub fn now_unix() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default()
 }
+
+/// Milliseconds since the epoch.
+///
+/// Turn claims use this rather than [`now_unix`] because a killed short
+/// turn still has a measured duration. A persisted wall clock also
+/// survives the process restart that recovery exists to handle;
+/// [`std::time::Instant`] does not.
+pub fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
+}

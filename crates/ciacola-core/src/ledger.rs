@@ -79,6 +79,14 @@ pub struct TurnRow {
     /// written before the provider contract.
     pub cost_state: String,
     pub elapsed_ms: i64,
+    /// `measured`, `upper_bound`, `unknown`, `not_attempted`, or
+    /// `legacy` for rows written before elapsed provenance was tracked.
+    pub elapsed_state: String,
+    /// Wall-clock milliseconds when `queued -> running` won.
+    ///
+    /// `None` is a legacy row that predates durable claim timing, not a
+    /// claim at the epoch. Queued turns also have no claim time.
+    pub claimed_unix_ms: Option<i64>,
     pub tokens_in: i64,
     pub tokens_out: i64,
     pub tokens_cached: i64,
@@ -110,6 +118,8 @@ type TurnTuple = (
     i64,
     String,
     i64,
+    String,
+    Option<i64>,
     i64,
     i64,
     i64,
@@ -135,7 +145,8 @@ const AGENT_SELECT: &str = "\
 
 const TURN_SELECT: &str = "\
     SELECT agent_id, seq, prompt, state, reply, error, cost_micro_usd, cost_state,
-           elapsed_ms, tokens_in, tokens_out, tokens_cached, usage_state, provider_turns
+           elapsed_ms, elapsed_state, claimed_unix_ms, tokens_in, tokens_out,
+           tokens_cached, usage_state, provider_turns
     FROM turns";
 
 fn agent_row(t: AgentTuple) -> Result<AgentRow, FlatError> {
@@ -178,6 +189,8 @@ fn turn_row(t: TurnTuple) -> TurnRow {
         cost_micro_usd,
         cost_state,
         elapsed_ms,
+        elapsed_state,
+        claimed_unix_ms,
         tokens_in,
         tokens_out,
         tokens_cached,
@@ -194,6 +207,8 @@ fn turn_row(t: TurnTuple) -> TurnRow {
         cost_micro_usd,
         cost_state,
         elapsed_ms,
+        elapsed_state,
+        claimed_unix_ms,
         tokens_in,
         tokens_out,
         tokens_cached,
@@ -215,6 +230,45 @@ fn usage_state(usage: ciacola_agent::Usage) -> &'static str {
         ciacola_agent::Usage::Reported(_) => "reported",
         ciacola_agent::Usage::Unreported => "unreported",
         ciacola_agent::Usage::NotTracked => "not_tracked",
+    }
+}
+
+impl TurnRow {
+    /// A monetary value known to be a measurement.
+    ///
+    /// A positive legacy value is unambiguous enough to preserve as a
+    /// historical sample. Legacy zero is the old conflation this method
+    /// exists to avoid and therefore remains unknown.
+    pub fn reported_cost_micro_usd(&self) -> Option<i64> {
+        (self.cost_state == "reported" || (self.cost_state == "legacy" && self.cost_micro_usd != 0))
+            .then_some(self.cost_micro_usd)
+    }
+
+    /// Token buckets known to be measurements.
+    ///
+    /// As with cost, nonzero legacy buckets are useful history while an
+    /// all-zero legacy row cannot say whether the provider measured zero
+    /// or reported nothing.
+    pub fn reported_tokens(&self) -> Option<(i64, i64, i64)> {
+        (self.usage_state == "reported"
+            || (self.usage_state == "legacy"
+                && (self.tokens_in != 0 || self.tokens_out != 0 || self.tokens_cached != 0)))
+            .then_some((self.tokens_in, self.tokens_out, self.tokens_cached))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InterruptionTiming {
+    Live,
+    Recovery,
+}
+
+impl InterruptionTiming {
+    const fn as_sql(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Recovery => "recovery",
+        }
     }
 }
 
@@ -300,6 +354,14 @@ impl Ledger {
                 "0013_turns_provider_turns",
                 "ALTER TABLE turns ADD COLUMN provider_turns INTEGER",
             ),
+            Migration::add_column(
+                "0014_turns_claimed_unix_ms",
+                "ALTER TABLE turns ADD COLUMN claimed_unix_ms INTEGER",
+            ),
+            Migration::add_column(
+                "0015_turns_elapsed_state",
+                "ALTER TABLE turns ADD COLUMN elapsed_state TEXT NOT NULL DEFAULT 'legacy'",
+            ),
         ];
         crate::plugin::apply_migrations(&pool, "core", MIGRATIONS).await?;
         let ledger = Self {
@@ -354,6 +416,35 @@ impl Ledger {
     /// [`ciacola_agent::AgentError::UnknownProvider`].
     pub fn providers(&self) -> &ciacola_agent::ProviderRegistry {
         &self.providers
+    }
+
+    /// The honest terminal accounting when a provider attempt ends
+    /// without a result event.
+    ///
+    /// A backend that never prices or counts says so; one that normally
+    /// reports a bucket but could not because it was killed says the
+    /// bucket is unreported. If the configured backend is unavailable,
+    /// neither claim can be made and both remain unreported.
+    async fn unavailable_telemetry(
+        &self,
+        agent_id: &str,
+    ) -> Result<(ciacola_agent::Cost, ciacola_agent::Usage), FlatError> {
+        let capabilities = self
+            .get_agent(agent_id)
+            .await?
+            .and_then(|agent| self.providers.get(&agent.def.provider).ok())
+            .map(|provider| provider.capabilities());
+        let cost = match capabilities.as_ref() {
+            Some(capabilities) if !capabilities.reports_cost => ciacola_agent::Cost::NotPriced,
+            _ => ciacola_agent::Cost::Unreported,
+        };
+        let usage = match capabilities.as_ref() {
+            Some(capabilities) if !capabilities.reports_token_usage => {
+                ciacola_agent::Usage::NotTracked
+            }
+            _ => ciacola_agent::Usage::Unreported,
+        };
+        Ok((cost, usage))
     }
 }
 
@@ -456,6 +547,37 @@ impl Ledger {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Replace this turn's best-known cumulative token snapshot.
+    ///
+    /// Providers emit totals, never deltas, so replacement is both
+    /// idempotent and immune to retry double-counting. A snapshot queued
+    /// just before cancellation may reach SQLite after the kill update;
+    /// claimed killed rows remain writable for exactly that drain window.
+    /// A queued kill has no claim and can never be turned into a provider
+    /// run by a stray event.
+    pub async fn record_usage_snapshot(
+        &self,
+        agent_id: &str,
+        seq: i64,
+        usage: ciacola_agent::TokenUsage,
+    ) -> Result<bool, FlatError> {
+        let done = sqlx::query(
+            "UPDATE turns SET tokens_in = ?3, tokens_out = ?4, tokens_cached = ?5,
+                 usage_state = 'reported'
+             WHERE agent_id = ?1 AND seq = ?2
+               AND (state = 'running'
+                    OR (state = 'killed' AND claimed_unix_ms IS NOT NULL))",
+        )
+        .bind(agent_id)
+        .bind(seq)
+        .bind(usage.input as i64)
+        .bind(usage.output as i64)
+        .bind(usage.cached_input as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
     }
 }
 
@@ -689,14 +811,152 @@ impl Ledger {
 
     /// `queued -> running`, exactly once. Returning false means someone
     /// else already ran (or is running) this turn, and the caller must
-    /// not run it again; this is what makes redelivery safe.
+    /// not run it again; this is what makes redelivery safe. The claim
+    /// time is part of the same write so a kill can never observe
+    /// `running` without the clock it needs to settle elapsed time.
     pub async fn claim_turn(&self, agent_id: &str, seq: i64) -> Result<bool, FlatError> {
         let done = sqlx::query(
-            "UPDATE turns SET state = 'running'
+            "UPDATE turns SET state = 'running', claimed_unix_ms = ?3
              WHERE agent_id = ?1 AND seq = ?2 AND state = 'queued'",
         )
         .bind(agent_id)
         .bind(seq)
+        .bind(crate::time::now_unix_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    /// Settle a queued or running turn from outside its provider future.
+    ///
+    /// This is the convergence point for an operator kill and restart
+    /// recovery. The terminal transition and elapsed calculation are a
+    /// single UPDATE: if a claim races the interruption, either the
+    /// queued row is settled first as a known zero-cost non-attempt, or
+    /// the claim lands first with a timestamp the interruption measures.
+    /// There is no read gap in which a running attempt can become a
+    /// false `0ms` provider run.
+    ///
+    /// A queued turn has known zero cost and usage because the provider
+    /// was never touched. A running turn uses the selected provider's
+    /// declared reporting capabilities. Numeric zeros remain storage
+    /// defaults; their state columns say whether zero was measured,
+    /// unavailable, or a bucket the provider never tracks. A legacy
+    /// running row without a durable claim clock retains its old
+    /// elapsed value with `unknown` provenance.
+    pub async fn interrupt_turn(
+        &self,
+        agent_id: &str,
+        seq: i64,
+        state: &str,
+        error: &str,
+    ) -> Result<bool, FlatError> {
+        self.settle_interruption(agent_id, seq, state, error, InterruptionTiming::Live)
+            .await
+    }
+
+    /// Settle a turn found running during restart recovery.
+    ///
+    /// The durable claim-to-restart interval contains the provider run,
+    /// but may also contain time after the process died. It is therefore
+    /// an upper bound, not a measured provider duration. Legacy running
+    /// rows without a claim timestamp retain their numeric value but are
+    /// explicitly marked unknown.
+    pub async fn recover_turn(
+        &self,
+        agent_id: &str,
+        seq: i64,
+        error: &str,
+    ) -> Result<bool, FlatError> {
+        self.settle_interruption(agent_id, seq, "failed", error, InterruptionTiming::Recovery)
+            .await
+    }
+
+    async fn settle_interruption(
+        &self,
+        agent_id: &str,
+        seq: i64,
+        state: &str,
+        error: &str,
+        timing: InterruptionTiming,
+    ) -> Result<bool, FlatError> {
+        let (cost, usage) = self.unavailable_telemetry(agent_id).await?;
+        let now_ms = crate::time::now_unix_ms();
+        let done = sqlx::query(
+            "UPDATE turns SET state = ?3, error = ?4,
+                 cost_micro_usd = 0,
+                 cost_state = CASE WHEN state = 'queued' THEN 'reported' ELSE ?5 END,
+                 tokens_in = CASE
+                     WHEN state = 'queued' OR usage_state <> 'reported' THEN 0
+                     ELSE tokens_in
+                 END,
+                 tokens_out = CASE
+                     WHEN state = 'queued' OR usage_state <> 'reported' THEN 0
+                     ELSE tokens_out
+                 END,
+                 tokens_cached = CASE
+                     WHEN state = 'queued' OR usage_state <> 'reported' THEN 0
+                     ELSE tokens_cached
+                 END,
+                 usage_state = CASE
+                     WHEN state = 'queued' THEN 'reported'
+                     WHEN usage_state = 'reported' THEN 'reported'
+                     ELSE ?6
+                 END,
+                 provider_turns = CASE WHEN state = 'queued' THEN 0 ELSE NULL END,
+                 elapsed_state = CASE
+                     WHEN state = 'queued' THEN 'not_attempted'
+                     WHEN ?8 = 'recovery' AND claimed_unix_ms IS NOT NULL THEN 'upper_bound'
+                     WHEN ?8 = 'recovery' THEN 'unknown'
+                     WHEN claimed_unix_ms IS NULL THEN 'unknown'
+                     ELSE 'measured'
+                 END,
+                 elapsed_ms = MAX(
+                     elapsed_ms,
+                     CASE
+                         WHEN state = 'running' AND claimed_unix_ms IS NOT NULL
+                             THEN MAX(?7 - claimed_unix_ms, 0)
+                         ELSE 0
+                     END)
+             WHERE agent_id = ?1 AND seq = ?2 AND state IN ('queued', 'running')
+               AND (?8 = 'live' OR state = 'running')",
+        )
+        .bind(agent_id)
+        .bind(seq)
+        .bind(state)
+        .bind(error)
+        .bind(cost_state(cost))
+        .bind(usage_state(usage))
+        .bind(now_ms)
+        .bind(timing.as_sql())
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    /// Fail a claimed dispatch before its provider future was touched.
+    ///
+    /// This is narrower than interruption: it only accepts `running`,
+    /// and records the known fact that no provider attempt, spend, usage,
+    /// or runtime occurred. It is used when installing or validating the
+    /// process-local kill registration itself fails.
+    pub async fn abort_claimed_turn(
+        &self,
+        agent_id: &str,
+        seq: i64,
+        error: &str,
+    ) -> Result<bool, FlatError> {
+        let done = sqlx::query(
+            "UPDATE turns SET state = 'failed', error = ?3,
+                 cost_micro_usd = 0, cost_state = 'reported',
+                 tokens_in = 0, tokens_out = 0, tokens_cached = 0,
+                 usage_state = 'reported', provider_turns = 0,
+                 elapsed_ms = 0, elapsed_state = 'not_attempted'
+             WHERE agent_id = ?1 AND seq = ?2 AND state = 'running'",
+        )
+        .bind(agent_id)
+        .bind(seq)
+        .bind(error)
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected() == 1)
@@ -719,8 +979,24 @@ impl Ledger {
         let mut tx = self.pool.begin().await?;
         let done = sqlx::query(
             "UPDATE turns SET state = 'ok', reply = ?3, cost_micro_usd = ?4,
-                 cost_state = ?5, elapsed_ms = ?6, tokens_in = ?7, tokens_out = ?8,
-                 tokens_cached = ?9, usage_state = ?10, provider_turns = ?11
+                 cost_state = ?5, elapsed_ms = ?6, elapsed_state = 'measured',
+                 tokens_in = CASE
+                     WHEN ?10 = 'reported' OR usage_state <> 'reported' THEN ?7
+                     ELSE tokens_in
+                 END,
+                 tokens_out = CASE
+                     WHEN ?10 = 'reported' OR usage_state <> 'reported' THEN ?8
+                     ELSE tokens_out
+                 END,
+                 tokens_cached = CASE
+                     WHEN ?10 = 'reported' OR usage_state <> 'reported' THEN ?9
+                     ELSE tokens_cached
+                 END,
+                 usage_state = CASE
+                     WHEN ?10 = 'reported' OR usage_state <> 'reported' THEN ?10
+                     ELSE usage_state
+                 END,
+                 provider_turns = ?11
              WHERE agent_id = ?1 AND seq = ?2 AND state = 'running'",
         )
         .bind(agent_id)
@@ -767,22 +1043,20 @@ impl Ledger {
         Ok(recorded)
     }
 
-    /// Mark a turn failed or killed. Touches nothing if the turn already
-    /// completed, so a late kill cannot overwrite a result. A failed
-    /// exchange can still have cost money and learned a session id; both
-    /// are recorded on the agent so spend is never under-reported and a
-    /// half-finished conversation stays resumable.
     /// Settle a turn that did not succeed.
     ///
-    /// `elapsed_ms` is wall clock for the attempt, which is measurable
-    /// whatever went wrong and used to be discarded: a five minute
-    /// failure read as 0ms, so the runs most worth investigating looked
-    /// like the cheapest ones on the board.
-    // Eight positional arguments is past where this stays readable.
-    // Left alone rather than wrapped in a struct because every caller
-    // is in this crate and the next change here is likely a
-    // claimed-at column, which is the thing that would make a struct
-    // worth it.
+    /// Touches nothing if the turn already completed. A failed exchange
+    /// can still have cost money and learned a session id; both are
+    /// recorded on the agent so spend is never under-reported and a
+    /// half-finished conversation stays resumable.
+    ///
+    /// For a running attempt, `elapsed_ms` is measured wall clock. That
+    /// used to be discarded on failure: a five minute failure read as
+    /// 0ms, so the runs most worth investigating looked like the cheapest
+    /// ones on the board. A queued row is explicitly `not_attempted`.
+    // This compatibility path still accepts scalar telemetry. New provider
+    // execution paths should prefer `fail_exchange`, which preserves the
+    // provider's typed accounting states.
     #[allow(clippy::too_many_arguments)]
     pub async fn fail_turn(
         &self,
@@ -794,10 +1068,35 @@ impl Ledger {
         elapsed_ms: i64,
         session: Option<&str>,
     ) -> Result<bool, FlatError> {
+        let (unavailable_cost, unavailable_usage) = self.unavailable_telemetry(agent_id).await?;
+        let cost = if cost_micro_usd > 0 {
+            ciacola_agent::Cost::Reported {
+                micro_usd: cost_micro_usd as u64,
+            }
+        } else {
+            unavailable_cost
+        };
         let mut tx = self.pool.begin().await?;
         let done = sqlx::query(
             "UPDATE turns SET state = ?3, error = ?4, cost_micro_usd = ?5,
-                 elapsed_ms = ?6
+                 cost_state = CASE
+                     WHEN state = 'queued' AND ?5 = 0 THEN 'reported'
+                     ELSE ?6
+                 END,
+                 elapsed_ms = ?7,
+                 elapsed_state = CASE
+                     WHEN state = 'queued' THEN 'not_attempted'
+                     ELSE 'measured'
+                 END,
+                 tokens_in = CASE WHEN state = 'queued' THEN 0 ELSE tokens_in END,
+                 tokens_out = CASE WHEN state = 'queued' THEN 0 ELSE tokens_out END,
+                 tokens_cached = CASE WHEN state = 'queued' THEN 0 ELSE tokens_cached END,
+                 usage_state = CASE
+                     WHEN state = 'queued' THEN 'reported'
+                     WHEN usage_state = 'reported' THEN 'reported'
+                     ELSE ?8
+                 END,
+                 provider_turns = CASE WHEN state = 'queued' THEN 0 ELSE provider_turns END
              WHERE agent_id = ?1 AND seq = ?2 AND state IN ('queued', 'running')",
         )
         .bind(agent_id)
@@ -805,7 +1104,9 @@ impl Ledger {
         .bind(state)
         .bind(error)
         .bind(cost_micro_usd)
+        .bind(cost_state(cost))
         .bind(elapsed_ms)
+        .bind(usage_state(unavailable_usage))
         .execute(&mut *tx)
         .await?;
         let recorded = done.rows_affected() == 1;
@@ -848,8 +1149,24 @@ impl Ledger {
         let mut tx = self.pool.begin().await?;
         let done = sqlx::query(
             "UPDATE turns SET state = ?3, error = ?4, cost_micro_usd = ?5,
-                 cost_state = ?6, elapsed_ms = ?7, tokens_in = ?8, tokens_out = ?9,
-                 tokens_cached = ?10, usage_state = ?11, provider_turns = ?12
+                 cost_state = ?6, elapsed_ms = ?7, elapsed_state = 'measured',
+                 tokens_in = CASE
+                     WHEN ?11 = 'reported' OR usage_state <> 'reported' THEN ?8
+                     ELSE tokens_in
+                 END,
+                 tokens_out = CASE
+                     WHEN ?11 = 'reported' OR usage_state <> 'reported' THEN ?9
+                     ELSE tokens_out
+                 END,
+                 tokens_cached = CASE
+                     WHEN ?11 = 'reported' OR usage_state <> 'reported' THEN ?10
+                     ELSE tokens_cached
+                 END,
+                 usage_state = CASE
+                     WHEN ?11 = 'reported' OR usage_state <> 'reported' THEN ?11
+                     ELSE usage_state
+                 END,
+                 provider_turns = ?12
              WHERE agent_id = ?1 AND seq = ?2 AND state IN ('queued', 'running')",
         )
         .bind(agent_id)
@@ -926,12 +1243,201 @@ impl Ledger {
 mod session_tests {
     use super::*;
     use crate::agent::{AgentDef, Exchange};
+    use std::sync::Arc;
 
     async fn ledger() -> Ledger {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:")
             .await
             .expect("pool");
         Ledger::setup(pool).await.expect("ledger")
+    }
+
+    struct AccountingProvider {
+        key: ciacola_agent::ProviderKey,
+        reports_cost: bool,
+        reports_usage: bool,
+    }
+
+    impl ciacola_agent::Provider for AccountingProvider {
+        fn key(&self) -> ciacola_agent::ProviderKey {
+            self.key.clone()
+        }
+
+        fn capabilities(&self) -> ciacola_agent::Capabilities {
+            let mut capabilities = ciacola_agent::Capabilities::none(self.key.clone());
+            capabilities.reports_cost = self.reports_cost;
+            capabilities.reports_token_usage = self.reports_usage;
+            capabilities
+        }
+
+        fn run<'a>(
+            &'a self,
+            _intent: &'a ciacola_agent::TurnIntent,
+            _events: &'a dyn ciacola_agent::TurnEvents,
+        ) -> ciacola_agent::BoxFut<'a, Result<ciacola_agent::TurnOutcome, ciacola_agent::AgentError>>
+        {
+            Box::pin(async { panic!("accounting-only provider must not run") })
+        }
+
+        fn owns_process(&self, _ps_line: &str) -> bool {
+            false
+        }
+    }
+
+    async fn ledger_with_provider(key: &str, reports_cost: bool, reports_usage: bool) -> Ledger {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let providers = ciacola_agent::ProviderRegistry::new()
+            .with(Arc::new(AccountingProvider {
+                key: ciacola_agent::ProviderKey::new(key),
+                reports_cost,
+                reports_usage,
+            }))
+            .expect("provider");
+        Ledger::setup(pool)
+            .await
+            .expect("ledger")
+            .with_providers(providers)
+    }
+
+    /// Upgrade a real pre-0014 shape rather than manufacturing legacy
+    /// values after setup. Existing terminal and in-flight rows keep
+    /// nullable claim time and explicit legacy elapsed provenance; a
+    /// legacy running row recovered without a claim clock becomes
+    /// `unknown`, never a fabricated zero-duration measurement.
+    #[tokio::test]
+    async fn pre_claim_timestamp_database_upgrades_without_rewriting_history() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        sqlx::query(
+            "CREATE TABLE agents (
+                 agent_id TEXT PRIMARY KEY, name TEXT NOT NULL, def TEXT NOT NULL,
+                 session TEXT, cost_micro_usd INTEGER NOT NULL DEFAULT 0,
+                 spawned_by TEXT, retired INTEGER NOT NULL DEFAULT 0,
+                 session_started_seq INTEGER NOT NULL DEFAULT 0, token TEXT);
+             CREATE UNIQUE INDEX idx_agents_token ON agents(token);
+             CREATE TABLE turns (
+                 agent_id TEXT NOT NULL, seq INTEGER NOT NULL, prompt TEXT NOT NULL,
+                 state TEXT NOT NULL, reply TEXT, error TEXT,
+                 cost_micro_usd INTEGER NOT NULL DEFAULT 0,
+                 elapsed_ms INTEGER NOT NULL DEFAULT 0,
+                 at_unix INTEGER NOT NULL DEFAULT 0,
+                 tokens_in INTEGER NOT NULL DEFAULT 0,
+                 tokens_out INTEGER NOT NULL DEFAULT 0,
+                 tokens_cached INTEGER NOT NULL DEFAULT 0,
+                 cost_state TEXT NOT NULL DEFAULT 'legacy',
+                 usage_state TEXT NOT NULL DEFAULT 'legacy',
+                 provider_turns INTEGER,
+                 PRIMARY KEY (agent_id, seq));
+             CREATE TABLE schema_migrations (
+                 owner TEXT NOT NULL, name TEXT NOT NULL, applied_unix INTEGER NOT NULL,
+                 PRIMARY KEY (owner, name));",
+        )
+        .execute(&pool)
+        .await
+        .expect("pre-0014 schema");
+        for name in [
+            "0001_agents_turns",
+            "0002_agents_spawned_by",
+            "0003_agents_retired",
+            "0004_agents_session_started_seq",
+            "0005_turns_at_unix",
+            "0006_turns_tokens_in",
+            "0007_turns_tokens_out",
+            "0008_turns_tokens_cached",
+            "0009_agents_token",
+            "0010_agents_token_index",
+            "0011_turns_cost_state",
+            "0012_turns_usage_state",
+            "0013_turns_provider_turns",
+        ] {
+            sqlx::query(
+                "INSERT INTO schema_migrations (owner, name, applied_unix)
+                 VALUES ('core', ?1, 1)",
+            )
+            .bind(name)
+            .execute(&pool)
+            .await
+            .expect("migration marker");
+        }
+
+        let def = serde_json::to_string(&AgentDef::new("legacy", "sys")).expect("definition");
+        sqlx::query(
+            "INSERT INTO agents (agent_id, name, def, token)
+             VALUES ('legacy-agent', 'legacy', ?1, 'legacy-token')",
+        )
+        .bind(def)
+        .execute(&pool)
+        .await
+        .expect("agent");
+        for (seq, state, elapsed_ms) in [
+            (1, "ok", 2_000),
+            (2, "running", 700),
+            (3, "queued", 0),
+            (4, "running", 900),
+        ] {
+            sqlx::query(
+                "INSERT INTO turns (agent_id, seq, prompt, state, elapsed_ms, at_unix)
+                 VALUES ('legacy-agent', ?1, 'work', ?2, ?3, 1)",
+            )
+            .bind(seq)
+            .bind(state)
+            .bind(elapsed_ms)
+            .execute(&pool)
+            .await
+            .expect("turn");
+        }
+
+        let ledger = Ledger::setup(pool).await.expect("upgrade");
+        for seq in 1..=4 {
+            let turn = ledger
+                .get_turn("legacy-agent", seq)
+                .await
+                .expect("turn query")
+                .expect("turn");
+            assert_eq!(turn.claimed_unix_ms, None);
+            assert_eq!(turn.elapsed_state, "legacy");
+        }
+
+        assert!(
+            ledger
+                .recover_turn("legacy-agent", 2, "orphaned by restart")
+                .await
+                .expect("recover")
+        );
+        let recovered = ledger
+            .get_turn("legacy-agent", 2)
+            .await
+            .expect("turn query")
+            .expect("turn");
+        assert_eq!(recovered.state, "failed");
+        assert_eq!(recovered.elapsed_ms, 700);
+        assert_eq!(recovered.elapsed_state, "unknown");
+        assert!(
+            ledger
+                .interrupt_turn("legacy-agent", 4, "killed", "live kill without claim clock")
+                .await
+                .expect("interrupt")
+        );
+        let interrupted = ledger
+            .get_turn("legacy-agent", 4)
+            .await
+            .expect("turn query")
+            .expect("turn");
+        assert_eq!(interrupted.state, "killed");
+        assert_eq!(interrupted.elapsed_ms, 900);
+        assert_eq!(interrupted.elapsed_state, "unknown");
+        assert_eq!(
+            ledger
+                .get_turn("legacy-agent", 3)
+                .await
+                .expect("turn query")
+                .expect("turn")
+                .state,
+            "queued"
+        );
     }
 
     fn exchange(session: &str) -> Exchange {
@@ -1052,6 +1558,14 @@ mod session_tests {
             "the next turn must use --resume, not reuse --session-id"
         );
         assert_eq!(a.cost_micro_usd, 1_250_000);
+        assert_eq!(
+            l.get_turn(&id, 1)
+                .await
+                .expect("turn query")
+                .expect("turn")
+                .elapsed_state,
+            "measured"
+        );
     }
 
     /// The arithmetic that depends on the above. `in_session` is
@@ -1363,6 +1877,19 @@ mod session_tests {
             .expect("create");
         let seq = l.enqueue_turn(&id, "go").await.unwrap();
         assert!(l.claim_turn(&id, seq).await.unwrap());
+        assert!(
+            l.record_usage_snapshot(
+                &id,
+                seq,
+                ciacola_agent::TokenUsage {
+                    input: 99,
+                    output: 98,
+                    cached_input: 97,
+                },
+            )
+            .await
+            .expect("snapshot")
+        );
         let exchange = Exchange {
             reply: String::new(),
             session: None,
@@ -1389,5 +1916,354 @@ mod session_tests {
             (12, 3, 7)
         );
         assert_eq!(turn.provider_turns, Some(9));
+        assert_eq!(turn.elapsed_state, "measured");
+        assert_eq!(turn.reported_tokens(), Some((12, 3, 7)));
+        assert_eq!(turn.reported_cost_micro_usd(), None);
+    }
+
+    #[tokio::test]
+    async fn terminal_usage_gaps_do_not_erase_reported_snapshots() {
+        let l = ledger().await;
+        let id = l
+            .create_agent(&AgentDef::new("a", "s"), None)
+            .await
+            .expect("agent");
+
+        let success = l.enqueue_turn(&id, "success").await.expect("turn");
+        assert!(l.claim_turn(&id, success).await.expect("claim"));
+        assert!(
+            l.record_usage_snapshot(
+                &id,
+                success,
+                ciacola_agent::TokenUsage {
+                    input: 30,
+                    output: 5,
+                    cached_input: 12,
+                },
+            )
+            .await
+            .expect("snapshot")
+        );
+        let no_terminal_usage = Exchange {
+            reply: "done".into(),
+            session: None,
+            cost: ciacola_agent::Cost::Reported { micro_usd: 10 },
+            usage: ciacola_agent::Usage::Unreported,
+            provider_turns: Some(1),
+            elapsed_ms: 100,
+            error: None,
+        };
+        assert!(
+            l.complete_turn(&id, success, &no_terminal_usage)
+                .await
+                .expect("complete")
+        );
+        assert_eq!(
+            l.get_turn(&id, success)
+                .await
+                .unwrap()
+                .unwrap()
+                .reported_tokens(),
+            Some((30, 5, 12))
+        );
+
+        let failed = l.enqueue_turn(&id, "failed").await.expect("turn");
+        assert!(l.claim_turn(&id, failed).await.expect("claim"));
+        assert!(
+            l.record_usage_snapshot(
+                &id,
+                failed,
+                ciacola_agent::TokenUsage {
+                    input: 44,
+                    output: 7,
+                    cached_input: 18,
+                },
+            )
+            .await
+            .expect("snapshot")
+        );
+        let partial_without_usage = Exchange {
+            reply: String::new(),
+            session: None,
+            cost: ciacola_agent::Cost::Unreported,
+            usage: ciacola_agent::Usage::Unreported,
+            provider_turns: None,
+            elapsed_ms: 200,
+            error: Some("timed out after launch".into()),
+        };
+        assert!(
+            l.fail_exchange(
+                &id,
+                failed,
+                "failed",
+                "timed out after launch",
+                &partial_without_usage,
+            )
+            .await
+            .expect("fail")
+        );
+        assert_eq!(
+            l.get_turn(&id, failed)
+                .await
+                .unwrap()
+                .unwrap()
+                .reported_tokens(),
+            Some((44, 7, 18))
+        );
+    }
+
+    /// The live-kill regression: elapsed time comes from the durable
+    /// claim, and a provider that normally reports both buckets records
+    /// their absence rather than manufacturing measured zeros.
+    #[tokio::test]
+    async fn interrupting_a_running_turn_keeps_elapsed_and_marks_gaps() {
+        let l = ledger_with_provider("priced", true, true).await;
+        let id = l
+            .create_agent(&AgentDef::new("a", "s").provider("priced"), None)
+            .await
+            .expect("agent");
+        let seq = l.enqueue_turn(&id, "work for a while").await.expect("turn");
+        assert!(l.claim_turn(&id, seq).await.expect("claim"));
+        let claimed = crate::time::now_unix_ms() - 2_000;
+        sqlx::query("UPDATE turns SET claimed_unix_ms = ?3 WHERE agent_id = ?1 AND seq = ?2")
+            .bind(&id)
+            .bind(seq)
+            .bind(claimed)
+            .execute(l.pool())
+            .await
+            .expect("age claim");
+
+        assert!(
+            l.interrupt_turn(&id, seq, "killed", "killed by request")
+                .await
+                .expect("interrupt")
+        );
+        let turn = l.get_turn(&id, seq).await.unwrap().unwrap();
+        assert_eq!(turn.state, "killed");
+        assert_eq!(turn.claimed_unix_ms, Some(claimed));
+        assert!(turn.elapsed_ms >= 2_000, "elapsed was {}", turn.elapsed_ms);
+        assert_eq!(turn.elapsed_state, "measured");
+        assert_eq!(turn.cost_state, "unreported");
+        assert_eq!(turn.usage_state, "unreported");
+        assert_eq!(turn.reported_cost_micro_usd(), None);
+        assert_eq!(turn.reported_tokens(), None);
+    }
+
+    /// The other side of the kill/claim race. If interruption wins, the
+    /// provider never starts and a later delivery cannot claim the row.
+    #[tokio::test]
+    async fn interrupting_a_queued_turn_prevents_claim_and_measures_zero_runtime() {
+        let l = ledger_with_provider("priced", true, true).await;
+        let id = l
+            .create_agent(&AgentDef::new("a", "s").provider("priced"), None)
+            .await
+            .expect("agent");
+        let seq = l.enqueue_turn(&id, "queued work").await.expect("turn");
+
+        assert!(
+            l.interrupt_turn(&id, seq, "killed", "killed by request")
+                .await
+                .expect("interrupt")
+        );
+        assert!(!l.claim_turn(&id, seq).await.expect("late claim"));
+        let turn = l.get_turn(&id, seq).await.unwrap().unwrap();
+        assert_eq!(turn.elapsed_ms, 0);
+        assert_eq!(turn.claimed_unix_ms, None);
+        assert_eq!(turn.elapsed_state, "not_attempted");
+        assert_eq!(turn.cost_state, "reported");
+        assert_eq!(turn.usage_state, "reported");
+        assert_eq!(turn.provider_turns, Some(0));
+        assert_eq!(turn.reported_cost_micro_usd(), Some(0));
+        assert_eq!(turn.reported_tokens(), Some((0, 0, 0)));
+        assert!(
+            !l.record_usage_snapshot(
+                &id,
+                seq,
+                ciacola_agent::TokenUsage {
+                    input: 1,
+                    output: 1,
+                    cached_input: 0,
+                },
+            )
+            .await
+            .expect("queued kill rejects snapshots")
+        );
+    }
+
+    /// Backend capability is part of the fact: Codex-like providers do
+    /// not have a missing monetary price when they never produce one.
+    #[tokio::test]
+    async fn interruption_distinguishes_unpriced_from_unreported() {
+        let l = ledger_with_provider("unpriced", false, true).await;
+        let id = l
+            .create_agent(&AgentDef::new("a", "s").provider("unpriced"), None)
+            .await
+            .expect("agent");
+        let seq = l.enqueue_turn(&id, "work").await.expect("turn");
+        assert!(l.claim_turn(&id, seq).await.expect("claim"));
+        assert!(
+            l.interrupt_turn(&id, seq, "killed", "killed by request")
+                .await
+                .expect("interrupt")
+        );
+        let turn = l.get_turn(&id, seq).await.unwrap().unwrap();
+        assert_eq!(turn.cost_state, "not_priced");
+        assert_eq!(turn.usage_state, "unreported");
+        assert_eq!(turn.elapsed_state, "measured");
+    }
+
+    /// A provider can genuinely report zero. The state, not the number,
+    /// is what makes that different from the interrupted rows above.
+    #[tokio::test]
+    async fn reported_zero_remains_a_measurement() {
+        let l = ledger().await;
+        let id = l
+            .create_agent(&AgentDef::new("a", "s"), None)
+            .await
+            .expect("agent");
+        let seq = l.enqueue_turn(&id, "work").await.expect("turn");
+        assert!(l.claim_turn(&id, seq).await.expect("claim"));
+        let outcome = Exchange {
+            reply: "done".into(),
+            session: None,
+            cost: ciacola_agent::Cost::Reported { micro_usd: 0 },
+            usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage::default()),
+            provider_turns: Some(0),
+            elapsed_ms: 0,
+            error: None,
+        };
+        assert!(l.complete_turn(&id, seq, &outcome).await.expect("complete"));
+        let turn = l.get_turn(&id, seq).await.unwrap().unwrap();
+        assert_eq!(turn.reported_cost_micro_usd(), Some(0));
+        assert_eq!(turn.reported_tokens(), Some((0, 0, 0)));
+        assert_eq!(turn.elapsed_state, "measured");
+    }
+
+    #[tokio::test]
+    async fn abort_before_provider_is_a_known_zero_non_attempt() {
+        let l = ledger_with_provider("priced", true, true).await;
+        let id = l
+            .create_agent(&AgentDef::new("a", "s").provider("priced"), None)
+            .await
+            .expect("agent");
+        let seq = l.enqueue_turn(&id, "work").await.expect("turn");
+        assert!(l.claim_turn(&id, seq).await.expect("claim"));
+
+        assert!(
+            l.abort_claimed_turn(&id, seq, "dispatch could not start")
+                .await
+                .expect("abort")
+        );
+        let turn = l.get_turn(&id, seq).await.unwrap().unwrap();
+        assert_eq!(turn.state, "failed");
+        assert_eq!(turn.elapsed_state, "not_attempted");
+        assert_eq!(turn.elapsed_ms, 0);
+        assert_eq!(turn.reported_cost_micro_usd(), Some(0));
+        assert_eq!(turn.reported_tokens(), Some((0, 0, 0)));
+        assert_eq!(turn.provider_turns, Some(0));
+    }
+
+    #[tokio::test]
+    async fn cumulative_usage_snapshot_survives_both_sides_of_a_live_kill() {
+        let l = ledger_with_provider("priced", true, true).await;
+        let id = l
+            .create_agent(&AgentDef::new("a", "s").provider("priced"), None)
+            .await
+            .expect("agent");
+        let seq = l.enqueue_turn(&id, "work").await.expect("turn");
+        assert!(l.claim_turn(&id, seq).await.expect("claim"));
+
+        assert!(
+            l.record_usage_snapshot(
+                &id,
+                seq,
+                ciacola_agent::TokenUsage {
+                    input: 10,
+                    output: 2,
+                    cached_input: 3,
+                },
+            )
+            .await
+            .expect("running snapshot")
+        );
+        assert!(
+            l.interrupt_turn(&id, seq, "killed", "stopped")
+                .await
+                .expect("kill")
+        );
+        assert!(
+            l.record_usage_snapshot(
+                &id,
+                seq,
+                ciacola_agent::TokenUsage {
+                    input: 15,
+                    output: 4,
+                    cached_input: 5,
+                },
+            )
+            .await
+            .expect("drained snapshot after kill")
+        );
+
+        let turn = l.get_turn(&id, seq).await.unwrap().unwrap();
+        assert_eq!(turn.reported_tokens(), Some((15, 4, 5)));
+        assert_eq!(turn.cost_state, "unreported");
+        assert_eq!(turn.reported_cost_micro_usd(), None);
+    }
+
+    #[tokio::test]
+    async fn recovery_and_scalar_failure_preserve_reported_usage_snapshots() {
+        let l = ledger_with_provider("priced", true, true).await;
+        let id = l
+            .create_agent(&AgentDef::new("a", "s").provider("priced"), None)
+            .await
+            .expect("agent");
+        let usage = ciacola_agent::TokenUsage {
+            input: 21,
+            output: 8,
+            cached_input: 13,
+        };
+
+        let recovered = l.enqueue_turn(&id, "recover").await.expect("turn");
+        assert!(l.claim_turn(&id, recovered).await.expect("claim"));
+        assert!(
+            l.record_usage_snapshot(&id, recovered, usage)
+                .await
+                .expect("snapshot")
+        );
+        assert!(
+            l.recover_turn(&id, recovered, "restart")
+                .await
+                .expect("recover")
+        );
+        assert_eq!(
+            l.get_turn(&id, recovered)
+                .await
+                .unwrap()
+                .unwrap()
+                .reported_tokens(),
+            Some((21, 8, 13))
+        );
+
+        let failed = l.enqueue_turn(&id, "fail").await.expect("turn");
+        assert!(l.claim_turn(&id, failed).await.expect("claim"));
+        assert!(
+            l.record_usage_snapshot(&id, failed, usage)
+                .await
+                .expect("snapshot")
+        );
+        assert!(
+            l.fail_turn(&id, failed, "failed", "boom", 0, 9, None)
+                .await
+                .expect("fail")
+        );
+        assert_eq!(
+            l.get_turn(&id, failed)
+                .await
+                .unwrap()
+                .unwrap()
+                .reported_tokens(),
+            Some((21, 8, 13))
+        );
     }
 }
