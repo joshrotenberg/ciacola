@@ -47,17 +47,22 @@ hermetic = "full"
 # own directory keeps transcripts with the run that produced them,
 # which is the precondition for mining them later.
 #
-# It also isolates the login: a fresh directory authenticates as
-# nobody. Mint a token with `claude setup-token` and name the variable
-# holding it below.
+# It also selects the login: a fresh directory authenticates as nobody.
+# Authenticate that home separately, or on Unix pass a token through the
+# inherited descriptor named by CIACOLA_CLAUDE_TOKEN_FD when launching the
+# binary. Windows uses the separately authenticated home.
 # claude_home = "~/.local/share/ciacola/claude"
-# token_env = "CIACOLA_CLAUDE_TOKEN"
 
-# Codex keeps its own auth and sessions here. `codex_token_env` names a source
-# variable that Ciacola maps to `CODEX_API_KEY` for a Codex turn. Treat the
-# server and provider processes as one OS-user trust boundary.
+# Codex keeps its own auth and sessions here. Authenticate it separately, or
+# on Unix pass an API credential through CIACOLA_CODEX_TOKEN_FD at binary
+# startup. Windows uses the separately authenticated home.
 # codex_home = "~/.local/share/ciacola/codex"
-# codex_token_env = "CIACOLA_CODEX_TOKEN"
+
+# Provider children start from an empty environment. Ciacola restores only
+# path/home/user/temp/locale basics plus exact names listed here. Git keeps its
+# HOME-based config; SSH agents, proxies, Git overrides, GitHub credentials,
+# Ciacola variables, and other workflow values require deliberate opt-in.
+# provider_env_passthrough = ["SSH_AUTH_SOCK", "HTTPS_PROXY"]
 
 [limits]
 # Rolling admission circuit breakers, not per-turn budgets. Measured spend

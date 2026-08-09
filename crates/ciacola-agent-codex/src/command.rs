@@ -12,6 +12,8 @@ use codex_wrapper::{
     RolloutBudgetConfig, SandboxMode,
 };
 
+const SHELL_ENV_EXCLUDE: &str = "shell_environment_policy.exclude=[\"CIACOLA_*\",\"MCP_BEARER\",\"CODEX_*\",\"OPENAI_*\",\"ANTHROPIC_*\",\"CLAUDE_*\",\"AWS_*\",\"GOOGLE_*\",\"AZURE_*\"]";
+
 /// An opening turn or a resumed turn, with the child-only environment
 /// required by its scoped MCP headers.
 #[derive(Debug)]
@@ -92,7 +94,7 @@ pub(crate) fn build(intent: &TurnIntent) -> Result<PreparedTurn, AgentError> {
     // commands the model launches. They are defense in depth rather than an
     // isolation claim for arbitrary user-configured Codex turns.
     config.push("shell_environment_policy.ignore_default_excludes=false".into());
-    config.push("shell_environment_policy.exclude=[\"CIACOLA_*\",\"MCP_BEARER\"]".into());
+    config.push(SHELL_ENV_EXCLUDE.into());
 
     let mut env = BTreeMap::new();
     if let Some(scope) = &intent.mcp {
@@ -266,9 +268,7 @@ mod tests {
         assert!(config.contains(&"approval_policy=\"never\""));
         assert!(config.contains(&"sandbox_workspace_write.network_access=false"));
         assert!(config.contains(&"shell_environment_policy.ignore_default_excludes=false"));
-        assert!(
-            config.contains(&"shell_environment_policy.exclude=[\"CIACOLA_*\",\"MCP_BEARER\"]")
-        );
+        assert!(config.contains(&SHELL_ENV_EXCLUDE));
     }
 
     #[test]
@@ -286,9 +286,7 @@ mod tests {
         let config = config_values(&args);
         assert!(config.contains(&"approval_policy=\"never\""));
         assert!(config.contains(&"sandbox_mode=\"read-only\""));
-        assert!(
-            config.contains(&"shell_environment_policy.exclude=[\"CIACOLA_*\",\"MCP_BEARER\"]")
-        );
+        assert!(config.contains(&SHELL_ENV_EXCLUDE));
         assert!(
             !config
                 .iter()

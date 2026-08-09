@@ -336,19 +336,20 @@ pub struct TurnIntent {
     pub isolation: Isolation,
     /// Where the provider keeps its configuration, and its login.
     ///
-    /// Pointing this at the server's own directory keeps transcripts
-    /// with the run that produced them rather than mixed into the
-    /// operator's history. **It also isolates credentials**, which is
-    /// why it is paired with [`token_env`](Self::token_env): a fresh
-    /// directory authenticates as nobody, and every turn then fails
-    /// with "not logged in".
+    /// Pointing this at the server's own directory keeps transcripts with the
+    /// run that produced them rather than mixed into the operator's history.
+    /// It also selects that directory's login; a fresh directory authenticates
+    /// as nobody unless the host supplies an in-memory provider credential.
     pub config_home: Option<String>,
-    /// The *name* of an environment variable holding a long-lived
-    /// token, read from the server's own environment.
+    /// Legacy name of an environment variable that held a long-lived token.
     ///
-    /// The name, never the value, so a credential never lands in a
-    /// config file, the ledger, argv, the board, or a log line. Nothing
-    /// in this crate ever stores the value it resolves to.
+    /// Retained only so persisted pre-descriptor definitions decode losslessly
+    /// and current adapters can refuse them before spawning. Supplying a new
+    /// runtime credential does not erase this durable marker: the host must
+    /// replace the definition or retire and recreate the agent. New hosts
+    /// should keep this `None` and provide credentials outside the turn
+    /// contract; neither a source variable name nor a credential value belongs
+    /// in a durable intent.
     pub token_env: Option<String>,
     /// Which conversation to continue. `None` starts a fresh one and
     /// lets the provider name it.

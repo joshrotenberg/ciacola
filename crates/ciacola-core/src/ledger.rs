@@ -745,7 +745,7 @@ impl Ledger {
     /// Stamp server-wide defaults onto a definition at the storage
     /// boundary. Both creation and replacement pass here: config upsert
     /// and `spawn_role` replace a definition after the id is known, and a
-    /// create-only guard let those writes erase isolation and credentials.
+    /// create-only guard let those writes erase isolation and provider homes.
     fn normalized_def(&self, def: &AgentDef) -> AgentDef {
         let mut def = def.clone();
         def.resolve_provider(self.runtime.default_provider_key());
@@ -755,19 +755,16 @@ impl Ledger {
         if def.sandbox.is_none() {
             def.sandbox = self.runtime.sandbox.clone();
         }
-        let (home, token_env) = if def.provider.as_str() == "codex" {
-            (&self.runtime.codex_home, &self.runtime.codex_token_env)
+        let home = if def.provider.as_str() == "codex" {
+            &self.runtime.codex_home
         } else {
-            (&self.runtime.claude_home, &self.runtime.token_env)
+            &self.runtime.claude_home
         };
         if def.config_home.is_none() {
             def.config_home = home.clone();
         }
         if def.house_rules.is_none() {
             def.house_rules = self.house_rules.clone();
-        }
-        if def.token_env.is_none() {
-            def.token_env = token_env.clone();
         }
         def
     }
@@ -2196,6 +2193,7 @@ mod session_tests {
             codex_home: Some("/tmp/ciacola-test-codex-home".into()),
             house_rules: Some("keep the rule".into()),
             house_rules_file: None,
+            provider_env_passthrough: vec!["SSH_AUTH_SOCK".into()],
             token_env: Some("CIACOLA_TEST_TOKEN".into()),
             codex_token_env: Some("CIACOLA_TEST_CODEX_TOKEN".into()),
         };
@@ -2217,7 +2215,10 @@ mod session_tests {
         assert_eq!(def.sandbox.as_deref(), Some("read-only"));
         assert_eq!(def.config_home.as_deref(), Some("/tmp/ciacola-test-home"));
         assert_eq!(def.house_rules.as_deref(), Some("keep the rule"));
-        assert_eq!(def.token_env.as_deref(), Some("CIACOLA_TEST_TOKEN"));
+        assert!(
+            def.token_env.is_none(),
+            "retired runtime token sources must not enter new ledger rows"
+        );
     }
 
     #[tokio::test]
@@ -2255,10 +2256,7 @@ mod session_tests {
             current.config_home.as_deref(),
             Some("/tmp/ciacola-default-codex-home")
         );
-        assert_eq!(
-            current.token_env.as_deref(),
-            Some("CIACOLA_DEFAULT_CODEX_TOKEN")
-        );
+        assert!(current.token_env.is_none());
         assert_eq!(
             current.sandbox.as_deref(),
             Some("workspace-write-no-network")
@@ -2271,7 +2269,8 @@ mod session_tests {
                 "model": null,
                 "allowed_tools": [],
                 "working_dir": null,
-                "max_turns": null
+                "max_turns": null,
+                "token_env": "CIACOLA_PERSISTED_LEGACY_TOKEN"
             }"#,
         )
         .expect("legacy definition");
@@ -2289,7 +2288,24 @@ mod session_tests {
         );
         assert_eq!(
             legacy.token_env.as_deref(),
-            Some("CIACOLA_LEGACY_CLAUDE_TOKEN")
+            Some("CIACOLA_PERSISTED_LEGACY_TOKEN")
+        );
+
+        let restarted = Ledger::setup(l.pool.clone())
+            .await
+            .expect("restart")
+            .with_runtime(crate::roles::Runtime::default())
+            .expect("runtime");
+        let after_restart = restarted
+            .get_agent(&legacy_id)
+            .await
+            .expect("get after restart")
+            .expect("legacy row")
+            .def;
+        assert_eq!(
+            after_restart.token_env.as_deref(),
+            Some("CIACOLA_PERSISTED_LEGACY_TOKEN"),
+            "backward decode stays lossless so launch-time refusal can see it"
         );
     }
 

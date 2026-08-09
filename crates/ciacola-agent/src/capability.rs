@@ -234,7 +234,13 @@ pub struct Capabilities {
     pub client_assigned_resume: bool,
     /// Can be sealed off from ambient configuration.
     pub isolation: bool,
-    /// Keeps its configuration and login where we tell it to.
+    /// Selects configuration and login deterministically in a cleared direct
+    /// child environment.
+    ///
+    /// This is credential selection, not OS/process isolation. It says
+    /// ambient provider selectors cannot override the intended home or
+    /// credential; it does not stop same-UID processes from reading accessible
+    /// files, memory, or process metadata.
     pub credential_isolation: bool,
     /// Can confine filesystem writes and network reach the way
     /// [`Sandbox`](crate::intent::Sandbox) asks. `false` for any
@@ -322,9 +328,9 @@ impl Capabilities {
             miss(
                 Constraint::CredentialIsolation,
                 format!(
-                    "provider '{who}' cannot keep its configuration and login in a \
-                     directory of our choosing, so this agent would authenticate as \
-                     the operator"
+                    "provider '{who}' cannot select its configuration and login in a \
+                     cleared direct-child environment, so ambient credentials could \
+                     override this agent's intended identity"
                 ),
             );
         }

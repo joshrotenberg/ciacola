@@ -24,6 +24,22 @@
 //! non-security boundary that this adapter enforces with
 //! `--max-budget-usd`.
 //!
+//! # Credential-isolation boundary
+//!
+//! A [`ClaudeProvider`] owns one startup snapshot of the environment
+//! deliberately granted to provider children. Every opening and resume clears
+//! the inherited daemon environment, restores that snapshot after removing
+//! Claude's authentication, routing, cloud, and config selectors, and finally
+//! applies the intended config home and optional in-memory OAuth credential.
+//! This is what `credential_isolation = true` means here: deterministic
+//! credential selection and direct-child environment minimization. It is not
+//! protection from another process running under the same OS user, from files
+//! that user can read, or from a deliberately allowlisted value. The pinned
+//! Claude CLI has no separate shell-tool environment exclusion contract;
+//! subprocesses naturally begin with the already-minimized child environment,
+//! but that inheritance is defense in depth rather than a stronger isolation
+//! claim.
+//!
 //! # Cancellation and drop safety
 //!
 //! [`ClaudeProvider::run`] consumes the wrapper's live JSONL stream.
@@ -54,16 +70,18 @@
 #![warn(missing_docs)]
 
 use std::collections::HashSet;
+use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use ciacola_agent::{
     AgentError, BoxFut, CacheTreatment, Capabilities, CeilingCapability, EnforcementGranularity,
-    MeterId, PartialTelemetry, Provider, ProviderKey, ResumeId, TokenUsage, TurnEvents, TurnIntent,
-    TurnOutcome,
+    MeterId, PartialTelemetry, Provider, ProviderChildEnvironment, ProviderKey, ResumeId,
+    TokenUsage, TurnEvents, TurnIntent, TurnOutcome,
 };
 use claude_wrapper::{
-    Claude, OutputFormat, QueryResult,
+    Claude, ClaudeBuilder, OutputFormat, QueryResult,
     streaming::{StreamEvent, stream_query},
 };
 
@@ -84,8 +102,110 @@ pub fn turn_ceiling_capability() -> CeilingCapability {
 }
 
 /// The Claude backend, over `claude-wrapper`.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ClaudeProvider;
+///
+/// Environment values and the optional credential are runtime-only: neither
+/// is serialized into a turn intent or ledger row. Debug output exposes only
+/// the granted environment names and whether a credential is present.
+#[derive(Clone, Default)]
+pub struct ClaudeProvider {
+    child_environment: ProviderChildEnvironment,
+    credential: Option<Arc<str>>,
+}
+
+impl ClaudeProvider {
+    /// Construct a provider from the daemon's startup environment snapshot and
+    /// an optional credential consumed from `CIACOLA_CLAUDE_TOKEN_FD`.
+    ///
+    /// `credential` is moved into redacted process memory and is applied only
+    /// as Claude's canonical `CLAUDE_CODE_OAUTH_TOKEN` child variable. Use
+    /// `None` with a separately authenticated provider home.
+    #[must_use]
+    pub fn new(child_environment: ProviderChildEnvironment, credential: Option<String>) -> Self {
+        Self {
+            child_environment,
+            credential: credential.map(Arc::from),
+        }
+    }
+
+    fn legacy_token_error(intent: &TurnIntent) -> Option<AgentError> {
+        intent.token_env.as_ref().map(|_| AgentError::Launch {
+            provider: ProviderKey::claude(),
+            detail: "legacy AgentDef.token_env blocks launch; reapply a config-managed definition or retire and recreate this agent, then use CIACOLA_CLAUDE_TOKEN_FD at daemon startup or a separately authenticated claude_home"
+                .into(),
+        })
+    }
+
+    fn client_for_intent(
+        &self,
+        intent: &TurnIntent,
+        mut builder: ClaudeBuilder,
+    ) -> Result<Claude, AgentError> {
+        if let Some(error) = Self::legacy_token_error(intent) {
+            return Err(error);
+        }
+
+        // Claude owns these namespaces for authentication, routing, cloud
+        // selection, and config. An operator may name them in the neutral
+        // passthrough policy, but they can never override this adapter's
+        // credential choice. Broad cloud prefixes are intentional: a newly
+        // introduced AWS/Vertex selector must fail closed without waiting for
+        // Ciacola to learn its exact spelling.
+        let environment = self.child_environment.excluding(
+            &["CLAUDECODE", "CLOUD_ML_REGION"],
+            &[
+                "CLAUDE_",
+                "ANTHROPIC_",
+                "AWS_",
+                "GOOGLE_",
+                "GCLOUD_",
+                "CLOUDSDK_",
+                "VERTEX_",
+            ],
+        );
+        builder = builder.clear_env().envs(environment.iter());
+
+        if let Some(dir) = &intent.working_dir {
+            builder = builder.working_dir(dir);
+        }
+        if let Some(home) = &intent.config_home {
+            // The CLI reads its config and writes its sessions here. Apply it
+            // after the neutral snapshot so a passthrough entry cannot win.
+            std::fs::create_dir_all(home).map_err(|e| AgentError::Io {
+                detail: format!("failed to create claude config home '{home}': {e}"),
+            })?;
+            builder = builder.env("CLAUDE_CONFIG_DIR", home);
+        }
+        if let Some(credential) = &self.credential {
+            // Canonical intended auth is last for the same reason.
+            builder = builder.env("CLAUDE_CODE_OAUTH_TOKEN", credential.as_ref());
+        }
+
+        builder.build().map_err(|e| AgentError::NotFound {
+            provider: ProviderKey::claude(),
+            detail: e.to_string(),
+        })
+    }
+
+    async fn run_turn_with_builder(
+        &self,
+        intent: &TurnIntent,
+        events: &dyn TurnEvents,
+        builder: ClaudeBuilder,
+    ) -> Result<TurnOutcome, AgentError> {
+        let claude = self.client_for_intent(intent, builder)?;
+        run_turn_with_client(intent, events, &claude).await
+    }
+}
+
+impl fmt::Debug for ClaudeProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaudeProvider")
+            .field("child_environment", &self.child_environment)
+            .field("has_credential", &self.credential.is_some())
+            .finish()
+    }
+}
 
 impl Provider for ClaudeProvider {
     fn key(&self) -> ProviderKey {
@@ -119,6 +239,9 @@ impl Provider for ClaudeProvider {
         events: &'a dyn TurnEvents,
     ) -> BoxFut<'a, Result<TurnOutcome, AgentError>> {
         Box::pin(async move {
+            if let Some(error) = Self::legacy_token_error(intent) {
+                return Err(error);
+            }
             if let Some(blocking) = self.capabilities().validate(intent).blocking() {
                 return Err(AgentError::Unsupported {
                     provider: self.key(),
@@ -126,7 +249,8 @@ impl Provider for ClaudeProvider {
                     detail: blocking.detail.clone(),
                 });
             }
-            run_turn(intent, events).await
+            self.run_turn_with_builder(intent, events, Claude::builder())
+                .await
         })
     }
 
@@ -142,38 +266,6 @@ impl Provider for ClaudeProvider {
             .split_whitespace()
             .any(|token| Path::new(token).file_name().and_then(|f| f.to_str()) == Some("claude"))
     }
-}
-
-async fn run_turn(intent: &TurnIntent, events: &dyn TurnEvents) -> Result<TurnOutcome, AgentError> {
-    let provider = ProviderKey::claude();
-
-    let mut builder = Claude::builder();
-    if let Some(dir) = &intent.working_dir {
-        builder = builder.working_dir(dir);
-    }
-    if let Some(home) = &intent.config_home {
-        // The CLI reads its config and writes its sessions here.
-        std::fs::create_dir_all(home).map_err(|e| AgentError::Io {
-            detail: format!("failed to create claude config home '{home}': {e}"),
-        })?;
-        builder = builder.env("CLAUDE_CONFIG_DIR", home);
-    }
-    if let Some(var) = &intent.token_env {
-        match std::env::var(var) {
-            Ok(token) if !token.is_empty() => {
-                builder = builder.env("CLAUDE_CODE_OAUTH_TOKEN", token);
-            }
-            _ => {
-                tracing::warn!(var, "token_env is set but the variable is empty or unset");
-            }
-        }
-    }
-    let claude = builder.build().map_err(|e| AgentError::NotFound {
-        provider: provider.clone(),
-        detail: e.to_string(),
-    })?;
-
-    run_turn_with_client(intent, events, &claude).await
 }
 
 #[derive(Default)]
@@ -305,11 +397,14 @@ async fn run_turn_with_client(
 mod tests {
     use super::*;
     use ciacola_agent::{Cost, FailureKind, Isolation, ProviderRegistry, Sandbox, Usage};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    fn fixture(name: &str, args: impl IntoIterator<Item = String>) -> Claude {
+    const ENV_WORKER_ROOT: &str = "CIACOLA_CLAUDE_ENV_WORKER_ROOT";
+
+    fn fixture_builder(name: &str, args: impl IntoIterator<Item = String>) -> ClaudeBuilder {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join(name);
@@ -320,7 +415,13 @@ mod tests {
         for arg in args {
             builder = builder.arg(arg);
         }
-        builder.build().expect("fake claude client")
+        builder
+    }
+
+    fn fixture(name: &str, args: impl IntoIterator<Item = String>) -> Claude {
+        fixture_builder(name, args)
+            .build()
+            .expect("fake claude client")
     }
 
     fn temp_path(label: &str) -> PathBuf {
@@ -332,6 +433,23 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
+    }
+
+    fn captured_environment(path: &Path) -> BTreeMap<String, String> {
+        std::fs::read_to_string(path)
+            .expect("captured child environment")
+            .lines()
+            .map(|line| {
+                let (name, value) = line
+                    .split_once('=')
+                    .expect("env output always contains an equals sign");
+                (name.to_string(), value.to_string())
+            })
+            .collect()
+    }
+
+    fn environment_keys(environment: &BTreeMap<String, String>) -> Vec<&str> {
+        environment.keys().map(String::as_str).collect()
     }
 
     #[derive(Default)]
@@ -368,21 +486,280 @@ mod tests {
     #[test]
     fn the_provider_registers_under_the_claude_key() {
         let registry = ProviderRegistry::new()
-            .with(Arc::new(ClaudeProvider))
+            .with(Arc::new(ClaudeProvider::default()))
             .expect("unique key");
         assert!(registry.get(&ProviderKey::claude()).is_ok());
+    }
+
+    #[test]
+    fn provider_debug_redacts_the_in_memory_credential() {
+        let provider = ClaudeProvider::new(
+            ProviderChildEnvironment::default(),
+            Some("never-render-this-claude-token".into()),
+        );
+
+        let rendered = format!("{provider:?}");
+        assert!(rendered.contains("has_credential: true"), "{rendered}");
+        assert!(!rendered.contains("never-render-this-claude-token"));
+    }
+
+    #[tokio::test]
+    async fn a_legacy_token_source_is_refused_before_the_fake_child_launches() {
+        let capture = temp_path("legacy-token-refusal");
+        std::fs::create_dir_all(&capture).expect("capture directory");
+        let mut turn = intent("must not launch");
+        turn.token_env = Some("CIACOLA_OLD_CLAUDE_TOKEN".into());
+
+        let error = ClaudeProvider::default()
+            .run_turn_with_builder(
+                &turn,
+                &RecordingEvents::default(),
+                fixture_builder(
+                    "fake-claude-capture-env.sh",
+                    [capture.display().to_string(), "legacy".into()],
+                ),
+            )
+            .await
+            .expect_err("legacy startup environment credentials must fail closed");
+
+        match error {
+            AgentError::Launch { detail, .. } => {
+                assert!(detail.contains("AgentDef.token_env"), "{detail}");
+                assert!(detail.contains("CIACOLA_CLAUDE_TOKEN_FD"), "{detail}");
+                assert!(detail.contains("claude_home"), "{detail}");
+                assert!(!detail.contains("CIACOLA_OLD_CLAUDE_TOKEN"), "{detail}");
+            }
+            other => panic!("expected pre-launch migration error, got {other:?}"),
+        }
+        assert!(
+            !capture.join("legacy.marker").exists(),
+            "the fake child must never have run"
+        );
+        std::fs::remove_dir_all(capture).expect("remove capture directory");
+    }
+
+    /// Runs the environment assertions in a nested test process so ambient
+    /// variables can be supplied through `Command::env` without mutating the
+    /// multithreaded test runner's process-global environment.
+    #[test]
+    fn opening_and_resume_environment_contract_runs_in_an_isolated_process() {
+        let root = temp_path("child-environment");
+        std::fs::create_dir_all(&root).expect("worker directory");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "tests::provider_child_environment_worker",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(ENV_WORKER_ROOT, &root)
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.join("baseline-home"))
+            .env("LANG", "C")
+            .env("ANTHROPIC_API_KEY", "ambient-anthropic-key")
+            .env("ANTHROPIC_AUTH_TOKEN", "allowlisted-own-auth")
+            .env("CLAUDE_CODE_OAUTH_TOKEN", "ambient-wrong-oauth")
+            .env("CLAUDE_CODE_USE_BEDROCK", "1")
+            .env("CLAUDE_CODE_USE_VERTEX", "1")
+            .env("CLAUDE_CONFIG_DIR", root.join("ambient-claude-home"))
+            .env("CLAUDECODE", "ambient-nested-session")
+            .env("AWS_ACCESS_KEY_ID", "ambient-aws-key")
+            .env(
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                root.join("ambient-google-credentials"),
+            )
+            .env("CLOUD_ML_REGION", "ambient-cloud-region")
+            .env("CIACOLA_CLAUDE_SOURCE_TOKEN", "ambient-source-token")
+            .env("CODEX_API_KEY", "ambient-opposite-provider-token")
+            .env("MCP_BEARER", "ambient-client-bearer")
+            .env("CIACOLA_TEST_SENTINEL", "ambient-ciacola-secret")
+            .env("UNRELATED_SECRET_SENTINEL", "ambient-unrelated-secret")
+            .env("EXPLICIT_WORKFLOW", "explicit-workflow-value")
+            .output()
+            .expect("spawn isolated environment worker");
+
+        if !output.status.success() {
+            panic!(
+                "environment worker failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            root.join("worker-complete").exists(),
+            "exact worker test did not run; stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        std::fs::remove_dir_all(root).expect("remove worker directory");
+    }
+
+    #[tokio::test]
+    async fn provider_child_environment_worker() {
+        let Some(root) = std::env::var_os(ENV_WORKER_ROOT).map(PathBuf::from) else {
+            // The outer test launches this exact test again with controlled
+            // ambient values. Its ordinary test-suite invocation is a no-op.
+            return;
+        };
+
+        let open_home = root.join("open-home");
+        let open_snapshot = ProviderChildEnvironment::capture(&[]).expect("opening snapshot");
+        let open_provider =
+            ClaudeProvider::new(open_snapshot, Some("intended-open-oauth-token".into()));
+        let mut open = intent("open safely");
+        open.config_home = Some(open_home.display().to_string());
+        open.resume = Some(ResumeId::ClientAssigned("client-open".into()));
+        open_provider
+            .run_turn_with_builder(
+                &open,
+                &RecordingEvents::default(),
+                fixture_builder(
+                    "fake-claude-capture-env.sh",
+                    [root.display().to_string(), "open".into()],
+                ),
+            )
+            .await
+            .expect("opening turn");
+
+        let open_env = captured_environment(&root.join("open.env"));
+        assert!(
+            open_env.contains_key("PATH"),
+            "exported keys: {:?}",
+            environment_keys(&open_env)
+        );
+        assert_eq!(
+            open_env.get("HOME").map(String::as_str),
+            Some(root.join("baseline-home").to_string_lossy().as_ref())
+        );
+        assert_eq!(open_env.get("LANG").map(String::as_str), Some("C"));
+        assert_eq!(
+            open_env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(open_home.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            open_env.get("CLAUDE_CODE_OAUTH_TOKEN").map(String::as_str),
+            Some("intended-open-oauth-token")
+        );
+        for absent in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDECODE",
+            "AWS_ACCESS_KEY_ID",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "CLOUD_ML_REGION",
+            "CIACOLA_CLAUDE_SOURCE_TOKEN",
+            "CODEX_API_KEY",
+            "MCP_BEARER",
+            "CIACOLA_TEST_SENTINEL",
+            "UNRELATED_SECRET_SENTINEL",
+            "EXPLICIT_WORKFLOW",
+            ENV_WORKER_ROOT,
+        ] {
+            assert!(
+                !open_env.contains_key(absent),
+                "unexpected child key {absent}; exported keys: {:?}",
+                environment_keys(&open_env)
+            );
+        }
+        assert!(root.join("open.marker").exists());
+
+        let allowed = [
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CONFIG_DIR",
+            "AWS_ACCESS_KEY_ID",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "CLOUD_ML_REGION",
+            "CIACOLA_CLAUDE_SOURCE_TOKEN",
+            "CODEX_API_KEY",
+            "MCP_BEARER",
+            "CIACOLA_TEST_SENTINEL",
+            "UNRELATED_SECRET_SENTINEL",
+            "EXPLICIT_WORKFLOW",
+        ]
+        .map(str::to_string);
+        let resume_snapshot = ProviderChildEnvironment::capture(&allowed).expect("resume snapshot");
+        let debug_snapshot = format!("{resume_snapshot:?}");
+        assert!(debug_snapshot.contains("CODEX_API_KEY"));
+        assert!(!debug_snapshot.contains("ambient-opposite-provider-token"));
+
+        let resume_home = root.join("resume-home");
+        let resume_provider =
+            ClaudeProvider::new(resume_snapshot, Some("intended-resume-oauth-token".into()));
+        let mut resume = intent("continue safely");
+        resume.config_home = Some(resume_home.display().to_string());
+        resume.resume = Some(ResumeId::ProviderAssigned("sess-existing".into()));
+        resume_provider
+            .run_turn_with_builder(
+                &resume,
+                &RecordingEvents::default(),
+                fixture_builder(
+                    "fake-claude-capture-env.sh",
+                    [root.display().to_string(), "resume".into()],
+                ),
+            )
+            .await
+            .expect("resume turn");
+
+        let resume_env = captured_environment(&root.join("resume.env"));
+        assert_eq!(
+            resume_env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(resume_home.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            resume_env
+                .get("CLAUDE_CODE_OAUTH_TOKEN")
+                .map(String::as_str),
+            Some("intended-resume-oauth-token")
+        );
+        for stripped in [
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "AWS_ACCESS_KEY_ID",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "CLOUD_ML_REGION",
+        ] {
+            assert!(
+                !resume_env.contains_key(stripped),
+                "Claude-owned selector {stripped} survived; exported keys: {:?}",
+                environment_keys(&resume_env)
+            );
+        }
+        for (name, value) in [
+            ("CIACOLA_CLAUDE_SOURCE_TOKEN", "ambient-source-token"),
+            ("CODEX_API_KEY", "ambient-opposite-provider-token"),
+            ("MCP_BEARER", "ambient-client-bearer"),
+            ("CIACOLA_TEST_SENTINEL", "ambient-ciacola-secret"),
+            ("UNRELATED_SECRET_SENTINEL", "ambient-unrelated-secret"),
+            ("EXPLICIT_WORKFLOW", "explicit-workflow-value"),
+        ] {
+            assert_eq!(resume_env.get(name).map(String::as_str), Some(value));
+        }
+        let resume_args =
+            std::fs::read_to_string(root.join("resume.args")).expect("captured resume arguments");
+        assert!(
+            resume_args
+                .lines()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|pair| pair == ["--resume", "sess-existing"])
+        );
+        assert!(root.join("resume.marker").exists());
+        std::fs::write(root.join("worker-complete"), b"ok").expect("worker completion marker");
     }
 
     /// The capability this whole adapter exists to declare honestly:
     /// the CLI's permission prompts are not an OS-level sandbox.
     #[test]
     fn sandbox_is_always_declared_unsupported() {
-        assert!(!ClaudeProvider.capabilities().sandbox);
+        assert!(!ClaudeProvider::default().capabilities().sandbox);
     }
 
     #[test]
     fn native_budget_capability_is_micro_usd_at_a_response_boundary() {
-        let capability = ClaudeProvider
+        let capability = ClaudeProvider::default()
             .capabilities()
             .turn_ceiling
             .expect("Claude enforces max-budget-usd");
@@ -400,7 +777,7 @@ mod tests {
     fn a_sandboxed_turn_is_blocked_by_capability_validation() {
         let mut intent = TurnIntent::new("go");
         intent.sandbox = Sandbox::WorkspaceWriteNoNetwork;
-        let validation = ClaudeProvider.capabilities().validate(&intent);
+        let validation = ClaudeProvider::default().capabilities().validate(&intent);
         let blocking = validation.blocking().expect("sandbox must block");
         assert_eq!(blocking.constraint, ciacola_agent::Constraint::Sandbox);
     }
@@ -414,7 +791,6 @@ mod tests {
         let mut intent = TurnIntent::new("go");
         intent.isolation = Isolation::Full;
         intent.config_home = Some("/tmp/claude-home".into());
-        intent.token_env = Some("CLAUDE_TOKEN".into());
         intent.allowed_tools = Some(vec!["Read".into()]);
         intent.resume = Some(ciacola_agent::ResumeId::ClientAssigned("agent-1".into()));
         intent.max_provider_turns = Some(20);
@@ -431,7 +807,7 @@ mod tests {
             strict: true,
         });
 
-        let validation = ClaudeProvider.capabilities().validate(&intent);
+        let validation = ClaudeProvider::default().capabilities().validate(&intent);
         assert!(
             validation.unsupported.is_empty(),
             "{:?}",
@@ -441,7 +817,7 @@ mod tests {
 
     #[test]
     fn owns_process_matches_the_claude_binary_and_nothing_else() {
-        let provider = ClaudeProvider;
+        let provider = ClaudeProvider::default();
         assert!(provider.owns_process("54322 claude -p do the thing"));
         assert!(provider.owns_process("54322 /usr/local/bin/claude --resume sess-1 -- go"));
         assert!(

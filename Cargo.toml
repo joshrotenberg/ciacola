@@ -28,16 +28,15 @@ ciacola-core = { path = "crates/ciacola-core" }
 #
 # Revs rather than branches because once agents build this, the build has
 # to be reproducible: a path dep resolved to whatever four sibling
-# checkouts happened to contain. Published versions do not work yet
-# (claude-wrapper is 20 commits past v0.13.5 and ciacola needs
-# `QueryResult::usage` from one of them); switch to versions once the
-# four settle enough to release.
+# checkouts happened to contain. Published versions do not yet carry every
+# wrapper API Ciacola needs; switch to versions once the four dependencies
+# settle enough to release.
 #
 # `.cargo/config.toml` overrides these back to the siblings for local
 # work. See CONTRIBUTING.md.
 tower-mcp = { git = "https://github.com/joshrotenberg/tower-mcp", rev = "9c8b53973e650a140fe4c180e6c3fad4a6e65b9b", features = ["http"] }
-claude-wrapper = { git = "https://github.com/joshrotenberg/claude-wrapper", rev = "22484531ecbec0789c16ee10f8abaa95d5501596" }
-codex-wrapper = { git = "https://github.com/joshrotenberg/codex-wrapper", rev = "f250f0efcaaf4c3f93ad82ebabc534a853dde68b" }
+claude-wrapper = { git = "https://github.com/joshrotenberg/claude-wrapper", rev = "abaddd72184ca1ceebf21233922ce018274cd36d" }
+codex-wrapper = { git = "https://github.com/joshrotenberg/codex-wrapper", rev = "2dc1d36d25d0b0da8515ca347da578d9c9dffb46" }
 git-spawn = { git = "https://github.com/joshrotenberg/git-spawn", rev = "ea2826b9da416cc9396ce79f2af7f9770cd50ac1" }
 
 axum = "0.8"

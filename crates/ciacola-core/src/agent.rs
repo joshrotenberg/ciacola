@@ -103,12 +103,12 @@ pub struct AgentDef {
     /// the run that produced them rather than mixed into the operator's
     /// history, which is the precondition for mining them.
     ///
-    /// **It also isolates credentials.** The config directory is where
-    /// the CLI keeps its login, so a fresh one authenticates as nobody
-    /// and every run fails with "Not logged in". That directory has to
-    /// be logged in separately before this is usable, which is why it
-    /// is off by default and warned about at boot rather than quietly
-    /// breaking the first turn.
+    /// **It also selects credentials.** The config directory is where the CLI
+    /// keeps its login, so a fresh one authenticates as nobody unless the
+    /// runtime supplies its provider credential through the dedicated startup
+    /// descriptor. Log the directory in separately or configure that runtime
+    /// credential before use; boot warns rather than quietly breaking the
+    /// first turn.
     #[serde(default, alias = "claude_home")]
     pub config_home: Option<String>,
     /// Operator house rules, prepended to every agent's system prompt.
@@ -121,15 +121,16 @@ pub struct AgentDef {
     /// rules back.
     #[serde(default)]
     pub house_rules: Option<String>,
-    /// Name of an environment variable holding a long-lived token, read
-    /// from the server's own environment and passed to the provider.
+    /// Legacy name of an environment variable that held a long-lived token.
     ///
-    /// This makes an isolated provider home usable without storing a
-    /// credential in TOML. The adapter maps the source variable onto the
-    /// environment name its CLI accepts.
-    ///
-    /// The *name* rather than the value, so a token never lands in the
-    /// config file, the ledger, or the board.
+    /// Retained for backward decoding of persisted definitions. New runtime
+    /// configuration no longer populates it: startup environment credentials
+    /// are unsafe and are migrated to inherited descriptors. A non-empty
+    /// legacy value reaches the turn intent so current adapters can refuse it
+    /// before spawning rather than silently selecting another credential.
+    /// Config-managed agents lose the marker when their current definition is
+    /// reapplied; other persisted agents must be replaced or retired and
+    /// recreated.
     #[serde(default)]
     pub token_env: Option<String>,
 }
@@ -240,6 +241,8 @@ impl AgentDef {
         self
     }
 
+    /// Attach a legacy token source name for compatibility tests and stored
+    /// definitions.
     pub fn token_env(mut self, var: impl Into<String>) -> Self {
         self.token_env = Some(var.into());
         self
