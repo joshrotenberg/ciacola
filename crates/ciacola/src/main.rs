@@ -221,18 +221,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )?;
 
     let declared = declared_early;
-    let ctx = PluginContext {
-        pool: pool.clone(),
-        ledger: ledger.clone(),
-        exec: exec.clone(),
-        notify: notify.clone(),
-        db_path: database.path.display().to_string(),
-        loopback_mcp_config: mcp_config_path.display().to_string(),
-        operator_mcp_config: operator_mcp_config_path.display().to_string(),
-        plugin_config: declared.plugins.clone(),
-        limits: declared.limits.clone(),
-        runtime: declared.runtime.clone(),
-    };
     declared.runtime.check_provider_homes();
     eprintln!("[ciacola] limits: {}", declared.limits.summary());
 
@@ -279,6 +267,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .with_operator_mcp_config(operator_mcp_config_path.display().to_string());
     plugins.push(Box::new(RolesPlugin::new(merged_roles)));
+
+    let ctx = PluginContext {
+        pool: pool.clone(),
+        ledger: ledger.clone(),
+        exec: exec.clone(),
+        notify: notify.clone(),
+        db_path: database.path.display().to_string(),
+        loopback_mcp_config: mcp_config_path.display().to_string(),
+        operator_mcp_config: operator_mcp_config_path.display().to_string(),
+        plugin_config: declared.plugins.clone(),
+        limits: declared.limits.clone(),
+        runtime: declared.runtime.clone(),
+        roles: configured_roles.clone(),
+    };
 
     let host = Arc::new(PluginHost::setup(plugins, &ctx).await?);
     eprintln!("[ciacola] plugins: {}", host.names().join(", "));
