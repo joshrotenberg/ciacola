@@ -523,6 +523,61 @@ mod tests {
 
     use super::*;
 
+    struct ReportingProvider;
+
+    impl ciacola_agent::Provider for ReportingProvider {
+        fn key(&self) -> ciacola_agent::ProviderKey {
+            ciacola_agent::ProviderKey::claude()
+        }
+
+        fn capabilities(&self) -> ciacola_agent::Capabilities {
+            let mut capabilities = ciacola_agent::Capabilities::none(self.key());
+            capabilities.reports_cost = true;
+            capabilities.reports_token_usage = true;
+            capabilities
+        }
+
+        fn run<'a>(
+            &'a self,
+            _intent: &'a ciacola_agent::TurnIntent,
+            _events: &'a dyn ciacola_agent::TurnEvents,
+        ) -> ciacola_agent::BoxFut<'a, Result<ciacola_agent::TurnOutcome, ciacola_agent::AgentError>>
+        {
+            Box::pin(async { unreachable!("schedule tests do not run providers") })
+        }
+
+        fn owns_process(&self, _ps_line: &str) -> bool {
+            false
+        }
+    }
+
+    struct UnpricedProvider;
+
+    impl ciacola_agent::Provider for UnpricedProvider {
+        fn key(&self) -> ciacola_agent::ProviderKey {
+            ciacola_agent::ProviderKey::codex()
+        }
+
+        fn capabilities(&self) -> ciacola_agent::Capabilities {
+            let mut capabilities = ciacola_agent::Capabilities::none(self.key());
+            capabilities.reports_token_usage = true;
+            capabilities
+        }
+
+        fn run<'a>(
+            &'a self,
+            _intent: &'a ciacola_agent::TurnIntent,
+            _events: &'a dyn ciacola_agent::TurnEvents,
+        ) -> ciacola_agent::BoxFut<'a, Result<ciacola_agent::TurnOutcome, ciacola_agent::AgentError>>
+        {
+            Box::pin(async { unreachable!("schedule tests do not run providers") })
+        }
+
+        fn owns_process(&self, _ps_line: &str) -> bool {
+            false
+        }
+    }
+
     /// Records what it was handed and does nothing else: no claim, no
     /// run, no completion. A submitted turn therefore stays `queued`
     /// forever, which is exactly what "the agent is busy" means to the
@@ -549,7 +604,14 @@ mod tests {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:")
             .await
             .expect("pool");
-        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        let providers = ciacola_agent::ProviderRegistry::new()
+            .with(Arc::new(ReportingProvider))
+            .and_then(|providers| providers.with(Arc::new(UnpricedProvider)))
+            .expect("providers");
+        let ledger = Ledger::setup(pool.clone())
+            .await
+            .expect("ledger")
+            .with_providers(providers);
         let schedules = Schedules::setup(pool.clone()).await.expect("schedules");
         let (tx, _rx) = tower_mcp::context::notification_channel(8);
         let exec = Arc::new(RecordingExecutor::default());
@@ -663,6 +725,38 @@ mod tests {
             schedules.due(now_unix()).await.expect("due").is_empty(),
             "a skip that fails to advance leaves the schedule permanently due"
         );
+    }
+
+    #[tokio::test]
+    async fn unattended_schedule_cannot_run_an_unpriced_unguarded_provider() {
+        let (schedules, ctx, exec, ledger) = setup().await;
+        let agent_id = ledger
+            .create_agent(&AgentDef::new("codex", "sys").provider("codex"), None)
+            .await
+            .expect("create agent");
+        let schedule = schedules
+            .create(&agent_id, "hi", 10)
+            .await
+            .expect("create schedule");
+        make_due(&schedules, &schedule.schedule_id).await;
+
+        let due = schedules.due(now_unix()).await.expect("due");
+        let outcome = fire(&schedules, &ctx, &due[0]).await;
+        assert!(
+            matches!(outcome, Submission::Unguarded { .. }),
+            "{outcome:?}"
+        );
+        assert!(exec.submitted.lock().unwrap().is_empty());
+        assert!(
+            ledger
+                .conversation(&agent_id)
+                .await
+                .expect("conversation")
+                .is_empty()
+        );
+        let after = find(&schedules, &schedule.schedule_id).await;
+        assert_eq!(after.fires, 0);
+        assert_eq!(after.skips, 1);
     }
 
     #[tokio::test]

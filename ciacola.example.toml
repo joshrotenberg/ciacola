@@ -56,6 +56,19 @@ house_rules_file = "~/.claude/CLAUDE.md"
 # compounds faster than any spend check notices. 0 disables.
 max_spawn_depth = 3
 
+# Backends that do not report money need a provider token stop before
+# schedules, webhooks, or agents may submit work to them. Tokens are total
+# input + output over a rolling 24 hours; cached input is already included in
+# input and is never counted twice. Warning-only configuration does not make
+# unattended work bounded.
+# [limits.providers.codex]
+# daily_warn_tokens = 2_000_000
+# daily_stop_tokens = 4_000_000
+
+# Dollar and token stops are independent: reaching either refuses new work,
+# while turns already running finish. Ciacola uses the measurements each
+# backend reports and deliberately carries no provider price table.
+
 # Plugins read their own sections; the server never sees these fields.
 [plugins.repo-worker]
 root = "~/.local/share/ciacola/repos"

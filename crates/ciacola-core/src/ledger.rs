@@ -10,7 +10,7 @@
 //! state is derived from its turns, never stored, so it cannot drift.
 
 use serde::Serialize;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 
 use crate::agent::{AgentDef, Exchange, FlatError};
 use crate::plugin::Migration;
@@ -92,7 +92,20 @@ pub struct TurnRow {
     pub tokens_cached: i64,
     /// `reported`, `unreported`, `not_tracked`, or `legacy`.
     pub usage_state: String,
+    /// True only when terminal provider telemetry (or a known
+    /// no-attempt zero) makes the stored usage authoritative. Streaming
+    /// snapshots are useful lower bounds but remain incomplete.
+    pub usage_complete: bool,
     pub provider_turns: Option<i64>,
+    /// Provider selected when the turn was admitted. This is persisted
+    /// rather than joined through the current agent definition so
+    /// accounting remains historical fact.
+    pub provider: String,
+    /// Unix seconds when the turn reached a terminal state.
+    pub settled_unix: Option<i64>,
+    /// Canonical JSON describing a supervised admission override, when
+    /// one was used. Policy owns the shape; the ledger owns durability.
+    pub admission_override: Option<String>,
 }
 
 type AgentTuple = (
@@ -108,25 +121,6 @@ type AgentTuple = (
     i64,
     i64,
 );
-type TurnTuple = (
-    String,
-    i64,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    i64,
-    String,
-    i64,
-    String,
-    Option<i64>,
-    i64,
-    i64,
-    i64,
-    String,
-    Option<i64>,
-);
-
 const AGENT_SELECT: &str = "\
     SELECT a.agent_id, a.name, a.def, a.session, a.cost_micro_usd,
            CASE
@@ -146,7 +140,8 @@ const AGENT_SELECT: &str = "\
 const TURN_SELECT: &str = "\
     SELECT agent_id, seq, prompt, state, reply, error, cost_micro_usd, cost_state,
            elapsed_ms, elapsed_state, claimed_unix_ms, tokens_in, tokens_out,
-           tokens_cached, usage_state, provider_turns
+           tokens_cached, usage_state, usage_complete, provider_turns, provider,
+           settled_unix, admission_override
     FROM turns";
 
 fn agent_row(t: AgentTuple) -> Result<AgentRow, FlatError> {
@@ -178,43 +173,33 @@ fn agent_row(t: AgentTuple) -> Result<AgentRow, FlatError> {
     })
 }
 
-fn turn_row(t: TurnTuple) -> TurnRow {
-    let (
-        agent_id,
-        seq,
-        prompt,
-        state,
-        reply,
-        error,
-        cost_micro_usd,
-        cost_state,
-        elapsed_ms,
-        elapsed_state,
-        claimed_unix_ms,
-        tokens_in,
-        tokens_out,
-        tokens_cached,
-        usage_state,
-        provider_turns,
-    ) = t;
-    TurnRow {
-        agent_id,
-        seq,
-        prompt,
-        state,
-        reply,
-        error,
-        cost_micro_usd,
-        cost_state,
-        elapsed_ms,
-        elapsed_state,
-        claimed_unix_ms,
-        tokens_in,
-        tokens_out,
-        tokens_cached,
-        usage_state,
-        provider_turns,
-    }
+fn turn_row(row: SqliteRow) -> Result<TurnRow, FlatError> {
+    Ok(TurnRow {
+        agent_id: row.try_get("agent_id")?,
+        seq: row.try_get("seq")?,
+        prompt: row.try_get("prompt")?,
+        state: row.try_get("state")?,
+        reply: row.try_get("reply")?,
+        error: row.try_get("error")?,
+        cost_micro_usd: row.try_get("cost_micro_usd")?,
+        cost_state: row.try_get("cost_state")?,
+        elapsed_ms: row.try_get("elapsed_ms")?,
+        elapsed_state: row.try_get("elapsed_state")?,
+        claimed_unix_ms: row.try_get("claimed_unix_ms")?,
+        tokens_in: row.try_get("tokens_in")?,
+        tokens_out: row.try_get("tokens_out")?,
+        tokens_cached: row.try_get("tokens_cached")?,
+        usage_state: row.try_get("usage_state")?,
+        usage_complete: row.try_get::<i64, _>("usage_complete")? != 0,
+        provider_turns: row.try_get("provider_turns")?,
+        provider: row.try_get("provider")?,
+        settled_unix: row.try_get("settled_unix")?,
+        admission_override: row.try_get("admission_override")?,
+    })
+}
+
+fn saturated_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn cost_state(cost: ciacola_agent::Cost) -> &'static str {
@@ -361,6 +346,83 @@ impl Ledger {
             Migration::add_column(
                 "0015_turns_elapsed_state",
                 "ALTER TABLE turns ADD COLUMN elapsed_state TEXT NOT NULL DEFAULT 'legacy'",
+            ),
+            Migration::add_column(
+                "0016_turns_provider",
+                "ALTER TABLE turns ADD COLUMN provider TEXT NOT NULL DEFAULT ''",
+            ),
+            Migration::new(
+                "0017_turns_provider_backfill",
+                "UPDATE turns
+                    SET provider = COALESCE(
+                        (SELECT NULLIF(json_extract(a.def, '$.provider'), '')
+                           FROM agents a WHERE a.agent_id = turns.agent_id),
+                        'claude')",
+            ),
+            Migration::add_column(
+                "0018_turns_settled_unix",
+                "ALTER TABLE turns ADD COLUMN settled_unix INTEGER",
+            ),
+            Migration::new(
+                "0019_turns_settled_unix_backfill",
+                "UPDATE turns SET settled_unix = at_unix
+                  WHERE state IN ('ok', 'failed', 'killed')",
+            ),
+            Migration::add_column(
+                "0020_turns_usage_complete",
+                "ALTER TABLE turns ADD COLUMN usage_complete INTEGER NOT NULL DEFAULT 0",
+            ),
+            Migration::new(
+                "0021_turns_usage_complete_backfill",
+                "UPDATE turns SET usage_complete = 1
+                  WHERE state IN ('ok', 'failed', 'killed')
+                    AND usage_state = 'reported'
+                    AND elapsed_state = 'not_attempted'",
+            ),
+            Migration::add_column(
+                "0022_turns_admission_override",
+                "ALTER TABLE turns ADD COLUMN admission_override TEXT",
+            ),
+            Migration::new(
+                "0023_turns_provider_settled_index",
+                "CREATE INDEX IF NOT EXISTS idx_turns_provider_settled
+                     ON turns(provider, settled_unix)",
+            ),
+            // These triggers keep additive-schema downgrade/re-upgrade
+            // safe. A pre-#65 binary omits the new columns when it writes;
+            // the database still stamps immutable provider attribution and
+            // settlement time instead of silently defaulting Codex to Claude
+            // or dropping a recent turn out of the rolling window.
+            Migration::new(
+                "0024_turns_legacy_writer_provider_trigger",
+                "CREATE TRIGGER IF NOT EXISTS ciacola_turn_provider_after_insert
+                   AFTER INSERT ON turns
+                   WHEN NEW.provider = ''
+                 BEGIN
+                   UPDATE turns
+                      SET provider = COALESCE(
+                          (SELECT NULLIF(json_extract(a.def, '$.provider'), '')
+                             FROM agents a WHERE a.agent_id = NEW.agent_id),
+                          'claude')
+                    WHERE agent_id = NEW.agent_id AND seq = NEW.seq;
+                 END",
+            ),
+            Migration::new(
+                "0025_turns_legacy_writer_settlement_trigger",
+                "CREATE TRIGGER IF NOT EXISTS ciacola_turn_settled_after_update
+                   AFTER UPDATE OF state ON turns
+                   WHEN NEW.state IN ('ok', 'failed', 'killed')
+                    AND NEW.settled_unix IS NULL
+                 BEGIN
+                   UPDATE turns
+                      SET settled_unix = CAST(strftime('%s', 'now') AS INTEGER)
+                    WHERE agent_id = NEW.agent_id AND seq = NEW.seq;
+                 END",
+            ),
+            Migration::new(
+                "0026_turns_state_settled_index",
+                "CREATE INDEX IF NOT EXISTS idx_turns_state_settled
+                     ON turns(state, settled_unix)",
             ),
         ];
         crate::plugin::apply_migrations(&pool, "core", MIGRATIONS).await?;
@@ -565,16 +627,16 @@ impl Ledger {
     ) -> Result<bool, FlatError> {
         let done = sqlx::query(
             "UPDATE turns SET tokens_in = ?3, tokens_out = ?4, tokens_cached = ?5,
-                 usage_state = 'reported'
+                 usage_state = 'reported', usage_complete = 0
              WHERE agent_id = ?1 AND seq = ?2
                AND (state = 'running'
                     OR (state = 'killed' AND claimed_unix_ms IS NOT NULL))",
         )
         .bind(agent_id)
         .bind(seq)
-        .bind(usage.input as i64)
-        .bind(usage.output as i64)
-        .bind(usage.cached_input as i64)
+        .bind(saturated_i64(usage.input))
+        .bind(saturated_i64(usage.output))
+        .bind(saturated_i64(usage.cached_input))
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected() == 1)
@@ -714,34 +776,54 @@ impl Ledger {
 
     /// Total tokens in and out across every turn.
     pub async fn token_totals(&self) -> Result<(i64, i64), FlatError> {
-        let row: (i64, i64) = sqlx::query_as(
-            "SELECT COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0) FROM turns",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row)
+        let rows: Vec<(i64, i64)> = sqlx::query_as("SELECT tokens_in, tokens_out FROM turns")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().try_fold((0_i64, 0_i64), |total, row| {
+            if row.0 < 0 || row.1 < 0 {
+                return Err("negative token accounting in the ledger".into());
+            }
+            Ok((total.0.saturating_add(row.0), total.1.saturating_add(row.1)))
+        })
     }
 
     /// Spend since a cutoff. "What did today cost" is the question an
     /// unattended system actually gets asked, and a cumulative total
     /// cannot answer it.
     pub async fn spend_since(&self, since_unix: i64) -> Result<i64, FlatError> {
-        let (cost,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(cost_micro_usd), 0) FROM turns WHERE at_unix >= ?1",
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT cost_micro_usd FROM turns
+              WHERE state IN ('ok', 'failed', 'killed') AND settled_unix >= ?1
+             UNION ALL
+             SELECT cost_micro_usd FROM turns
+              WHERE state IN ('ok', 'failed', 'killed')
+                AND settled_unix IS NULL AND at_unix >= ?1",
         )
         .bind(since_unix)
-        .fetch_one(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(cost)
+        rows.into_iter().try_fold(0_i64, |total, (cost,)| {
+            if cost < 0 {
+                return Err("negative cost accounting in the ledger".into());
+            }
+            Ok(total.saturating_add(cost))
+        })
     }
 
     /// Spend and turn totals across every agent ever, retired included.
     /// Retirement hides an agent from the list; it must never hide the
     /// money it cost.
     pub async fn totals(&self) -> Result<(i64, i64), FlatError> {
-        let (cost,): (i64,) = sqlx::query_as("SELECT COALESCE(SUM(cost_micro_usd), 0) FROM agents")
-            .fetch_one(&self.pool)
+        let costs: Vec<(i64,)> = sqlx::query_as("SELECT cost_micro_usd FROM agents")
+            .fetch_all(&self.pool)
             .await?;
+        let cost: Result<i64, FlatError> = costs.into_iter().try_fold(0_i64, |total, (cost,)| {
+            if cost < 0 {
+                return Err("negative agent cost accounting in the ledger".into());
+            }
+            Ok(total.saturating_add(cost))
+        });
+        let cost = cost?;
         let (turns,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM turns")
             .fetch_one(&self.pool)
             .await?;
@@ -778,16 +860,38 @@ impl Ledger {
     /// flight per agent is the ledger's one admission rule: the guard is
     /// inside the INSERT itself, so two concurrent sends cannot both
     /// pass it.
+    ///
+    /// This is a low-level delivery/test primitive. Product submission
+    /// paths must use [`Ledger::admit_turn`], which applies the rolling
+    /// circuit breakers and persists any supervised exception atomically.
+    #[doc(hidden)]
     pub async fn enqueue_turn(&self, agent_id: &str, prompt: &str) -> Result<i64, FlatError> {
+        self.enqueue_turn_with_admission_override(agent_id, prompt, None)
+            .await
+    }
+
+    /// Enqueue a turn and durably attach the policy decision that let a
+    /// supervised request proceed. The value is stored as canonical JSON;
+    /// its schema belongs to admission policy rather than the ledger.
+    async fn enqueue_turn_with_admission_override(
+        &self,
+        agent_id: &str,
+        prompt: &str,
+        admission_override: Option<&serde_json::Value>,
+    ) -> Result<i64, FlatError> {
+        let admission_override = admission_override.map(serde_json::to_string).transpose()?;
         // RETURNING keeps the seq in the same statement as the guarded
         // INSERT; a separate MAX(seq) read could hand back another
         // sender's turn number under a kill-plus-resend race.
         let row: Option<(i64,)> = sqlx::query_as(
-            "INSERT INTO turns (agent_id, seq, prompt, state, at_unix)
-             SELECT ?1,
-                    (SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE agent_id = ?1),
-                    ?2, 'queued', ?3
-             WHERE EXISTS (SELECT 1 FROM agents WHERE agent_id = ?1 AND retired = 0)
+            "INSERT INTO turns
+                 (agent_id, seq, prompt, state, at_unix, provider, admission_override)
+             SELECT a.agent_id,
+                    (SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE agent_id = a.agent_id),
+                    ?2, 'queued', ?3,
+                    COALESCE(NULLIF(json_extract(a.def, '$.provider'), ''), 'claude'), ?4
+               FROM agents a
+              WHERE a.agent_id = ?1 AND a.retired = 0
                AND NOT EXISTS (SELECT 1 FROM turns
                                WHERE agent_id = ?1 AND state IN ('queued', 'running'))
              RETURNING seq",
@@ -795,6 +899,7 @@ impl Ledger {
         .bind(agent_id)
         .bind(prompt)
         .bind(crate::time::now_unix())
+        .bind(admission_override)
         .fetch_optional(&self.pool)
         .await?;
         match row {
@@ -903,6 +1008,7 @@ impl Ledger {
                      WHEN usage_state = 'reported' THEN 'reported'
                      ELSE ?6
                  END,
+                 usage_complete = CASE WHEN state = 'queued' THEN 1 ELSE 0 END,
                  provider_turns = CASE WHEN state = 'queued' THEN 0 ELSE NULL END,
                  elapsed_state = CASE
                      WHEN state = 'queued' THEN 'not_attempted'
@@ -917,7 +1023,8 @@ impl Ledger {
                          WHEN state = 'running' AND claimed_unix_ms IS NOT NULL
                              THEN MAX(?7 - claimed_unix_ms, 0)
                          ELSE 0
-                     END)
+                     END),
+                 settled_unix = ?9
              WHERE agent_id = ?1 AND seq = ?2 AND state IN ('queued', 'running')
                AND (?8 = 'live' OR state = 'running')",
         )
@@ -929,6 +1036,7 @@ impl Ledger {
         .bind(usage_state(usage))
         .bind(now_ms)
         .bind(timing.as_sql())
+        .bind(now_ms.div_euclid(1_000))
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected() == 1)
@@ -950,13 +1058,14 @@ impl Ledger {
             "UPDATE turns SET state = 'failed', error = ?3,
                  cost_micro_usd = 0, cost_state = 'reported',
                  tokens_in = 0, tokens_out = 0, tokens_cached = 0,
-                 usage_state = 'reported', provider_turns = 0,
-                 elapsed_ms = 0, elapsed_state = 'not_attempted'
+                 usage_state = 'reported', usage_complete = 1, provider_turns = 0,
+                 elapsed_ms = 0, elapsed_state = 'not_attempted', settled_unix = ?4
              WHERE agent_id = ?1 AND seq = ?2 AND state = 'running'",
         )
         .bind(agent_id)
         .bind(seq)
         .bind(error)
+        .bind(crate::time::now_unix())
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected() == 1)
@@ -976,6 +1085,11 @@ impl Ledger {
         exchange: &Exchange,
     ) -> Result<bool, FlatError> {
         let tokens = exchange.tokens();
+        let cost = saturated_i64(exchange.cost_micro_usd());
+        let elapsed_ms = saturated_i64(exchange.elapsed_ms);
+        let tokens_in = saturated_i64(tokens.input);
+        let tokens_out = saturated_i64(tokens.output);
+        let tokens_cached = saturated_i64(tokens.cached_input);
         let mut tx = self.pool.begin().await?;
         let done = sqlx::query(
             "UPDATE turns SET state = 'ok', reply = ?3, cost_micro_usd = ?4,
@@ -996,20 +1110,24 @@ impl Ledger {
                      WHEN ?10 = 'reported' OR usage_state <> 'reported' THEN ?10
                      ELSE usage_state
                  END,
-                 provider_turns = ?11
+                 usage_complete = CASE
+                     WHEN ?10 = 'reported' AND ?11 THEN 1 ELSE 0 END,
+                 provider_turns = ?12, settled_unix = ?13
              WHERE agent_id = ?1 AND seq = ?2 AND state = 'running'",
         )
         .bind(agent_id)
         .bind(seq)
         .bind(&exchange.reply)
-        .bind(exchange.cost_micro_usd() as i64)
+        .bind(cost)
         .bind(cost_state(exchange.cost))
-        .bind(exchange.elapsed_ms as i64)
-        .bind(tokens.input as i64)
-        .bind(tokens.output as i64)
-        .bind(tokens.cached_input as i64)
+        .bind(elapsed_ms)
+        .bind(tokens_in)
+        .bind(tokens_out)
+        .bind(tokens_cached)
         .bind(usage_state(exchange.usage))
+        .bind(exchange.usage_complete)
         .bind(exchange.provider_turns.map(i64::from))
+        .bind(crate::time::now_unix())
         .execute(&mut *tx)
         .await?;
         let recorded = done.rows_affected() == 1;
@@ -1024,7 +1142,10 @@ impl Ledger {
             // one turn early on every agent for the rest of its life.
             sqlx::query(
                 "UPDATE agents SET session = COALESCE(?2, session),
-                     cost_micro_usd = cost_micro_usd + ?3,
+                     cost_micro_usd = CASE
+                         WHEN cost_micro_usd > 9223372036854775807 - ?3
+                             THEN 9223372036854775807
+                         ELSE cost_micro_usd + ?3 END,
                      session_started_seq = CASE
                          WHEN ?2 IS NOT NULL
                               AND (session IS NULL OR session <> ?2
@@ -1034,7 +1155,7 @@ impl Ledger {
             )
             .bind(agent_id)
             .bind(exchange.session.as_deref())
-            .bind(exchange.cost_micro_usd() as i64)
+            .bind(cost)
             .bind(seq)
             .execute(&mut *tx)
             .await?;
@@ -1068,6 +1189,8 @@ impl Ledger {
         elapsed_ms: i64,
         session: Option<&str>,
     ) -> Result<bool, FlatError> {
+        let cost_micro_usd = cost_micro_usd.max(0);
+        let elapsed_ms = elapsed_ms.max(0);
         let (unavailable_cost, unavailable_usage) = self.unavailable_telemetry(agent_id).await?;
         let cost = if cost_micro_usd > 0 {
             ciacola_agent::Cost::Reported {
@@ -1096,7 +1219,9 @@ impl Ledger {
                      WHEN usage_state = 'reported' THEN 'reported'
                      ELSE ?8
                  END,
-                 provider_turns = CASE WHEN state = 'queued' THEN 0 ELSE provider_turns END
+                 usage_complete = CASE WHEN state = 'queued' THEN 1 ELSE 0 END,
+                 provider_turns = CASE WHEN state = 'queued' THEN 0 ELSE provider_turns END,
+                 settled_unix = ?9
              WHERE agent_id = ?1 AND seq = ?2 AND state IN ('queued', 'running')",
         )
         .bind(agent_id)
@@ -1107,13 +1232,17 @@ impl Ledger {
         .bind(cost_state(cost))
         .bind(elapsed_ms)
         .bind(usage_state(unavailable_usage))
+        .bind(crate::time::now_unix())
         .execute(&mut *tx)
         .await?;
         let recorded = done.rows_affected() == 1;
         if recorded && (cost_micro_usd > 0 || session.is_some()) {
             sqlx::query(
                 "UPDATE agents SET session = COALESCE(?2, session),
-                     cost_micro_usd = cost_micro_usd + ?3,
+                     cost_micro_usd = CASE
+                         WHEN cost_micro_usd > 9223372036854775807 - ?3
+                             THEN 9223372036854775807
+                         ELSE cost_micro_usd + ?3 END,
                      session_started_seq = CASE
                          WHEN ?2 IS NOT NULL
                               AND (session IS NULL OR session <> ?2
@@ -1145,7 +1274,11 @@ impl Ledger {
         exchange: &Exchange,
     ) -> Result<bool, FlatError> {
         let tokens = exchange.tokens();
-        let cost = exchange.cost_micro_usd() as i64;
+        let cost = saturated_i64(exchange.cost_micro_usd());
+        let elapsed_ms = saturated_i64(exchange.elapsed_ms);
+        let tokens_in = saturated_i64(tokens.input);
+        let tokens_out = saturated_i64(tokens.output);
+        let tokens_cached = saturated_i64(tokens.cached_input);
         let mut tx = self.pool.begin().await?;
         let done = sqlx::query(
             "UPDATE turns SET state = ?3, error = ?4, cost_micro_usd = ?5,
@@ -1166,7 +1299,9 @@ impl Ledger {
                      WHEN ?11 = 'reported' OR usage_state <> 'reported' THEN ?11
                      ELSE usage_state
                  END,
-                 provider_turns = ?12
+                 usage_complete = CASE
+                     WHEN ?11 = 'reported' AND ?12 THEN 1 ELSE 0 END,
+                 provider_turns = ?13, settled_unix = ?14
              WHERE agent_id = ?1 AND seq = ?2 AND state IN ('queued', 'running')",
         )
         .bind(agent_id)
@@ -1175,19 +1310,24 @@ impl Ledger {
         .bind(error)
         .bind(cost)
         .bind(cost_state(exchange.cost))
-        .bind(exchange.elapsed_ms as i64)
-        .bind(tokens.input as i64)
-        .bind(tokens.output as i64)
-        .bind(tokens.cached_input as i64)
+        .bind(elapsed_ms)
+        .bind(tokens_in)
+        .bind(tokens_out)
+        .bind(tokens_cached)
         .bind(usage_state(exchange.usage))
+        .bind(exchange.usage_complete)
         .bind(exchange.provider_turns.map(i64::from))
+        .bind(crate::time::now_unix())
         .execute(&mut *tx)
         .await?;
         let recorded = done.rows_affected() == 1;
         if recorded && (cost > 0 || exchange.session.is_some()) {
             sqlx::query(
                 "UPDATE agents SET session = COALESCE(?2, session),
-                     cost_micro_usd = cost_micro_usd + ?3,
+                     cost_micro_usd = CASE
+                         WHEN cost_micro_usd > 9223372036854775807 - ?3
+                             THEN 9223372036854775807
+                         ELSE cost_micro_usd + ?3 END,
                      session_started_seq = CASE
                          WHEN ?2 IS NOT NULL
                               AND (session IS NULL OR session <> ?2
@@ -1207,35 +1347,33 @@ impl Ledger {
     }
 
     pub async fn get_turn(&self, agent_id: &str, seq: i64) -> Result<Option<TurnRow>, FlatError> {
-        let row: Option<TurnTuple> =
-            sqlx::query_as(&format!("{TURN_SELECT} WHERE agent_id = ?1 AND seq = ?2"))
-                .bind(agent_id)
-                .bind(seq)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(turn_row))
+        let row = sqlx::query(&format!("{TURN_SELECT} WHERE agent_id = ?1 AND seq = ?2"))
+            .bind(agent_id)
+            .bind(seq)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(turn_row).transpose()
     }
 
     pub async fn conversation(&self, agent_id: &str) -> Result<Vec<TurnRow>, FlatError> {
-        let rows: Vec<TurnTuple> =
-            sqlx::query_as(&format!("{TURN_SELECT} WHERE agent_id = ?1 ORDER BY seq"))
-                .bind(agent_id)
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows.into_iter().map(turn_row).collect())
+        let rows = sqlx::query(&format!("{TURN_SELECT} WHERE agent_id = ?1 ORDER BY seq"))
+            .bind(agent_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(turn_row).collect()
     }
 
     /// Turns in a given state, across all agents. This is the whole
     /// recovery API: after a restart, `queued` turns are resubmitted and
     /// `running` turns are the crashed ones to adjudicate.
     pub async fn turns_in_state(&self, state: &str) -> Result<Vec<TurnRow>, FlatError> {
-        let rows: Vec<TurnTuple> = sqlx::query_as(&format!(
+        let rows = sqlx::query(&format!(
             "{TURN_SELECT} WHERE state = ?1 ORDER BY agent_id, seq"
         ))
         .bind(state)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(turn_row).collect())
+        rows.into_iter().map(turn_row).collect()
     }
 }
 
@@ -1450,6 +1588,7 @@ mod session_tests {
                 output: 1,
                 cached_input: 0,
             }),
+            usage_complete: true,
             provider_turns: Some(1),
             elapsed_ms: 1,
             error: None,
@@ -1899,6 +2038,7 @@ mod session_tests {
                 output: 3,
                 cached_input: 7,
             }),
+            usage_complete: true,
             provider_turns: Some(9),
             elapsed_ms: 250,
             error: Some("limited".into()),
@@ -1917,6 +2057,8 @@ mod session_tests {
         );
         assert_eq!(turn.provider_turns, Some(9));
         assert_eq!(turn.elapsed_state, "measured");
+        assert!(turn.usage_complete);
+        assert!(turn.settled_unix.is_some());
         assert_eq!(turn.reported_tokens(), Some((12, 3, 7)));
         assert_eq!(turn.reported_cost_micro_usd(), None);
     }
@@ -1949,6 +2091,7 @@ mod session_tests {
             session: None,
             cost: ciacola_agent::Cost::Reported { micro_usd: 10 },
             usage: ciacola_agent::Usage::Unreported,
+            usage_complete: false,
             provider_turns: Some(1),
             elapsed_ms: 100,
             error: None,
@@ -1958,13 +2101,11 @@ mod session_tests {
                 .await
                 .expect("complete")
         );
-        assert_eq!(
-            l.get_turn(&id, success)
-                .await
-                .unwrap()
-                .unwrap()
-                .reported_tokens(),
-            Some((30, 5, 12))
+        let success = l.get_turn(&id, success).await.unwrap().unwrap();
+        assert_eq!(success.reported_tokens(), Some((30, 5, 12)));
+        assert!(
+            !success.usage_complete,
+            "a snapshot is not a terminal report"
         );
 
         let failed = l.enqueue_turn(&id, "failed").await.expect("turn");
@@ -1987,6 +2128,7 @@ mod session_tests {
             session: None,
             cost: ciacola_agent::Cost::Unreported,
             usage: ciacola_agent::Usage::Unreported,
+            usage_complete: false,
             provider_turns: None,
             elapsed_ms: 200,
             error: Some("timed out after launch".into()),
@@ -2002,13 +2144,11 @@ mod session_tests {
             .await
             .expect("fail")
         );
-        assert_eq!(
-            l.get_turn(&id, failed)
-                .await
-                .unwrap()
-                .unwrap()
-                .reported_tokens(),
-            Some((44, 7, 18))
+        let failed = l.get_turn(&id, failed).await.unwrap().unwrap();
+        assert_eq!(failed.reported_tokens(), Some((44, 7, 18)));
+        assert!(
+            !failed.usage_complete,
+            "a snapshot is not a terminal report"
         );
     }
 
@@ -2045,6 +2185,8 @@ mod session_tests {
         assert_eq!(turn.elapsed_state, "measured");
         assert_eq!(turn.cost_state, "unreported");
         assert_eq!(turn.usage_state, "unreported");
+        assert!(!turn.usage_complete);
+        assert!(turn.settled_unix.is_some());
         assert_eq!(turn.reported_cost_micro_usd(), None);
         assert_eq!(turn.reported_tokens(), None);
     }
@@ -2072,6 +2214,8 @@ mod session_tests {
         assert_eq!(turn.elapsed_state, "not_attempted");
         assert_eq!(turn.cost_state, "reported");
         assert_eq!(turn.usage_state, "reported");
+        assert!(turn.usage_complete);
+        assert!(turn.settled_unix.is_some());
         assert_eq!(turn.provider_turns, Some(0));
         assert_eq!(turn.reported_cost_micro_usd(), Some(0));
         assert_eq!(turn.reported_tokens(), Some((0, 0, 0)));
@@ -2128,6 +2272,7 @@ mod session_tests {
             session: None,
             cost: ciacola_agent::Cost::Reported { micro_usd: 0 },
             usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage::default()),
+            usage_complete: true,
             provider_turns: Some(0),
             elapsed_ms: 0,
             error: None,
@@ -2137,6 +2282,7 @@ mod session_tests {
         assert_eq!(turn.reported_cost_micro_usd(), Some(0));
         assert_eq!(turn.reported_tokens(), Some((0, 0, 0)));
         assert_eq!(turn.elapsed_state, "measured");
+        assert!(turn.usage_complete);
     }
 
     #[tokio::test]
@@ -2161,6 +2307,8 @@ mod session_tests {
         assert_eq!(turn.reported_cost_micro_usd(), Some(0));
         assert_eq!(turn.reported_tokens(), Some((0, 0, 0)));
         assert_eq!(turn.provider_turns, Some(0));
+        assert!(turn.usage_complete);
+        assert!(turn.settled_unix.is_some());
     }
 
     #[tokio::test]
@@ -2207,6 +2355,7 @@ mod session_tests {
 
         let turn = l.get_turn(&id, seq).await.unwrap().unwrap();
         assert_eq!(turn.reported_tokens(), Some((15, 4, 5)));
+        assert!(!turn.usage_complete);
         assert_eq!(turn.cost_state, "unreported");
         assert_eq!(turn.reported_cost_micro_usd(), None);
     }
@@ -2236,14 +2385,10 @@ mod session_tests {
                 .await
                 .expect("recover")
         );
-        assert_eq!(
-            l.get_turn(&id, recovered)
-                .await
-                .unwrap()
-                .unwrap()
-                .reported_tokens(),
-            Some((21, 8, 13))
-        );
+        let recovered = l.get_turn(&id, recovered).await.unwrap().unwrap();
+        assert_eq!(recovered.reported_tokens(), Some((21, 8, 13)));
+        assert!(!recovered.usage_complete);
+        assert!(recovered.settled_unix.is_some());
 
         let failed = l.enqueue_turn(&id, "fail").await.expect("turn");
         assert!(l.claim_turn(&id, failed).await.expect("claim"));
@@ -2257,13 +2402,391 @@ mod session_tests {
                 .await
                 .expect("fail")
         );
-        assert_eq!(
-            l.get_turn(&id, failed)
+        let failed = l.get_turn(&id, failed).await.unwrap().unwrap();
+        assert_eq!(failed.reported_tokens(), Some((21, 8, 13)));
+        assert!(!failed.usage_complete);
+        assert!(failed.settled_unix.is_some());
+    }
+
+    #[tokio::test]
+    async fn provenance_migrations_backfill_provider_settlement_and_known_completeness() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        sqlx::query(
+            "CREATE TABLE agents (
+                 agent_id TEXT PRIMARY KEY, name TEXT NOT NULL, def TEXT NOT NULL,
+                 session TEXT, cost_micro_usd INTEGER NOT NULL DEFAULT 0,
+                 spawned_by TEXT, retired INTEGER NOT NULL DEFAULT 0,
+                 session_started_seq INTEGER NOT NULL DEFAULT 0, token TEXT);
+             CREATE UNIQUE INDEX idx_agents_token ON agents(token);
+             CREATE TABLE turns (
+                 agent_id TEXT NOT NULL, seq INTEGER NOT NULL, prompt TEXT NOT NULL,
+                 state TEXT NOT NULL, reply TEXT, error TEXT,
+                 cost_micro_usd INTEGER NOT NULL DEFAULT 0,
+                 elapsed_ms INTEGER NOT NULL DEFAULT 0,
+                 at_unix INTEGER NOT NULL DEFAULT 0,
+                 tokens_in INTEGER NOT NULL DEFAULT 0,
+                 tokens_out INTEGER NOT NULL DEFAULT 0,
+                 tokens_cached INTEGER NOT NULL DEFAULT 0,
+                 cost_state TEXT NOT NULL DEFAULT 'legacy',
+                 usage_state TEXT NOT NULL DEFAULT 'legacy',
+                 provider_turns INTEGER, claimed_unix_ms INTEGER,
+                 elapsed_state TEXT NOT NULL DEFAULT 'legacy',
+                 PRIMARY KEY (agent_id, seq));
+             CREATE TABLE schema_migrations (
+                 owner TEXT NOT NULL, name TEXT NOT NULL, applied_unix INTEGER NOT NULL,
+                 PRIMARY KEY (owner, name));",
+        )
+        .execute(&pool)
+        .await
+        .expect("pre-provenance schema");
+        for name in [
+            "0001_agents_turns",
+            "0002_agents_spawned_by",
+            "0003_agents_retired",
+            "0004_agents_session_started_seq",
+            "0005_turns_at_unix",
+            "0006_turns_tokens_in",
+            "0007_turns_tokens_out",
+            "0008_turns_tokens_cached",
+            "0009_agents_token",
+            "0010_agents_token_index",
+            "0011_turns_cost_state",
+            "0012_turns_usage_state",
+            "0013_turns_provider_turns",
+            "0014_turns_claimed_unix_ms",
+            "0015_turns_elapsed_state",
+        ] {
+            sqlx::query(
+                "INSERT INTO schema_migrations (owner, name, applied_unix)
+                 VALUES ('core', ?1, 1)",
+            )
+            .bind(name)
+            .execute(&pool)
+            .await
+            .expect("migration marker");
+        }
+
+        let codex = serde_json::to_string(&AgentDef::new("codex", "s").provider("codex"))
+            .expect("definition");
+        let legacy = r#"{
+            "name":"legacy","system_prompt":"s","model":null,
+            "allowed_tools":[],"working_dir":null,"max_turns":null
+        }"#;
+        sqlx::query(
+            "INSERT INTO agents (agent_id, name, def, token) VALUES
+                 ('codex-agent', 'codex', ?1, 'codex-token'),
+                 ('legacy-agent', 'legacy', ?2, 'legacy-token')",
+        )
+        .bind(codex)
+        .bind(legacy)
+        .execute(&pool)
+        .await
+        .expect("agents");
+        for (seq, state, at_unix, elapsed_state) in [
+            (1, "ok", 101, "measured"),
+            (2, "failed", 102, "measured"),
+            (3, "killed", 103, "measured"),
+            (4, "killed", 104, "not_attempted"),
+        ] {
+            sqlx::query(
+                "INSERT INTO turns
+                     (agent_id, seq, prompt, state, at_unix, usage_state, elapsed_state)
+                 VALUES ('codex-agent', ?1, 'work', ?2, ?3, 'reported', ?4)",
+            )
+            .bind(seq)
+            .bind(state)
+            .bind(at_unix)
+            .bind(elapsed_state)
+            .execute(&pool)
+            .await
+            .expect("turn");
+        }
+        sqlx::query(
+            "INSERT INTO turns (agent_id, seq, prompt, state, at_unix)
+             VALUES ('legacy-agent', 1, 'wait', 'queued', 105)",
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy turn");
+
+        let ledger = Ledger::setup(pool.clone()).await.expect("upgrade");
+        for (seq, complete) in [(1, false), (2, false), (3, false), (4, true)] {
+            let turn = ledger
+                .get_turn("codex-agent", seq)
                 .await
-                .unwrap()
-                .unwrap()
-                .reported_tokens(),
-            Some((21, 8, 13))
+                .expect("query")
+                .expect("turn");
+            assert_eq!(turn.provider, "codex");
+            assert_eq!(turn.settled_unix, Some(100 + seq));
+            assert_eq!(turn.usage_complete, complete);
+            assert_eq!(turn.admission_override, None);
+        }
+        let legacy = ledger
+            .get_turn("legacy-agent", 1)
+            .await
+            .expect("query")
+            .expect("turn");
+        assert_eq!(legacy.provider, "claude");
+        assert_eq!(legacy.settled_unix, None);
+        assert!(!legacy.usage_complete);
+
+        // Simulate a #64 binary writing after the additive #65 schema has
+        // been installed: its INSERT/UPDATE statements know none of the
+        // provider, settlement, or completeness columns. Persistent
+        // triggers must keep the first two facts correct, while the absent
+        // completeness proof remains conservatively false.
+        sqlx::query(
+            "INSERT INTO turns
+                 (agent_id, seq, prompt, state, at_unix, usage_state, elapsed_state)
+             VALUES ('codex-agent', 5, 'old writer', 'queued', 106, 'legacy', 'legacy')",
+        )
+        .execute(&pool)
+        .await
+        .expect("old writer insert");
+        sqlx::query(
+            "UPDATE turns
+                SET state = 'ok', usage_state = 'reported', tokens_in = 11,
+                    tokens_out = 2, elapsed_state = 'measured'
+              WHERE agent_id = 'codex-agent' AND seq = 5",
+        )
+        .execute(&pool)
+        .await
+        .expect("old writer settlement");
+        let reopened = Ledger::setup(pool.clone()).await.expect("re-upgrade");
+        let mixed = reopened
+            .get_turn("codex-agent", 5)
+            .await
+            .expect("query mixed-version row")
+            .expect("mixed-version turn");
+        assert_eq!(mixed.provider, "codex");
+        assert!(mixed.settled_unix.is_some());
+        assert!(!mixed.usage_complete);
+        let providers = ciacola_agent::ProviderRegistry::new()
+            .with(Arc::new(AccountingProvider {
+                key: ciacola_agent::ProviderKey::codex(),
+                reports_cost: false,
+                reports_usage: true,
+            }))
+            .expect("codex provider");
+        let reopened = reopened.with_providers(providers);
+        let limits = crate::limits::Limits {
+            providers: [(
+                "codex".into(),
+                crate::limits::ProviderLimits {
+                    daily_stop_tokens: Some(100),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let report = reopened
+            .admission_report(&limits)
+            .await
+            .expect("mixed-version admission report");
+        let codex = report
+            .providers
+            .iter()
+            .find(|status| status.accounting.provider == "codex")
+            .expect("codex status");
+        assert_eq!(codex.accounting.total_tokens(), 13);
+        assert_eq!(codex.accounting.usage_incomplete_turns, 1);
+        assert_eq!(codex.state, crate::limits::AdmissionState::Unobservable);
+
+        let (indexes,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'index'
+                AND name IN ('idx_turns_provider_settled', 'idx_turns_state_settled')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("index query");
+        assert_eq!(indexes, 2);
+    }
+
+    #[tokio::test]
+    async fn spend_window_uses_terminal_settlement_and_enqueue_stamps_auditable_provenance() {
+        let l = ledger().await;
+        let id = l
+            .create_agent(&AgentDef::new("codex", "s").provider("codex"), None)
+            .await
+            .expect("agent");
+        let admission_override = serde_json::json!({
+            "mode": "supervised",
+            "reason": "dogfood"
+        });
+        let seq = l
+            .enqueue_turn_with_admission_override(&id, "long run", Some(&admission_override))
+            .await
+            .expect("enqueue");
+        sqlx::query("UPDATE turns SET at_unix = 1 WHERE agent_id = ?1 AND seq = ?2")
+            .bind(&id)
+            .bind(seq)
+            .execute(l.pool())
+            .await
+            .expect("age enqueue");
+        assert!(l.claim_turn(&id, seq).await.expect("claim"));
+        let outcome = Exchange {
+            reply: "done".into(),
+            session: None,
+            cost: ciacola_agent::Cost::Reported { micro_usd: 73 },
+            usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage {
+                input: 10,
+                output: 2,
+                cached_input: 4,
+            }),
+            usage_complete: true,
+            provider_turns: Some(1),
+            elapsed_ms: 172_800_000,
+            error: None,
+        };
+        let cutoff = crate::time::now_unix() - 60;
+        assert!(l.complete_turn(&id, seq, &outcome).await.expect("settle"));
+
+        let turn = l.get_turn(&id, seq).await.unwrap().unwrap();
+        assert_eq!(turn.provider, "codex");
+        assert!(turn.settled_unix.expect("settled") >= cutoff);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                turn.admission_override.as_deref().expect("override")
+            )
+            .expect("valid json"),
+            admission_override
         );
+        assert_eq!(l.spend_since(cutoff).await.expect("spend"), 73);
+        assert_eq!(l.spend_since(cutoff + 120).await.expect("future"), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_u64_accounting_saturates_without_becoming_negative() {
+        let l = ledger().await;
+        let id = l
+            .create_agent(&AgentDef::new("a", "s"), None)
+            .await
+            .expect("agent");
+
+        let partial = l.enqueue_turn(&id, "partial").await.expect("turn");
+        assert!(l.claim_turn(&id, partial).await.expect("claim"));
+        assert!(
+            l.record_usage_snapshot(
+                &id,
+                partial,
+                ciacola_agent::TokenUsage {
+                    input: u64::MAX,
+                    output: u64::MAX,
+                    cached_input: u64::MAX,
+                },
+            )
+            .await
+            .expect("snapshot")
+        );
+        let snapshot = l.get_turn(&id, partial).await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.reported_tokens(),
+            Some((i64::MAX, i64::MAX, i64::MAX))
+        );
+        assert!(!snapshot.usage_complete);
+        assert!(
+            l.fail_exchange(
+                &id,
+                partial,
+                "failed",
+                "no terminal usage",
+                &Exchange {
+                    reply: String::new(),
+                    session: None,
+                    cost: ciacola_agent::Cost::Reported {
+                        micro_usd: u64::MAX,
+                    },
+                    usage: ciacola_agent::Usage::Unreported,
+                    usage_complete: false,
+                    provider_turns: None,
+                    elapsed_ms: u64::MAX,
+                    error: Some("no terminal usage".into()),
+                },
+            )
+            .await
+            .expect("settle")
+        );
+        let partial = l.get_turn(&id, partial).await.unwrap().unwrap();
+        assert_eq!(partial.cost_micro_usd, i64::MAX);
+        assert_eq!(partial.elapsed_ms, i64::MAX);
+        assert_eq!(
+            partial.reported_tokens(),
+            Some((i64::MAX, i64::MAX, i64::MAX))
+        );
+        assert!(!partial.usage_complete);
+
+        let authoritative = l.enqueue_turn(&id, "authoritative").await.expect("turn");
+        assert!(l.claim_turn(&id, authoritative).await.expect("claim"));
+        assert!(
+            l.complete_turn(
+                &id,
+                authoritative,
+                &Exchange {
+                    reply: "done".into(),
+                    session: None,
+                    cost: ciacola_agent::Cost::Reported {
+                        micro_usd: u64::MAX,
+                    },
+                    usage: ciacola_agent::Usage::Reported(ciacola_agent::TokenUsage {
+                        input: u64::MAX,
+                        output: u64::MAX,
+                        cached_input: u64::MAX,
+                    }),
+                    usage_complete: true,
+                    provider_turns: None,
+                    elapsed_ms: u64::MAX,
+                    error: None,
+                },
+            )
+            .await
+            .expect("complete")
+        );
+        let authoritative = l.get_turn(&id, authoritative).await.unwrap().unwrap();
+        assert_eq!(authoritative.cost_micro_usd, i64::MAX);
+        assert_eq!(authoritative.elapsed_ms, i64::MAX);
+        assert_eq!(
+            authoritative.reported_tokens(),
+            Some((i64::MAX, i64::MAX, i64::MAX))
+        );
+        assert!(authoritative.usage_complete);
+        assert_eq!(
+            l.get_agent(&id).await.unwrap().unwrap().cost_micro_usd,
+            i64::MAX
+        );
+        assert_eq!(l.spend_since(0).await.expect("saturated spend"), i64::MAX);
+        assert_eq!(
+            l.token_totals().await.expect("saturated token totals"),
+            (i64::MAX, i64::MAX)
+        );
+
+        let scalar = l.enqueue_turn(&id, "scalar").await.expect("turn");
+        assert!(l.claim_turn(&id, scalar).await.expect("claim"));
+        assert!(
+            l.fail_turn(
+                &id,
+                scalar,
+                "failed",
+                "legacy scalar telemetry",
+                i64::MAX,
+                1,
+                None,
+            )
+            .await
+            .expect("scalar settlement")
+        );
+        assert_eq!(
+            l.get_agent(&id).await.unwrap().unwrap().cost_micro_usd,
+            i64::MAX
+        );
+        assert_eq!(l.totals().await.expect("saturated totals").0, i64::MAX);
+
+        let health = crate::health::Health::new(l.clone(), "").report().await;
+        assert_eq!(health["reported_cost_micro_usd"], i64::MAX);
+        assert_eq!(health["tokens_in"], i64::MAX);
+        assert_eq!(health["tokens_out"], i64::MAX);
     }
 }

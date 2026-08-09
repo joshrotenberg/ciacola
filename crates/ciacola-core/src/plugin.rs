@@ -190,6 +190,7 @@ pub struct Section {
 pub enum Submission {
     Submitted {
         seq: i64,
+        admission_override: Option<crate::limits::AdmissionOverride>,
     },
     Busy {
         reason: String,
@@ -201,6 +202,23 @@ pub enum Submission {
         spent_usd: f64,
         limit_usd: f64,
     },
+    /// The target provider reached its portable token stop.
+    OverTokens {
+        provider: String,
+        used_tokens: u64,
+        limit_tokens: u64,
+    },
+    /// A configured hard stop cannot be evaluated from the rolling
+    /// telemetry. Automatic work fails closed.
+    Unobservable {
+        provider: String,
+        reason: String,
+    },
+    /// An unpriced provider has no token stop for automatic work.
+    Unguarded {
+        provider: String,
+        reason: String,
+    },
     Failed {
         reason: String,
     },
@@ -209,7 +227,7 @@ pub enum Submission {
 impl Submission {
     pub fn submitted(&self) -> Option<i64> {
         match self {
-            Submission::Submitted { seq } => Some(*seq),
+            Submission::Submitted { seq, .. } => Some(*seq),
             _ => None,
         }
     }
@@ -288,80 +306,220 @@ pub async fn submit(
     text: &str,
     source: &str,
 ) -> Submission {
-    // Checked before enqueuing, never against running work: an
-    // in-flight turn finishes and is recorded whatever the rolling
-    // total says. Stopping mid-supervision would leave a half-finished
-    // branch and an agent that never learns how it ended, which is
-    // worse than the overspend.
-    let warn = limits.warn_micro_usd();
-    let stop = limits.stop_micro_usd();
-    if warn.is_some() || stop.is_some() {
-        let since = crate::time::now_unix() - 86_400;
-        let spent = ledger.spend_since(since).await.unwrap_or_default();
-        if let Some(limit) = stop.filter(|limit| spent >= *limit) {
-            let (spent_usd, limit_usd) = (spent as f64 / 1e6, limit as f64 / 1e6);
+    submit_with_authority(
+        ledger,
+        exec,
+        notify,
+        limits,
+        crate::admission::AdmissionAuthority::Automatic,
+        agent_id,
+        text,
+        source,
+    )
+    .await
+}
+
+/// The interactive stdio-only exception path. It still cannot cross a
+/// known hard stop; it only acknowledges an unguarded or unobservable
+/// provider with a durable reason.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn submit_supervised(
+    ledger: &Ledger,
+    exec: &dyn TurnExecutor,
+    notify: &Notifier,
+    limits: &crate::limits::Limits,
+    agent_id: &str,
+    text: &str,
+    source: &str,
+    reason: &str,
+) -> Submission {
+    submit_with_authority(
+        ledger,
+        exec,
+        notify,
+        limits,
+        crate::admission::AdmissionAuthority::Supervised { reason },
+        agent_id,
+        text,
+        source,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_with_authority(
+    ledger: &Ledger,
+    exec: &dyn TurnExecutor,
+    notify: &Notifier,
+    limits: &crate::limits::Limits,
+    authority: crate::admission::AdmissionAuthority<'_>,
+    agent_id: &str,
+    text: &str,
+    source: &str,
+) -> Submission {
+    use crate::admission::AdmissionDecision;
+
+    match ledger
+        .admit_turn(limits, authority, agent_id, text, source)
+        .await
+    {
+        Ok(AdmissionDecision::Admitted {
+            seq,
+            status,
+            global,
+            admission_override,
+            ..
+        }) => {
+            let spent = global.reported_spend_micro_usd;
+            if let Some(warn) = global.daily_warn_micro_usd.filter(|warn| spent >= *warn) {
+                let stop_detail = global
+                    .daily_stop_micro_usd
+                    .map(|limit| format!(", stop at ${:.2}", limit as f64 / 1e6))
+                    .unwrap_or_default();
+                notify.turn(
+                    LogLevel::Warning,
+                    agent_id,
+                    seq,
+                    "budget_warning",
+                    &format!(
+                        "{source}: ${:.2} reported in 24h, warning at ${:.2}{stop_detail}",
+                        spent as f64 / 1e6,
+                        warn as f64 / 1e6,
+                    ),
+                );
+            }
+            let used_tokens = status.accounting.total_tokens();
+            if let Some(warn) = status.daily_warn_tokens.filter(|warn| used_tokens >= *warn) {
+                let stop_detail = status
+                    .daily_stop_tokens
+                    .map(|limit| format!(", stop at {limit}"))
+                    .unwrap_or_default();
+                notify.turn(
+                    LogLevel::Warning,
+                    agent_id,
+                    seq,
+                    "token_warning",
+                    &format!(
+                        "{source}: {used_tokens} {} tokens reported in 24h, warning at {warn}{stop_detail}",
+                        status.accounting.provider,
+                    ),
+                );
+            }
+            if let Some(audit) = &admission_override {
+                notify.turn(
+                    LogLevel::Warning,
+                    agent_id,
+                    seq,
+                    "admission_override",
+                    &format!(
+                        "{source}: supervised {:?} override for {}: {}",
+                        audit.kind, audit.provider, audit.reason
+                    ),
+                );
+                tracing::warn!(
+                    agent = %agent_id,
+                    seq,
+                    provider = %audit.provider,
+                    kind = ?audit.kind,
+                    reason = %audit.reason,
+                    "supervised admission override"
+                );
+            }
+            exec.submit(agent_id.to_string(), seq);
+            tracing::Span::current().record("outcome", "submitted");
+            tracing::info!(agent = %agent_id, seq, source, "turn submitted");
+            notify.turn(LogLevel::Info, agent_id, seq, "submitted", source);
+            Submission::Submitted {
+                seq,
+                admission_override,
+            }
+        }
+        Ok(AdmissionDecision::Busy { reason }) => {
+            notify.turn(
+                LogLevel::Warning,
+                agent_id,
+                0,
+                "skipped",
+                &format!("{source}: busy"),
+            );
+            Submission::Busy { reason }
+        }
+        Ok(AdmissionDecision::OverBudget {
+            spent_micro_usd,
+            limit_micro_usd,
+        }) => {
+            let spent_usd = spent_micro_usd as f64 / 1e6;
+            let limit_usd = limit_micro_usd as f64 / 1e6;
             notify.turn(
                 LogLevel::Error,
                 agent_id,
                 0,
                 "over_budget",
                 &format!(
-                    "{source}: ${spent_usd:.2} spent in 24h, limit ${limit_usd:.2}; \
-                     new submissions refused until it falls below"
+                    "{source}: ${spent_usd:.2} reported in 24h, limit ${limit_usd:.2}; new submissions refused until it falls below"
                 ),
             );
-            return Submission::OverBudget {
+            Submission::OverBudget {
                 spent_usd,
                 limit_usd,
-            };
+            }
         }
-        if let Some(warn) = warn.filter(|warn| spent >= *warn) {
-            let stop_detail = stop
-                .map(|limit| format!(", stop at ${:.2}", limit as f64 / 1e6))
-                .unwrap_or_default();
+        Ok(AdmissionDecision::OverTokens {
+            provider,
+            used_tokens,
+            limit_tokens,
+        }) => {
             notify.turn(
-                LogLevel::Warning,
+                LogLevel::Error,
                 agent_id,
                 0,
-                "budget_warning",
+                "over_tokens",
                 &format!(
-                    "{source}: ${:.2} spent in 24h, warning at ${:.2}{stop_detail}",
-                    spent as f64 / 1e6,
-                    warn as f64 / 1e6,
+                    "{source}: {used_tokens} {provider} tokens reported in 24h, limit {limit_tokens}; new submissions refused until it falls below"
                 ),
             );
+            Submission::OverTokens {
+                provider,
+                used_tokens,
+                limit_tokens,
+            }
         }
-    }
-
-    match ledger.enqueue_turn(agent_id, text).await {
-        Ok(seq) => {
-            exec.submit(agent_id.to_string(), seq);
-            tracing::Span::current().record("outcome", "submitted");
-            tracing::info!(agent = %agent_id, seq, source, "turn submitted");
-            notify.turn(LogLevel::Info, agent_id, seq, "submitted", source);
-            Submission::Submitted { seq }
+        Ok(AdmissionDecision::Unobservable { provider, detail }) => {
+            notify.turn(
+                LogLevel::Error,
+                agent_id,
+                0,
+                "admission_unobservable",
+                &format!("{source}: {provider}: {detail}"),
+            );
+            Submission::Unobservable {
+                provider,
+                reason: detail,
+            }
+        }
+        Ok(AdmissionDecision::Unguarded { provider, detail }) => {
+            notify.turn(
+                LogLevel::Error,
+                agent_id,
+                0,
+                "admission_unguarded",
+                &format!("{source}: {provider}: {detail}"),
+            );
+            Submission::Unguarded {
+                provider,
+                reason: detail,
+            }
         }
         Err(e) => {
             let reason = e.to_string();
-            if reason.contains("in flight") {
-                notify.turn(
-                    LogLevel::Warning,
-                    agent_id,
-                    0,
-                    "skipped",
-                    &format!("{source}: busy"),
-                );
-                Submission::Busy { reason }
-            } else {
-                notify.turn(
-                    LogLevel::Error,
-                    agent_id,
-                    0,
-                    "rejected",
-                    &format!("{source}: {reason}"),
-                );
-                Submission::Failed { reason }
-            }
+            notify.turn(
+                LogLevel::Error,
+                agent_id,
+                0,
+                "rejected",
+                &format!("{source}: {reason}"),
+            );
+            Submission::Failed { reason }
         }
     }
 }
@@ -666,6 +824,40 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    struct ReportingProvider;
+
+    impl ciacola_agent::Provider for ReportingProvider {
+        fn key(&self) -> ciacola_agent::ProviderKey {
+            ciacola_agent::ProviderKey::claude()
+        }
+
+        fn capabilities(&self) -> ciacola_agent::Capabilities {
+            let mut capabilities = ciacola_agent::Capabilities::none(self.key());
+            capabilities.reports_cost = true;
+            capabilities.reports_token_usage = true;
+            capabilities
+        }
+
+        fn run<'a>(
+            &'a self,
+            _intent: &'a ciacola_agent::TurnIntent,
+            _events: &'a dyn ciacola_agent::TurnEvents,
+        ) -> ciacola_agent::BoxFut<'a, Result<ciacola_agent::TurnOutcome, ciacola_agent::AgentError>>
+        {
+            Box::pin(async { unreachable!("submission tests do not run providers") })
+        }
+
+        fn owns_process(&self, _ps_line: &str) -> bool {
+            false
+        }
+    }
+
+    fn reporting_providers() -> ciacola_agent::ProviderRegistry {
+        ciacola_agent::ProviderRegistry::new()
+            .with(Arc::new(ReportingProvider))
+            .expect("provider")
+    }
+
     #[derive(Default)]
     struct RecordingExecutor(Mutex<Vec<(String, i64)>>);
 
@@ -702,7 +894,10 @@ mod tests {
 
     async fn ctx() -> PluginContext {
         let pool = SqlitePool::connect("sqlite::memory:").await.expect("pool");
-        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        let ledger = Ledger::setup(pool.clone())
+            .await
+            .expect("ledger")
+            .with_providers(reporting_providers());
         let (tx, _rx) = tower_mcp::context::notification_channel(8);
         let notify = Notifier(tx);
         let exec = crate::exec::HandExecutor::start(ledger.clone(), notify.clone(), 1);
@@ -852,15 +1047,18 @@ mod tests {
         use tower_mcp::ServerNotification;
 
         let pool = SqlitePool::connect("sqlite::memory:").await.expect("pool");
-        let ledger = Ledger::setup(pool.clone()).await.expect("ledger");
+        let ledger = Ledger::setup(pool.clone())
+            .await
+            .expect("ledger")
+            .with_providers(reporting_providers());
         let agent_id = ledger
             .create_agent(&AgentDef::new("target", "system"), None)
             .await
             .expect("agent");
         sqlx::query(
             "INSERT INTO turns
-                 (agent_id, seq, prompt, state, cost_micro_usd, at_unix)
-             VALUES ('previous', 1, 'spent', 'ok', 2000000, ?1)",
+                 (agent_id, seq, prompt, state, cost_micro_usd, at_unix, settled_unix)
+             VALUES ('previous', 1, 'spent', 'ok', 2000000, ?1, ?1)",
         )
         .bind(crate::time::now_unix())
         .execute(&pool)

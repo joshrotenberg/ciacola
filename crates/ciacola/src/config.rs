@@ -130,6 +130,7 @@ fn parse(text: &str) -> Result<Config, FlatError> {
 }
 
 fn validate(config: &Config) -> Result<(), FlatError> {
+    config.limits.validate()?;
     validate_sandbox("runtime", config.runtime.sandbox.as_deref())?;
     for role in &config.roles {
         if role.inherit_provider_tools && !role.allowed_tools.is_empty() {
@@ -421,6 +422,46 @@ mod tests {
         )
         .expect_err("a typo must not remove containment");
         assert!(sandbox.to_string().contains("unknown sandbox"));
+    }
+
+    #[test]
+    fn provider_token_limits_parse_with_clear_total_token_units() {
+        let config = parse(
+            r#"
+                [limits]
+                daily_stop_usd = 50.0
+
+                [limits.providers.codex]
+                daily_warn_tokens = 2000000
+                daily_stop_tokens = 4000000
+            "#,
+        )
+        .expect("provider limits");
+        let codex = config.limits.providers.get("codex").expect("codex");
+        assert_eq!(codex.daily_warn_tokens, Some(2_000_000));
+        assert_eq!(codex.daily_stop_tokens, Some(4_000_000));
+    }
+
+    #[test]
+    fn inverted_or_zero_limits_fail_at_parse_time() {
+        let inverted = parse(
+            r#"
+                [limits.providers.codex]
+                daily_warn_tokens = 20
+                daily_stop_tokens = 10
+            "#,
+        )
+        .expect_err("inverted token thresholds");
+        assert!(inverted.to_string().contains("must be <="), "{inverted}");
+
+        let zero = parse(
+            r#"
+                [limits]
+                daily_stop_usd = 0.0
+            "#,
+        )
+        .expect_err("zero means omit the breaker, not a valid value");
+        assert!(zero.to_string().contains("positive"), "{zero}");
     }
 
     #[test]

@@ -148,12 +148,6 @@ forbid. House rules are now an explicit layer of the system prompt.
    one client is the wrong direction, so this is filed upstream as
    [mcp-repl#87](https://github.com/joshrotenberg/mcp-repl/issues/87)
    and nothing here changes.
-4. **The dollar breaker cannot bound unpriced Codex turns.** Codex reports
-   tokens and no price at all, and the adapter deliberately refuses to
-   synthesize one. Token usage is durable and visible, but admission still
-   needs provider/token limits before an unattended Codex schedule has a
-   meaningful circuit breaker.
-
 ## What to do next, roughly in order
 
 **Real use, on more than one repository.** The system has taken exactly
@@ -171,8 +165,8 @@ JSONL stream announces them, resumes through the provider's separate command,
 records real tokens as unpriced, applies strict scoped MCP with env-backed
 identity headers, and treats sandbox plus native execution policy as Codex's
 authority surface. Scripted tests cover the contract; the next proof is a
-small supervised repository task. Add a token breaker before scheduling one
-unattended.
+small supervised repository task. Configure its provider token breaker before
+scheduling one unattended.
 
 **Session mining.** Provider-specific `claude_home` and `codex_home` make
 the server's transcripts a separate, attributable corpus, which is what makes
@@ -186,8 +180,9 @@ between them is the interesting signal.
 **Streaming, scoped.** Not token text, which nobody is watching. Tool calls
 and phase transitions, recorded as turn events and rendered, answer "is it
 doing something sensible" without reading everything. Codex JSONL now arrives
-live, but the provider-neutral event sink carries only a session id; widen that
-contract deliberately before exposing provider-specific event shapes.
+live, while the provider-neutral event sink deliberately carries only durable
+session and cumulative token-usage observations; widen that contract deliberately
+before exposing provider-specific event shapes.
 
 **The board, properly.** It is 355 lines of hand-rolled HTML with a
 five-second meta refresh, and it has carried further than it deserves

@@ -48,6 +48,7 @@
 //! point, and which silently removed the operator's own standing rules
 //! until house rules became an explicit layer of the system prompt.
 
+mod admission;
 pub mod agent;
 pub mod complete;
 pub mod exec;
