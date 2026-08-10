@@ -51,7 +51,8 @@ use sqlx::SqlitePool;
 mod config;
 mod operator_auth;
 mod provider_auth;
-use tower_mcp::context::notification_channel;
+use tower_mcp::McpRouter;
+use tower_mcp::context::{NotificationReceiver, notification_channel};
 use tower_mcp::transport::{GenericStdioTransport, HttpTransport};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -241,6 +242,47 @@ async fn run(
     config_path: Option<String>,
     declared_early: config::Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve(
+        build(
+            operator_token,
+            provider_credentials,
+            child_environment,
+            config_path,
+            declared_early,
+        )
+        .await?,
+    )
+    .await
+}
+
+/// What `serve` still needs once the server is fully started: the
+/// operator stdio router with its notification stream, and the wiring
+/// the Ctrl-C drain path uses. `build` returns this only after the
+/// loopback HTTP server is bound and serving, recovery has reconciled
+/// the ledger, and dispatch is open, so a caller other than `serve`
+/// (a future one-shot CLI) gets a dispatch-ready server without the
+/// stdio transport attached.
+struct Built {
+    stdio_router: McpRouter,
+    notifications: NotificationReceiver,
+    drain_exec: Arc<dyn TurnExecutor>,
+    shutdown: CancellationToken,
+    http_handle: tokio::task::JoinHandle<()>,
+}
+
+/// Bring the server all the way up: tracing, ledger, providers,
+/// plugins, the three MCP routers, the loopback HTTP bind, recovery,
+/// and dispatch opening, in that order. The tail of this sequence is a
+/// security property, not a convenience: dispatch stays closed until
+/// the complete loopback surface is bound and recovery has adjudicated
+/// pre-crash rows, and reordering it must fail closed.
+async fn build(
+    operator_token: Option<operator_auth::HumanOperatorToken>,
+    provider_credentials: provider_auth::ProviderCredentials,
+    child_environment: ciacola_agent::ProviderChildEnvironment,
+    config_path: Option<String>,
+    declared_early: config::Config,
+) -> Result<Built, Box<dyn std::error::Error + Send + Sync>> {
     // Seeded now so the split into real crates inherits instrumentation
     // rather than needing it retrofitted. Off unless RUST_LOG asks, and
     // to stderr because stdout is the MCP transport.
@@ -599,11 +641,33 @@ async fn run(
     dispatch.open();
     eprintln!("[ciacola] dispatch: ready ({})", exec.name());
 
+    Ok(Built {
+        stdio_router,
+        notifications: rx,
+        drain_exec,
+        shutdown,
+        http_handle,
+    })
+}
+
+/// Attach the stdio operator transport to a started server and hold it
+/// until stdin ends or Ctrl-C drains it. Everything before this point
+/// lives in `build`; a caller that only needs a dispatch-ready server
+/// stops there.
+async fn serve(built: Built) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Built {
+        stdio_router,
+        notifications,
+        drain_exec,
+        shutdown,
+        http_handle,
+    } = built;
+
     // Ctrl-C drains rather than kills. Without this, a signal ends a
     // twenty minute agent run mid-flight: recovery tidies up on the
     // next boot, but it tidies up by killing the provider and marking
     // the turn failed, so the work and the money are both gone.
-    let mut transport = GenericStdioTransport::with_notifications(stdio_router, rx);
+    let mut transport = GenericStdioTransport::with_notifications(stdio_router, notifications);
     tokio::select! {
         result = transport.run() => { result?; }
         _ = tokio::signal::ctrl_c() => {
