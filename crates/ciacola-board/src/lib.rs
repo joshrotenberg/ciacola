@@ -561,7 +561,7 @@ async fn overview_body(state: &BoardState) -> String {
     }
 
     body.push_str(&format!(
-        "<section class=\"panel\"><details><summary>limits, usage, and automatic admission</summary>\
+        "<section class=\"panel\"><details id=\"d-limits\"><summary>limits, usage, and automatic admission</summary>\
          {}</details></section>",
         admission_section(state.ledger.admission_report(&state.limits).await)
     ));
@@ -600,7 +600,7 @@ async fn overview_body(state: &BoardState) -> String {
         ));
     }
     body.push_str(&format!(
-        "<section class=\"panel\"><details><summary>all active agents ({})</summary>\
+        "<section class=\"panel\"><details id=\"d-agents\"><summary>all active agents ({})</summary>\
          <div class=\"table-wrap\"><table class=\"responsive-table\"><caption class=\"sr-only\">All non-retired agents</caption>\
          <tr><th scope=\"col\">name</th><th scope=\"col\">role</th><th scope=\"col\">state</th>\
          <th scope=\"col\">provider</th><th scope=\"col\" class=\"num\">turns</th>\
@@ -1092,6 +1092,17 @@ mod tests {
             html.find("active now") < html.find("limits, usage, and automatic admission"),
             "{html}"
         );
+    }
+
+    /// The live swap preserves open disclosures by id, so the ids are a
+    /// contract: renaming one silently breaks state preservation.
+    #[tokio::test]
+    async fn overview_disclosures_carry_stable_ids() {
+        let state = state().await;
+        let html = overview_body(&state).await;
+
+        assert!(html.contains("<details id=\"d-limits\">"), "{html}");
+        assert!(html.contains("<details id=\"d-agents\">"), "{html}");
     }
 
     #[tokio::test]

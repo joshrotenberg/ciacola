@@ -131,6 +131,13 @@ pub fn page_with(title: &str, body: &str, live: bool) -> Html<String> {
 }
 
 /// Reconnects on its own, swaps one fragment, and leaves scroll alone.
+///
+/// The swap replaces `main` wholesale, which would also reset every
+/// `details` the operator has opened; any timestamp tick refreshes a
+/// nonempty board at least once a minute, so without repair the
+/// disclosures snap shut mid-read. Disclosures with a stable `id`
+/// therefore have their open state carried across the swap, and focus
+/// is restored by id when the focused element survives.
 const LIVE_SCRIPT: &str = r#"<script>
 (() => {
   const main = () => document.querySelector('main');
@@ -147,7 +154,20 @@ const LIVE_SCRIPT: &str = r#"<script>
       try {
         const html = await (await fetch('/board/fragment')).text();
         const el = main();
-        if (el && el.innerHTML !== html) el.innerHTML = html;
+        if (el && el.innerHTML !== html) {
+          const open = new Set(
+            [...el.querySelectorAll('details[id]')].filter(d => d.open).map(d => d.id)
+          );
+          const focused = document.activeElement && document.activeElement.id;
+          el.innerHTML = html;
+          for (const d of el.querySelectorAll('details[id]')) {
+            if (open.has(d.id)) d.open = true;
+          }
+          if (focused) {
+            const again = document.getElementById(focused);
+            if (again) again.focus();
+          }
+        }
         setLive('yes', 'live');
       } catch (_) { /* a failed fetch is a dropped frame, not an error */ }
     });
@@ -183,5 +203,14 @@ mod tests {
         assert!(chip("retained").contains("#d29922"));
         assert!(chip("stale").contains("#f85149"));
         assert!(chip("completed").contains("#3fb950"));
+    }
+
+    /// The fragment swap must repair operator view state, not just
+    /// replace content: open disclosures (by id) and focus survive.
+    #[test]
+    fn live_script_preserves_disclosures_and_focus_across_swaps() {
+        assert!(LIVE_SCRIPT.contains("details[id]"));
+        assert!(LIVE_SCRIPT.contains("d.open = true"));
+        assert!(LIVE_SCRIPT.contains("again.focus()"));
     }
 }
