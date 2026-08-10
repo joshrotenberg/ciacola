@@ -828,6 +828,42 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_example_config_parses_through_the_startup_path() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("ciacola.example.toml");
+        let text = std::fs::read_to_string(&path)
+            .expect("ciacola.example.toml sits in the workspace root");
+        let config = parse(&text).expect("the shipped example must parse and validate as written");
+
+        // The uncommented portion of the file; everything else is
+        // annotation. Failing here means the example drifted from what
+        // the binary accepts, or its live settings changed.
+        assert_eq!(config.runtime.hermetic.as_deref(), Some("full"));
+        assert_eq!(config.limits.max_spawn_depth, 3);
+        assert!(config.limits.daily_warn_usd.is_none());
+        assert!(config.limits.daily_stop_usd.is_none());
+        assert!(config.agents.is_empty());
+        assert!(config.roles.is_empty());
+        assert!(config.delegation.roles.is_empty());
+
+        let repo_worker = config
+            .plugins
+            .get("repo-worker")
+            .expect("the example configures the repo-worker plugin");
+        assert_eq!(
+            repo_worker.get("root").and_then(toml::Value::as_str),
+            Some("~/.local/share/ciacola/repos")
+        );
+        let repos = repo_worker
+            .get("repos")
+            .and_then(toml::Value::as_array)
+            .expect("repos is a list");
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].as_str(), Some("joshrotenberg/mdbook-lint"));
+    }
+
+    #[test]
     fn persistent_role_missing_an_argument_fails_at_boot() {
         let config: Config = toml::from_str(
             r#"
