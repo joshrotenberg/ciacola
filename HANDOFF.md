@@ -51,8 +51,11 @@ ceiling in `ciacola.toml`.
 | `CIACOLA_CONFIG` | config file; default `ciacola.toml` when present, otherwise empty |
 | `CIACOLA_HTTP` | port for the board and the agents' MCP endpoint |
 | `CIACOLA_CONCURRENCY` | turns in flight, default 4 |
+| `CIACOLA_EXECUTOR` | `channel` selects notification dispatch; any other value uses polling |
 | `CIACOLA_NO_RECOVER` | skip startup recovery |
 | `CIACOLA_OPERATOR_TOKEN_FD` | inherited descriptor containing the human HTTP root bearer |
+| `CIACOLA_CLAUDE_TOKEN_FD` | inherited descriptor carrying a Claude credential for a fresh provider home |
+| `CIACOLA_CODEX_TOKEN_FD` | inherited descriptor carrying a Codex credential for a fresh provider home |
 | `RUST_LOG` | tracing filter, default `warn` |
 
 Four surfaces, one process:
@@ -66,7 +69,8 @@ Four surfaces, one process:
   unknown, and retired callers are refused before MCP dispatch.
 - **Authenticated HTTP MCP at `/mcp-operator`** for a human holding the root
   bearer. Provider-backed agent credentials are refused.
-- **The board at `/board`**, plain HTML, auto-refreshing.
+- **The board at `/board`**, server-rendered HTML with SSE-driven
+  live updates and no build step.
 
 `ciacola.example.toml` is annotated and is the fastest way to see what
 is configurable.
@@ -144,17 +148,21 @@ retained in this public handoff.
 ## Layout, and where the line falls
 
 ```
-ciacola-core        the primitive and everything nothing works without
-ciacola-kanban      work items, lanes, per-item journeys
-ciacola-memory      namespaced key-value that outlives any agent
-ciacola-findings    what agents notice about the system
-ciacola-schedule    interval schedules; a fire is an ordinary turn
-ciacola-refs        reference material; writes no SQL
-ciacola-git         live git state; stores nothing at all
-ciacola-webhook     inbound HTTP that pokes an agent
-ciacola-tuning      what each model has actually cost and achieved
-ciacola-repo-worker issue to pull request, in the system's own clone
-ciacola             config, the plugin list, main
+ciacola-agent        the provider boundary; depends on no other crate here
+ciacola-agent-claude the Claude adapter behind that boundary
+ciacola-agent-codex  the Codex adapter behind that boundary
+ciacola-core         the primitive and everything nothing works without
+ciacola-board        the operator board; takes a Ledger and the plugin host
+ciacola-kanban       work items, lanes, per-item journeys
+ciacola-memory       namespaced key-value that outlives any agent
+ciacola-findings     what agents notice about the system
+ciacola-schedule     interval schedules; a fire is an ordinary turn
+ciacola-refs         reference material; writes no SQL
+ciacola-git          live git state; stores nothing at all
+ciacola-webhook      inbound HTTP that pokes an agent
+ciacola-tuning       what each model has actually cost and achieved
+ciacola-repo-worker  issue to pull request, in the system's own clone
+ciacola              config, the plugin list, main
 ```
 
 `PluginContext` is the precise statement of what core is: pool, ledger,
@@ -176,8 +184,8 @@ Three plugin shapes exist and are worth copying from:
 - **Stateless** (`git`, `tuning`): no storage at all, every answer read
   live.
 
-None of the nine implements the same subset of the trait. That is the
-defaults working, not a gap.
+None of the ten registered plugins implements the same subset of the
+trait. That is the defaults working, not a gap.
 
 ## Two rules that were learned expensively
 
@@ -293,18 +301,16 @@ live, while the provider-neutral event sink deliberately carries only durable
 session and cumulative token-usage observations; widen that contract deliberately
 before exposing provider-specific event shapes.
 
-**The board, properly.** It is 355 lines of hand-rolled HTML with a
-five-second meta refresh, and it has carried further than it deserves
-to. Two separable questions.
+**The board, properly.** The *making it optional* half of what this
+section once proposed is done: the board is the `ciacola-board` crate,
+taking a `Ledger` and an `Arc<PluginHost>` and returning a `Router`
+the binary merges or not, and the shared render helpers (`esc`, `usd`,
+`chip`) stayed in core, in `ciacola_core::render`. The five-second
+meta refresh is gone too: `/board/events` holds an SSE connection and
+the client swaps server-rendered fragments with ~30 lines of vanilla
+JS, deliberately not htmx yet.
 
-*Making it optional* is easy and consistent: move it to a
-`ciacola-board` crate that takes a `Ledger` and an `Arc<PluginHost>`
-and returns a `Router`, and let the binary merge it or not. The eight
-plugins that contribute sections already import `ciacola_core::board`
-for three helpers (`esc`, `usd`, `chip`), so those helpers stay in core
-and the renderer moves out. Nothing in core needs the board.
-
-*Making it good* is the interesting one, and the toolkit question has a
+*Making it good* is the remaining half, and the toolkit question has a
 clearer answer here than it would for most apps, because of a property
 worth protecting: **the board has no build step.** `cargo run` and it
 is there. Adding `trunk`, `cargo-leptos`, or `npm` is a permanent tax
@@ -321,9 +327,10 @@ precisely the shape htmx serves: the server renders fragments, the
 client swaps them, nothing is built.
 
 So the recommendation is **axum plus htmx plus SSE first**, which keeps
-the no-build-step property and reuses machinery that already exists
-(tower-mcp's HTTP transport is already an SSE server, and notifications
-already flow through it). Reach for Leptos or Dioxus when the board
+the no-build-step property and reuses machinery that already exists.
+The SSE half is in place; htmx (or per-panel fragment swaps under the
+current vanilla JS) is the natural next step when whole-page swaps
+start fighting the operator. Reach for Leptos or Dioxus when the board
 grows genuine client state that a server round trip cannot serve:
 client-side filtering of large tables, a dependency graph you can drag,
 optimistic updates. Those are real reasons and none of them apply yet.
