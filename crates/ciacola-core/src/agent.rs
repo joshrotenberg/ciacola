@@ -306,7 +306,7 @@ pub struct Exchange {
     /// The provider reported the run as an error. The exchange still
     /// happened: it cost money and may have advanced the session, so it
     /// comes back as data rather than as `Err`, which would throw both
-    /// away. `Err` from [`run_exchange`] means the process could not be
+    /// away. `Err` from `run_exchange_with_ceiling` means the process could not be
     /// run at all.
     pub error: Option<String>,
     /// Typed reason a provider run ended badly. Kept beside `error` so a
