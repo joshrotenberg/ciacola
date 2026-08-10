@@ -1,0 +1,1 @@
+ALTER TABLE repo_worker_assignments ADD COLUMN base_head TEXT

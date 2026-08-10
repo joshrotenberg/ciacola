@@ -53,6 +53,9 @@ use ciacola_core::ledger::Ledger;
 use ciacola_core::plugin::{BoxFut, Migration, Plugin, PluginContext, Section, Surface};
 use ciacola_core::roles::{Role, Roles};
 
+mod migrations;
+use migrations::{ASSIGNMENTS_TABLE, MIGRATIONS};
+
 const ROLE: &str = "issue-implementer";
 const START_ISSUE_ROLE_ARGUMENTS: [&str; 3] = ["repo", "issue", "worktree"];
 /// The other half of the loop: whoever dispatches work is also who
@@ -185,121 +188,6 @@ fn validate_start_issue_role_arguments(role: &Role) -> Result<(), String> {
         differences.join("; ")
     ))
 }
-
-const ASSIGNMENTS_TABLE: &str = "repo_worker_assignments";
-const MIGRATIONS: &[Migration] = &[
-    Migration::new(
-        "0001_assignments",
-        "CREATE TABLE IF NOT EXISTS repo_worker_assignments (
-         assignment_id TEXT PRIMARY KEY,
-         repo TEXT NOT NULL COLLATE NOCASE,
-         issue_number INTEGER NOT NULL,
-         state TEXT NOT NULL CHECK (
-             state IN ('preparing', 'active', 'finishing', 'retained', 'completed', 'stale')),
-         phase TEXT NOT NULL,
-         base TEXT,
-         slug TEXT NOT NULL,
-         branch TEXT NOT NULL,
-         worktree TEXT NOT NULL,
-         bare_path TEXT NOT NULL,
-         agent_id TEXT UNIQUE,
-         related_agent_ids TEXT NOT NULL DEFAULT '[]',
-         spawned_by TEXT,
-         pr INTEGER,
-         last_error TEXT,
-         created_unix INTEGER NOT NULL,
-         updated_unix INTEGER NOT NULL,
-         terminal_unix INTEGER,
-         UNIQUE(repo, issue_number));
-     CREATE UNIQUE INDEX IF NOT EXISTS repo_worker_owned_worktree
-         ON repo_worker_assignments(worktree)
-         WHERE state IN ('preparing', 'active', 'finishing', 'retained');
-     CREATE UNIQUE INDEX IF NOT EXISTS repo_worker_owned_branch
-         ON repo_worker_assignments(repo, branch)
-         WHERE state IN ('preparing', 'active', 'finishing', 'retained');",
-    ),
-    Migration::add_column(
-        "0002_base_head",
-        "ALTER TABLE repo_worker_assignments ADD COLUMN base_head TEXT",
-    ),
-    Migration::add_column(
-        "0003_expected_head",
-        "ALTER TABLE repo_worker_assignments ADD COLUMN expected_head TEXT",
-    ),
-    Migration::add_column(
-        "0004_publication_state",
-        "ALTER TABLE repo_worker_assignments ADD COLUMN publication_state TEXT NOT NULL
-             DEFAULT 'unpublished' CHECK (
-                 publication_state IN ('unpublished', 'publishing', 'published', 'failed'))",
-    ),
-    Migration::add_column(
-        "0005_pr_url",
-        "ALTER TABLE repo_worker_assignments ADD COLUMN pr_url TEXT",
-    ),
-    Migration::add_column(
-        "0006_pr_state",
-        "ALTER TABLE repo_worker_assignments ADD COLUMN pr_state TEXT CHECK (
-             pr_state IS NULL OR pr_state IN ('open', 'closed', 'merged'))",
-    ),
-    Migration::add_column(
-        "0007_pr_draft",
-        "ALTER TABLE repo_worker_assignments ADD COLUMN pr_draft INTEGER CHECK (
-             pr_draft IS NULL OR pr_draft IN (0, 1))",
-    ),
-    Migration::add_column(
-        "0008_pr_head",
-        "ALTER TABLE repo_worker_assignments ADD COLUMN pr_head TEXT",
-    ),
-    Migration::add_column(
-        "0009_pr_base",
-        "ALTER TABLE repo_worker_assignments ADD COLUMN pr_base TEXT",
-    ),
-    Migration::add_column(
-        "0010_pr_checked_unix",
-        "ALTER TABLE repo_worker_assignments ADD COLUMN pr_checked_unix INTEGER",
-    ),
-    Migration::add_column(
-        "0011_cleanup_state",
-        "ALTER TABLE repo_worker_assignments ADD COLUMN cleanup_state TEXT NOT NULL
-             DEFAULT 'none' CHECK (
-                 cleanup_state IN ('none', 'retaining', 'retained', 'removing', 'completed', 'failed'))",
-    ),
-    Migration::add_column(
-        "0012_cleanup_head",
-        "ALTER TABLE repo_worker_assignments ADD COLUMN cleanup_head TEXT",
-    ),
-    Migration::add_column(
-        "0013_cleanup_reason",
-        "ALTER TABLE repo_worker_assignments ADD COLUMN cleanup_reason TEXT CHECK (
-             cleanup_reason IS NULL OR cleanup_reason IN ('absent', 'no_changes', 'merged', 'discarded'))",
-    ),
-    Migration::add_column(
-        "0014_pushed_head",
-        "ALTER TABLE repo_worker_assignments ADD COLUMN pushed_head TEXT",
-    ),
-    Migration::new(
-        "0015_journey_backfill",
-        "UPDATE repo_worker_assignments
-            SET publication_state = 'published'
-          WHERE pr IS NOT NULL;
-         UPDATE repo_worker_assignments
-            SET cleanup_state = CASE state
-                WHEN 'finishing' THEN CASE
-                    WHEN phase = 'finishing_keep' THEN 'retaining'
-                    ELSE 'removing'
-                END
-                WHEN 'retained' THEN 'retained'
-                WHEN 'completed' THEN 'completed'
-                WHEN 'stale' THEN 'failed'
-                ELSE 'none'
-            END",
-    ),
-    Migration::add_column(
-        "0016_branch_policy",
-        "ALTER TABLE repo_worker_assignments ADD COLUMN branch_policy TEXT NOT NULL
-             DEFAULT 'agent/{slug}'",
-    ),
-];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
