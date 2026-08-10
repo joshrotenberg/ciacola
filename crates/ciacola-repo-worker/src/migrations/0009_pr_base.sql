@@ -1,0 +1,1 @@
+ALTER TABLE repo_worker_assignments ADD COLUMN pr_base TEXT

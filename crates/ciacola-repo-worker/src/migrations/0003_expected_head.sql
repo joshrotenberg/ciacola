@@ -1,0 +1,1 @@
+ALTER TABLE repo_worker_assignments ADD COLUMN expected_head TEXT
