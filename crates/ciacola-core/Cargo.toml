@@ -25,3 +25,7 @@ toml = { workspace = true }
 tower-mcp = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
+
+[features]
+# Compiles in the admission-bypassing test enqueue path.
+test-support = []

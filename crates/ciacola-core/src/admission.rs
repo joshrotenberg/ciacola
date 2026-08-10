@@ -63,6 +63,21 @@ pub(crate) enum AdmissionDecision {
     },
 }
 
+/// The one guarded queued-turn INSERT: busy fence, retirement fence, and
+/// race-safe seq allocation in a single statement. `admit_turn` runs it
+/// inside the admission transaction; the test-support enqueue path runs
+/// the identical statement so the two cannot drift.
+pub(crate) const GUARDED_TURN_INSERT: &str = "INSERT INTO turns
+                 (agent_id, seq, prompt, state, at_unix, provider, admission_override,
+                  turn_protection_state, turn_protection, failure_kind)
+             SELECT ?1,
+                    (SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE agent_id = ?1),
+                    ?2, 'queued', ?3, ?4, ?5, ?6, ?7, 'none'
+              WHERE EXISTS (SELECT 1 FROM agents WHERE agent_id = ?1 AND retired = 0)
+                AND NOT EXISTS (SELECT 1 FROM turns
+                                WHERE agent_id = ?1 AND state IN ('queued', 'running'))
+             RETURNING seq";
+
 impl Ledger {
     pub async fn admission_report(&self, limits: &Limits) -> Result<AdmissionReport, FlatError> {
         self.admission_report_at(limits, crate::time::now_unix())
@@ -264,27 +279,16 @@ impl Ledger {
             .map(serde_json::to_string)
             .transpose()?;
         let turn_protection_json = serde_json::to_string(&turn_protection)?;
-        let row: Option<(i64,)> = sqlx::query_as(
-            "INSERT INTO turns
-                 (agent_id, seq, prompt, state, at_unix, provider, admission_override,
-                  turn_protection_state, turn_protection, failure_kind)
-             SELECT ?1,
-                    (SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE agent_id = ?1),
-                    ?2, 'queued', ?3, ?4, ?5, ?6, ?7, 'none'
-              WHERE EXISTS (SELECT 1 FROM agents WHERE agent_id = ?1 AND retired = 0)
-                AND NOT EXISTS (SELECT 1 FROM turns
-                                WHERE agent_id = ?1 AND state IN ('queued', 'running'))
-             RETURNING seq",
-        )
-        .bind(agent_id)
-        .bind(prompt)
-        .bind(checked_unix)
-        .bind(&provider)
-        .bind(override_json)
-        .bind(turn_protection.state.as_str())
-        .bind(turn_protection_json)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let row: Option<(i64,)> = sqlx::query_as(GUARDED_TURN_INSERT)
+            .bind(agent_id)
+            .bind(prompt)
+            .bind(checked_unix)
+            .bind(&provider)
+            .bind(override_json)
+            .bind(turn_protection.state.as_str())
+            .bind(turn_protection_json)
+            .fetch_optional(&mut *tx)
+            .await?;
         let Some((seq,)) = row else {
             tx.rollback().await?;
             return Ok(AdmissionDecision::Busy {

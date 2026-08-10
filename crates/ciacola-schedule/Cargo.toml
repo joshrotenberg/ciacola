@@ -22,5 +22,6 @@ toml = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
+ciacola-core = { workspace = true, features = ["test-support"] }
 ciacola-agent = { workspace = true }
 toml = { workspace = true }
