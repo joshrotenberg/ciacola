@@ -48,6 +48,7 @@ use ciacola_tuning::TuningPlugin;
 use ciacola_webhook::WebhookPlugin;
 use sqlx::SqlitePool;
 
+mod cli;
 mod config;
 mod operator_auth;
 mod provider_auth;
@@ -223,16 +224,34 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .any(|name| name == "MCP_BEARER");
     let operator_token = operator_auth::take_from_environment(allow_client_bearer)?;
     let provider_credentials = provider_auth::take_from_environment()?;
-    tokio::runtime::Builder::new_multi_thread()
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(run(
+        .build()?;
+    // Any argument other than `serve` selects the one-shot CLI: the same
+    // assembled operator surface, one tool call, exit. Bare `ciacola`
+    // and `ciacola serve` are the server, exactly as before.
+    if argv.len() > 1 && argv[1] != *"serve" {
+        let code = runtime.block_on(cli::run_cli(
+            argv,
             operator_token,
             provider_credentials,
             child_environment,
             config_path,
             declared,
-        ))
+        ))?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
+    runtime.block_on(run(
+        operator_token,
+        provider_credentials,
+        child_environment,
+        config_path,
+        declared,
+    ))
 }
 
 async fn run(
@@ -258,6 +277,32 @@ async fn run(
 /// What `serve` still needs once the server is fully started: the
 /// operator stdio router with its notification stream, and the wiring
 /// the Ctrl-C drain path uses. `build` returns this only after the
+/// Which consumer the assembly is for. One-shot must not publish
+/// loopback endpoint files, apply config-managed definitions, bind
+/// HTTP, run recovery, or open dispatch: it reads and queues against
+/// the shared ledger and leaves execution to a serving process.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Mode {
+    Serve,
+    OneShot,
+}
+
+/// Everything `assemble` produces: the three routers and the handles
+/// the serving tail (or a one-shot caller) needs.
+pub(crate) struct Assembled {
+    pub(crate) stdio_router: McpRouter,
+    agent_router: McpRouter,
+    operator_router: McpRouter,
+    notifications: NotificationReceiver,
+    exec: Arc<dyn TurnExecutor>,
+    drain_exec: Arc<dyn TurnExecutor>,
+    dispatch: DispatchReadiness,
+    ledger: Ledger,
+    host: Arc<PluginHost>,
+    limits: ciacola_core::limits::Limits,
+    port: u16,
+}
+
 /// loopback HTTP server is bound and serving, recovery has reconciled
 /// the ledger, and dispatch is open, so a caller other than `serve`
 /// (a future one-shot CLI) gets a dispatch-ready server without the
@@ -283,6 +328,29 @@ async fn build(
     config_path: Option<String>,
     declared_early: config::Config,
 ) -> Result<Built, Box<dyn std::error::Error + Send + Sync>> {
+    let assembled = assemble(
+        operator_token.as_ref(),
+        provider_credentials,
+        child_environment,
+        config_path,
+        declared_early,
+        Mode::Serve,
+    )
+    .await?;
+    finish_serving(assembled, operator_token).await
+}
+
+/// Configuration through router construction: the shared front of both
+/// the server and the one-shot CLI. No listener exists and dispatch is
+/// closed when this returns.
+pub(crate) async fn assemble(
+    operator_token: Option<&operator_auth::HumanOperatorToken>,
+    provider_credentials: provider_auth::ProviderCredentials,
+    child_environment: ciacola_agent::ProviderChildEnvironment,
+    config_path: Option<String>,
+    declared_early: config::Config,
+    mode: Mode,
+) -> Result<Assembled, Box<dyn std::error::Error + Send + Sync>> {
     // Seeded now so the split into real crates inherits instrumentation
     // rather than needing it retrofitted. Off unless RUST_LOG asks, and
     // to stderr because stdout is the MCP transport.
@@ -392,7 +460,12 @@ async fn build(
     // This describes where the service will be; the closed dispatch boundary
     // below is what prevents a provider from mistaking publication for HTTP
     // readiness.
-    let mcp_config_path = write_loopback_configs(&std::env::temp_dir(), port)?;
+    let mcp_config_path = match mode {
+        Mode::Serve => write_loopback_configs(&std::env::temp_dir(), port)?,
+        // The path itself is inert without execution; writing it from a
+        // one-shot would clobber a running server's published endpoint.
+        Mode::OneShot => std::env::temp_dir().join("ciacola-mcp.json"),
+    };
 
     let (tx, rx) = notification_channel(64);
     let notify = Notifier(tx);
@@ -493,16 +566,18 @@ async fn build(
     // declaration says that belongs to a plugin is handed to that
     // plugin by name, so this no longer needs a handle per plugin it
     // might encounter.
-    for line in config::apply(
-        &declared,
-        &ledger,
-        host.as_ref(),
-        &configured_roles,
-        &mcp_config_path.display().to_string(),
-    )
-    .await?
-    {
-        eprintln!("[ciacola] config: {line}");
+    if mode == Mode::Serve {
+        for line in config::apply(
+            &declared,
+            &ledger,
+            host.as_ref(),
+            &configured_roles,
+            &mcp_config_path.display().to_string(),
+        )
+        .await?
+        {
+            eprintln!("[ciacola] config: {line}");
+        }
     }
 
     let health = Health::new(ledger.clone(), database.path.display().to_string())
@@ -575,6 +650,40 @@ async fn build(
         operator_router = operator_router.resource(resource);
     }
 
+    Ok(Assembled {
+        stdio_router,
+        agent_router,
+        operator_router,
+        notifications: rx,
+        exec,
+        drain_exec,
+        dispatch,
+        ledger,
+        host,
+        limits: declared.limits,
+        port,
+    })
+}
+
+/// The serving tail: transports, the loopback bind, recovery, and
+/// dispatch opening, in the order the readiness contract requires.
+async fn finish_serving(
+    assembled: Assembled,
+    operator_token: Option<operator_auth::HumanOperatorToken>,
+) -> Result<Built, Box<dyn std::error::Error + Send + Sync>> {
+    let Assembled {
+        stdio_router,
+        agent_router,
+        operator_router,
+        notifications: rx,
+        exec,
+        drain_exec,
+        dispatch,
+        ledger,
+        host,
+        limits,
+        port,
+    } = assembled;
     // Shared with the drain below, so the HTTP side and the turn
     // executor wind down on the same signal: a request in flight when
     // the server stops finishes rather than getting cut, and an agent
@@ -608,7 +717,7 @@ async fn build(
         .merge(ciacola_board::router_with_limits(
             ledger.clone(),
             host,
-            declared.limits,
+            limits,
             shutdown.clone(),
         ));
     let listener = bind_loopback_before_dispatch(port, &dispatch).await?;
