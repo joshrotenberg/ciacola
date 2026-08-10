@@ -15,7 +15,7 @@ use ciacola_core::roles::Roles;
 use crate::assignment::{AssignmentState, CleanupReason, PrState};
 use crate::config::{BranchPolicies, DEFAULT_BRANCH_TEMPLATE};
 use crate::db::AssignmentDb;
-use crate::git::{gh, git_output, github_repo};
+use crate::git::{gh, github_repo, rev_parse_verify};
 use crate::journey::{cleanup_plan, publish_assignment, validate_cleanup_resources};
 use crate::repos::Repos;
 use crate::{
@@ -322,12 +322,7 @@ pub(crate) fn tools(plugin: &RepoWorkerPlugin, surface: Surface) -> Vec<Tool> {
                             .await;
                         return Ok(CallToolResult::error(error.to_string()));
                     }
-                    let base_head = match git_output(
-                        &worktree,
-                        &["rev-parse", "--verify", "HEAD^{commit}"],
-                    )
-                    .await
-                    {
+                    let base_head = match rev_parse_verify(&worktree, "HEAD^{commit}").await {
                         Ok(head) => head,
                         Err(e) => {
                             let error = format!("cannot capture assignment base commit: {e}");

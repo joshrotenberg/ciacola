@@ -9,8 +9,9 @@ use git_spawn::{CloneCommand, GitCommand, WorktreeCommand};
 
 use crate::assignment::Assignment;
 use crate::git::{
-    bare_repo, git_output, git_predicate, github_origin_matches, repo_storage_key,
-    stable_publication_url,
+    bare_repo, branch_ref_exists, check_branch_name, current_branch, delete_ref_at, git_output,
+    git_predicate, github_origin_matches, is_ancestor, is_bare_repository, ls_remote_heads,
+    repo_storage_key, rev_list_count, rev_parse_verify, stable_publication_url,
 };
 
 #[derive(Debug, Clone)]
@@ -97,16 +98,14 @@ impl Repos {
                 .await
                 .map_err(|e| -> FlatError { format!("clone {repo}: {e}").into() })?;
         }
-        let is_bare = git_output(&bare, &["rev-parse", "--is-bare-repository"])
-            .await
-            .map_err(|e| -> FlatError {
-                format!(
-                    "existing clone path '{}' is not a usable bare repository: {e}",
-                    bare.display()
-                )
-                .into()
-            })?;
-        if is_bare != "true" {
+        let is_bare = is_bare_repository(&bare).await.map_err(|e| -> FlatError {
+            format!(
+                "existing clone path '{}' is not a usable bare repository: {e}",
+                bare.display()
+            )
+            .into()
+        })?;
+        if !is_bare {
             return Err(format!("existing clone path '{}' is not bare", bare.display()).into());
         }
         let actual_origin = git_output(&bare, &["remote", "get-url", "origin"])
@@ -166,15 +165,13 @@ impl Repos {
         if !path.is_dir() {
             return Err(format!("worktree '{}' is not a directory", path.display()).into());
         }
-        let actual_branch = git_output(path, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-            .await
-            .map_err(|e| -> FlatError {
-                format!(
-                    "cannot validate existing worktree '{}': {e}",
-                    path.display()
-                )
-                .into()
-            })?;
+        let actual_branch = current_branch(path).await.map_err(|e| -> FlatError {
+            format!(
+                "cannot validate existing worktree '{}': {e}",
+                path.display()
+            )
+            .into()
+        })?;
         if actual_branch != branch {
             return Err(format!(
                 "existing worktree '{}' is on branch '{}', expected '{}'",
@@ -283,24 +280,20 @@ impl Repos {
         }
         let push_url = resolved_push_origins[0].to_string();
         stable_publication_url(worktree, &push_url).await?;
-        if !git_predicate(bare, &["check-ref-format", "--branch", base]).await? {
+        if !check_branch_name(bare, base).await? {
             return Err(format!("assignment base '{base}' is not a valid branch name").into());
         }
-        if !git_predicate(bare, &["check-ref-format", "--branch", &assignment.branch]).await? {
+        if !check_branch_name(bare, &assignment.branch).await? {
             return Err(format!(
                 "assignment branch '{}' is not a valid branch name",
                 assignment.branch
             )
             .into());
         }
-        let head = git_output(worktree, &["rev-parse", "--verify", "HEAD^{commit}"]).await?;
-        let branch_head = git_output(
+        let head = rev_parse_verify(worktree, "HEAD^{commit}").await?;
+        let branch_head = rev_parse_verify(
             worktree,
-            &[
-                "rev-parse",
-                "--verify",
-                &format!("refs/heads/{}^{{commit}}", assignment.branch),
-            ],
+            &format!("refs/heads/{}^{{commit}}", assignment.branch),
         )
         .await?;
         if branch_head != head {
@@ -310,29 +303,20 @@ impl Repos {
             )
             .into());
         }
-        let canonical_base = git_output(
-            worktree,
-            &["rev-parse", "--verify", &format!("{base_head}^{{commit}}")],
-        )
-        .await?;
+        let canonical_base = rev_parse_verify(worktree, &format!("{base_head}^{{commit}}")).await?;
         if canonical_base != base_head {
             return Err(format!(
                 "durable base head '{base_head}' is not a full canonical commit OID"
             )
             .into());
         }
-        if !git_predicate(worktree, &["merge-base", "--is-ancestor", base_head, &head]).await? {
+        if !is_ancestor(worktree, base_head, &head).await? {
             return Err(format!(
                 "assigned branch head {head} is not descended from durable base {base_head}"
             )
             .into());
         }
-        let commits_ahead = git_output(
-            worktree,
-            &["rev-list", "--count", &format!("{base_head}..{head}")],
-        )
-        .await?
-        .parse::<u64>()?;
+        let commits_ahead = rev_list_count(worktree, &format!("{base_head}..{head}")).await?;
         let has_material_delta =
             !git_predicate(worktree, &["diff", "--quiet", base_head, &head, "--"]).await?;
         Ok(WorktreeSnapshot {
@@ -349,29 +333,16 @@ impl Repos {
         assignment: &Assignment,
         push_url: &str,
     ) -> Result<Option<String>, FlatError> {
-        let output = git_output(
+        let mut entries = ls_remote_heads(
             Path::new(&assignment.worktree),
-            &[
-                "ls-remote",
-                "--heads",
-                push_url,
-                &format!("refs/heads/{}", assignment.branch),
-            ],
+            push_url,
+            &format!("refs/heads/{}", assignment.branch),
         )
         .await?;
-        if output.is_empty() {
-            return Ok(None);
-        }
-        let mut lines = output.lines();
-        let head = lines
-            .next()
-            .and_then(|line| line.split_whitespace().next())
-            .ok_or("remote branch query returned malformed output")?
-            .to_string();
-        if lines.next().is_some() {
+        if entries.len() > 1 {
             return Err("remote branch query returned more than one exact ref".into());
         }
-        Ok(Some(head))
+        Ok(entries.pop().map(|entry| entry.sha))
     }
 
     pub(crate) async fn local_branch_head(
@@ -383,15 +354,11 @@ impl Repos {
             return Ok(None);
         }
         let reference = format!("refs/heads/{}", assignment.branch);
-        if !git_predicate(bare, &["show-ref", "--verify", "--quiet", &reference]).await? {
+        if !branch_ref_exists(bare, &reference).await? {
             return Ok(None);
         }
         Ok(Some(
-            git_output(
-                bare,
-                &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
-            )
-            .await?,
+            rev_parse_verify(bare, &format!("{reference}^{{commit}}")).await?,
         ))
     }
 
@@ -512,52 +479,26 @@ impl Repos {
                 .await
                 .map_err(|e| -> FlatError { format!("worktree remove: {e}").into() })?;
         }
-        let exists = tokio::process::Command::new("git")
-            .args([
-                "show-ref",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ])
-            .current_dir(bare)
-            .kill_on_drop(true)
-            .status()
-            .await?;
-        if exists.success() {
+        let reference = format!("refs/heads/{branch}");
+        let exists = branch_ref_exists(bare, &reference)
+            .await
+            .map_err(|_| -> FlatError {
+                format!("cannot inspect branch '{branch}' in '{}'", bare.display()).into()
+            })?;
+        if exists {
             let expected_head = expected_head.ok_or_else(|| -> FlatError {
                 format!("refusing to delete local branch '{branch}' without an expected commit")
                     .into()
             })?;
-            git_output(
-                bare,
-                &[
-                    "update-ref",
-                    "--no-deref",
-                    "-d",
-                    &format!("refs/heads/{branch}"),
-                    expected_head,
-                ],
-            )
-            .await
-            .map_err(|e| -> FlatError { format!("branch delete {branch}: {e}").into() })?;
-            if git_predicate(
-                bare,
-                &[
-                    "show-ref",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/heads/{branch}"),
-                ],
-            )
-            .await?
-            {
+            delete_ref_at(bare, &reference, expected_head)
+                .await
+                .map_err(|e| -> FlatError { format!("branch delete {branch}: {e}").into() })?;
+            if branch_ref_exists(bare, &reference).await? {
                 return Err(format!(
                     "local branch '{branch}' moved before compare-and-swap deletion"
                 )
                 .into());
             }
-        } else if exists.code() != Some(1) {
-            return Err(format!("cannot inspect branch '{branch}' in '{}'", bare.display()).into());
         }
         Ok(())
     }
