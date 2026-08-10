@@ -459,7 +459,7 @@ pub fn compose_system_prompt(def: &AgentDef) -> String {
 /// Pure in the sense that matters: it mutates nothing of ours. Every
 /// caller decides for itself where the outcome is recorded, which is
 /// what lets the same function serve the in-memory `prompt`, the
-/// hand-rolled executor, and the apalis-driven one.
+/// channel-driven executor, and the polling one.
 #[tracing::instrument(
     skip_all,
     fields(

@@ -8,8 +8,9 @@
 //!
 //! - [`HandExecutor`] (here): a channel, a semaphore, a cancellation
 //!   token per turn.
-//! - `ciacola_apalis::ApalisExecutor`: push `{agent_id, seq}` to a
-//!   queue and let a worker drive the same functions.
+//! - [`PollingExecutor`](crate::PollingExecutor): poll the ledger for
+//!   the queued rows that are already durable and drive the same
+//!   functions.
 //!
 //! `claim_turn` is what makes both safe: whoever delivers the work, and
 //! however many times, the exchange runs at most once. Only the delivery
