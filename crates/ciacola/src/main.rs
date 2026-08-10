@@ -435,11 +435,9 @@ async fn run(
         ledger: ledger.clone(),
         exec: exec.clone(),
         notify: notify.clone(),
-        db_path: database.path.display().to_string(),
         loopback_mcp_config: mcp_config_path.display().to_string(),
         // Provider-backed operator roles are disabled. Supplying the ordinary
         // path here keeps any compatibility caller on the weaker mount.
-        operator_mcp_config: mcp_config_path.display().to_string(),
         plugin_config: declared.plugins.clone(),
         limits: declared.limits.clone(),
         runtime: declared.runtime.clone(),
