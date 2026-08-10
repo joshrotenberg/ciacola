@@ -33,10 +33,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::{
-    collections::{BTreeMap, HashSet},
-    fmt,
-};
+use std::{collections::HashSet, fmt};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -45,7 +42,7 @@ use sqlx::{Row, SqlitePool};
 use tower_mcp::extract::{Context, Json, State};
 use tower_mcp::{CallToolResult, Tool, ToolBuilder};
 
-use git_spawn::{CloneCommand, GitCommand, Repository, WorktreeCommand};
+use git_spawn::{CloneCommand, GitCommand, WorktreeCommand};
 
 use ciacola_core::agent::FlatError;
 use ciacola_core::delegation::{DelegatableAction, DelegationPolicy};
@@ -53,7 +50,19 @@ use ciacola_core::ledger::Ledger;
 use ciacola_core::plugin::{BoxFut, Migration, Plugin, PluginContext, Section, Surface};
 use ciacola_core::roles::{Role, Roles};
 
+mod assignment;
+mod config;
+mod git;
 mod migrations;
+use assignment::{
+    Assignment, AssignmentState, CleanupReason, CleanupState, LegacyAssignment, PrState,
+    PublicationState, assignment_slug, sqlite_u64,
+};
+use config::{BranchPolicies, BranchTemplate, DEFAULT_BRANCH_TEMPLATE, RepoWorkerConfig, expand};
+use git::{
+    bare_repo, gh, git_output, git_predicate, github_origin_matches, github_repo, repo_storage_key,
+    stable_publication_url, validate_branch_name, worktree_is_clean,
+};
 use migrations::{ASSIGNMENTS_TABLE, MIGRATIONS};
 
 const ROLE: &str = "issue-implementer";
@@ -62,85 +71,6 @@ const START_ISSUE_ROLE_ARGUMENTS: [&str; 3] = ["repo", "issue", "worktree"];
 /// notices what the implementer prompt got wrong, and that only turns
 /// into a better prompt if it is somebody's stated job.
 const MANAGER: &str = "repo-manager";
-const DEFAULT_BRANCH_TEMPLATE: &str = "agent/{slug}";
-
-#[derive(Clone, PartialEq, Eq)]
-struct BranchTemplate(String);
-
-impl fmt::Debug for BranchTemplate {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("BranchTemplate").field(&self.0).finish()
-    }
-}
-
-impl BranchTemplate {
-    fn parse(value: String) -> Result<Self, String> {
-        if value.matches("{slug}").count() != 1 {
-            return Err(format!(
-                "branch template '{value}' must contain exactly one '{{slug}}' placeholder"
-            ));
-        }
-        let remainder = value.replace("{slug}", "");
-        if remainder.contains(['{', '}']) {
-            return Err(format!(
-                "branch template '{value}' contains an unsupported placeholder; only '{{slug}}' is allowed"
-            ));
-        }
-        Ok(Self(value))
-    }
-
-    fn render(&self, slug: &str) -> String {
-        self.0.replace("{slug}", slug)
-    }
-
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone)]
-struct BranchPolicies {
-    default: BranchTemplate,
-    configured: BTreeMap<String, BranchTemplate>,
-}
-
-impl Default for BranchPolicies {
-    fn default() -> Self {
-        Self {
-            default: BranchTemplate(DEFAULT_BRANCH_TEMPLATE.to_string()),
-            configured: BTreeMap::new(),
-        }
-    }
-}
-
-impl BranchPolicies {
-    fn new(allowed: &[String], configured: BTreeMap<String, String>) -> Result<Self, String> {
-        let mut parsed = BTreeMap::new();
-        for (repo, template) in configured {
-            if !allowed.iter().any(|allowed| allowed == &repo) {
-                return Err(format!(
-                    "branch template repository '{repo}' is not present in plugins.repo-worker.repos"
-                ));
-            }
-            parsed.insert(repo, BranchTemplate::parse(template)?);
-        }
-        Ok(Self {
-            default: BranchTemplate(DEFAULT_BRANCH_TEMPLATE.to_string()),
-            configured: parsed,
-        })
-    }
-
-    fn for_repo(&self, repo: &str) -> &BranchTemplate {
-        self.configured.get(repo).unwrap_or(&self.default)
-    }
-
-    fn configured_state(&self) -> BTreeMap<&str, &str> {
-        self.configured
-            .iter()
-            .map(|(repo, template)| (repo.as_str(), template.as_str()))
-            .collect()
-    }
-}
 
 /// `start_issue` owns this role's argument map. Configured overrides may
 /// change the prompt and provisioning, but cannot require values the tool has
@@ -189,77 +119,6 @@ fn validate_start_issue_role_arguments(role: &Role) -> Result<(), String> {
     ))
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RepoWorkerConfig {
-    /// Where clones and worktrees live. `~` is expanded.
-    root: Option<String>,
-    /// Repositories that may be worked on, `owner/name`. An empty list
-    /// means none: this plugin does not get to pick.
-    #[serde(default)]
-    repos: Vec<String>,
-    /// Per-repository branch templates. The only placeholder is `{slug}`,
-    /// which is required exactly once so every assignment remains unique.
-    #[serde(default)]
-    branch_templates: BTreeMap<String, String>,
-}
-
-fn expand(path: &str) -> PathBuf {
-    match path.strip_prefix("~/") {
-        Some(rest) => match std::env::var("HOME") {
-            Ok(home) => PathBuf::from(home).join(rest),
-            Err(_) => PathBuf::from(path),
-        },
-        None => PathBuf::from(path),
-    }
-}
-
-/// git-spawn, dogfooded, in place of hand-rolled `Command` calls.
-///
-/// One gap found immediately by using it: `Repository::open` requires a
-/// `.git` entry, so it rejects a bare repository, which is exactly what
-/// this plugin keeps. `new_unchecked` is the way through and is
-/// documented for a different purpose (about to init or clone). Filed
-/// upstream as joshrotenberg/git-spawn#157.
-fn bare_repo(path: &Path) -> Repository {
-    Repository::new_unchecked(path)
-}
-
-fn repo_storage_key(repo: &str) -> String {
-    // Stable FNV-1a keeps the directory compact and collision-resistant while
-    // the readable prefix remains useful to an operator looking at the root.
-    // The hash is part of the on-disk contract; do not replace it with
-    // `DefaultHasher`, whose output is not stable across implementations.
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in repo.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let readable: String = repo
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .take(64)
-        .collect();
-    format!("{readable}-{hash:016x}")
-}
-
-fn github_origin_matches(repo: &str, origin: &str) -> bool {
-    let repo = repo.to_ascii_lowercase();
-    let origin = origin.to_ascii_lowercase();
-    // A transport URL normally has one optional `.git` suffix. The configured
-    // GitHub repository name is data, though, and may itself end in `.git`.
-    let origin = origin.strip_suffix(".git").unwrap_or(&origin);
-    origin == format!("https://github.com/{repo}")
-        || origin == format!("git@github.com:{repo}")
-        || origin == format!("ssh://git@github.com/{repo}")
-}
-
 /// Is this a conventional-commit title: `type(scope)!: subject`?
 ///
 /// Enforced mechanically in `open_pr` rather than only asked for in the
@@ -289,139 +148,6 @@ fn conventional_title(title: &str) -> bool {
         None => prefix,
     };
     TYPES.contains(&ty)
-}
-
-async fn gh(binary: &Path, dir: Option<&Path>, args: &[&str]) -> Result<String, FlatError> {
-    let mut command = tokio::process::Command::new(binary);
-    command.args(args).kill_on_drop(true);
-    if let Some(dir) = dir {
-        command.current_dir(dir);
-    }
-    let out = command.output().await?;
-    if !out.status.success() {
-        return Err(format!(
-            "gh {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )
-        .into());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-fn github_repo(repo: &str) -> String {
-    format!("github.com/{repo}")
-}
-
-async fn git_output(dir: &Path, args: &[&str]) -> Result<String, FlatError> {
-    let out = tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .kill_on_drop(true)
-        .output()
-        .await?;
-    if !out.status.success() {
-        return Err(format!(
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )
-        .into());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-async fn git_predicate(dir: &Path, args: &[&str]) -> Result<bool, FlatError> {
-    let out = tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .kill_on_drop(true)
-        .output()
-        .await?;
-    match out.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err(format!(
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )
-        .into()),
-    }
-}
-
-async fn validate_branch_name(branch: &str) -> Result<(), FlatError> {
-    let output = tokio::process::Command::new("git")
-        .args(["check-ref-format", "--branch", branch])
-        .kill_on_drop(true)
-        .output()
-        .await?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(format!(
-        "branch template rendered invalid Git branch '{branch}': {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    )
-    .into())
-}
-
-async fn worktree_is_clean(dir: &Path) -> Result<bool, FlatError> {
-    let out = tokio::process::Command::new("git")
-        .args([
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-        ])
-        .current_dir(dir)
-        .kill_on_drop(true)
-        .output()
-        .await?;
-    if !out.status.success() {
-        return Err(format!(
-            "git status: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )
-        .into());
-    }
-    Ok(out.stdout.is_empty())
-}
-
-async fn stable_publication_url(dir: &Path, url: &str) -> Result<(), FlatError> {
-    let probe = format!(
-        "ciacola-publication-{}",
-        ulid::Ulid::new().to_string().to_ascii_lowercase()
-    );
-    let config = format!("remote.{probe}.url={url}");
-    // `remote get-url <name>` ignores remotes supplied only through `-c`, but
-    // `remote -v` includes and fully expands them in both fetch and push
-    // contexts. This second resolution catches chained insteadOf /
-    // pushInsteadOf rules before the snapshotted URL reaches `git push`.
-    let remotes = git_output(dir, &["-c", &config, "remote", "-v"]).await?;
-    let prefix = format!("{probe}\t");
-    let mut fetch = Vec::new();
-    let mut push = Vec::new();
-    for line in remotes.lines() {
-        let Some(value) = line.strip_prefix(&prefix) else {
-            continue;
-        };
-        if let Some(value) = value.strip_suffix(" (fetch)") {
-            fetch.push(value);
-        } else if let Some(value) = value.strip_suffix(" (push)") {
-            push.push(value);
-        }
-    }
-    if fetch.as_slice() != [url] || push.as_slice() != [url] {
-        return Err(format!(
-            "publication URL '{url}' is rewritten to fetch '{}' / push '{}'; refusing an unstable remote target",
-            fetch.join(", "),
-            push.join(", "),
-        )
-        .into());
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1312,332 +1038,6 @@ pub struct RepoWorkerPlugin {
     repos: Option<Repos>,
     ctx: Option<PluginContext>,
     branch_policies: BranchPolicies,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum AssignmentState {
-    Preparing,
-    Active,
-    Finishing,
-    Retained,
-    Completed,
-    Stale,
-}
-
-impl AssignmentState {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Preparing => "preparing",
-            Self::Active => "active",
-            Self::Finishing => "finishing",
-            Self::Retained => "retained",
-            Self::Completed => "completed",
-            Self::Stale => "stale",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, FlatError> {
-        match value {
-            "preparing" => Ok(Self::Preparing),
-            "active" => Ok(Self::Active),
-            "finishing" => Ok(Self::Finishing),
-            "retained" => Ok(Self::Retained),
-            "completed" => Ok(Self::Completed),
-            "stale" => Ok(Self::Stale),
-            _ => Err(format!("invalid repo-worker assignment state '{value}'").into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PublicationState {
-    Unpublished,
-    Publishing,
-    Published,
-    Failed,
-}
-
-impl PublicationState {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unpublished => "unpublished",
-            Self::Publishing => "publishing",
-            Self::Published => "published",
-            Self::Failed => "failed",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, FlatError> {
-        match value {
-            "unpublished" => Ok(Self::Unpublished),
-            "publishing" => Ok(Self::Publishing),
-            "published" => Ok(Self::Published),
-            "failed" => Ok(Self::Failed),
-            _ => Err(format!("invalid repo-worker publication state '{value}'").into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PrState {
-    Open,
-    Closed,
-    Merged,
-}
-
-impl PrState {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Open => "open",
-            Self::Closed => "closed",
-            Self::Merged => "merged",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, FlatError> {
-        match value {
-            "open" => Ok(Self::Open),
-            "closed" => Ok(Self::Closed),
-            "merged" => Ok(Self::Merged),
-            _ => Err(format!("invalid repo-worker pull-request state '{value}'").into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum CleanupState {
-    None,
-    Retaining,
-    Retained,
-    Removing,
-    Completed,
-    Failed,
-}
-
-impl CleanupState {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Retaining => "retaining",
-            Self::Retained => "retained",
-            Self::Removing => "removing",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, FlatError> {
-        match value {
-            "none" => Ok(Self::None),
-            "retaining" => Ok(Self::Retaining),
-            "retained" => Ok(Self::Retained),
-            "removing" => Ok(Self::Removing),
-            "completed" => Ok(Self::Completed),
-            "failed" => Ok(Self::Failed),
-            _ => Err(format!("invalid repo-worker cleanup state '{value}'").into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum CleanupReason {
-    Absent,
-    NoChanges,
-    Merged,
-    Discarded,
-}
-
-impl CleanupReason {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Absent => "absent",
-            Self::NoChanges => "no_changes",
-            Self::Merged => "merged",
-            Self::Discarded => "discarded",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, FlatError> {
-        match value {
-            "absent" => Ok(Self::Absent),
-            "no_changes" => Ok(Self::NoChanges),
-            "merged" => Ok(Self::Merged),
-            "discarded" => Ok(Self::Discarded),
-            _ => Err(format!("invalid repo-worker cleanup reason '{value}'").into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Assignment {
-    assignment_id: String,
-    repo: String,
-    issue: u64,
-    state: AssignmentState,
-    phase: String,
-    base: Option<String>,
-    base_head: Option<String>,
-    slug: String,
-    branch: String,
-    branch_policy: String,
-    worktree: String,
-    bare_path: String,
-    agent_id: Option<String>,
-    related_agent_ids: Vec<String>,
-    spawned_by: Option<String>,
-    expected_head: Option<String>,
-    pushed_head: Option<String>,
-    publication_state: PublicationState,
-    pr: Option<u64>,
-    pr_url: Option<String>,
-    pr_state: Option<PrState>,
-    pr_draft: Option<bool>,
-    pr_head: Option<String>,
-    pr_base: Option<String>,
-    pr_checked_unix: Option<i64>,
-    cleanup_state: CleanupState,
-    cleanup_head: Option<String>,
-    cleanup_reason: Option<CleanupReason>,
-    last_error: Option<String>,
-    created_unix: i64,
-    updated_unix: i64,
-    terminal_unix: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyAssignment {
-    repo: String,
-    issue: u64,
-    slug: String,
-    branch: String,
-    worktree: String,
-    pr: Option<u64>,
-}
-
-impl Assignment {
-    fn from_row(row: sqlx::sqlite::SqliteRow) -> Result<Self, FlatError> {
-        let issue: i64 = row.try_get("issue_number")?;
-        let pr: Option<i64> = row.try_get("pr")?;
-        let related: String = row.try_get("related_agent_ids")?;
-        Ok(Self {
-            assignment_id: row.try_get("assignment_id")?,
-            repo: row.try_get("repo")?,
-            issue: u64::try_from(issue).map_err(|_| "negative issue number in assignment")?,
-            state: AssignmentState::parse(row.try_get("state")?)?,
-            phase: row.try_get("phase")?,
-            base: row.try_get("base")?,
-            base_head: row.try_get("base_head")?,
-            slug: row.try_get("slug")?,
-            branch: row.try_get("branch")?,
-            branch_policy: row.try_get("branch_policy")?,
-            worktree: row.try_get("worktree")?,
-            bare_path: row.try_get("bare_path")?,
-            agent_id: row.try_get("agent_id")?,
-            related_agent_ids: serde_json::from_str(&related)?,
-            spawned_by: row.try_get("spawned_by")?,
-            expected_head: row.try_get("expected_head")?,
-            pushed_head: row.try_get("pushed_head")?,
-            publication_state: PublicationState::parse(row.try_get("publication_state")?)?,
-            pr: pr.map(u64::try_from).transpose()?,
-            pr_url: row.try_get("pr_url")?,
-            pr_state: row
-                .try_get::<Option<&str>, _>("pr_state")?
-                .map(PrState::parse)
-                .transpose()?,
-            pr_draft: row
-                .try_get::<Option<i64>, _>("pr_draft")?
-                .map(|value| value != 0),
-            pr_head: row.try_get("pr_head")?,
-            pr_base: row.try_get("pr_base")?,
-            pr_checked_unix: row.try_get("pr_checked_unix")?,
-            cleanup_state: CleanupState::parse(row.try_get("cleanup_state")?)?,
-            cleanup_head: row.try_get("cleanup_head")?,
-            cleanup_reason: row
-                .try_get::<Option<&str>, _>("cleanup_reason")?
-                .map(CleanupReason::parse)
-                .transpose()?,
-            last_error: row.try_get("last_error")?,
-            created_unix: row.try_get("created_unix")?,
-            updated_unix: row.try_get("updated_unix")?,
-            terminal_unix: row.try_get("terminal_unix")?,
-        })
-    }
-
-    fn response(&self, created: bool) -> serde_json::Value {
-        json!({
-            "assignment_id": self.assignment_id,
-            "agent_id": self.agent_id,
-            "repo": self.repo,
-            "issue": self.issue,
-            "state": self.state.as_str(),
-            "created": created,
-            "base": self.base,
-            "base_head": self.base_head,
-            "branch": self.branch,
-            "branch_policy": self.branch_policy,
-            "worktree": self.worktree,
-            "expected_head": self.expected_head,
-            "pushed_head": self.pushed_head,
-            "publication_state": self.publication_state.as_str(),
-            "pr": self.pr,
-            "url": self.pr_url,
-            "pr_state": self.pr_state.map(PrState::as_str),
-            "pr_draft": self.pr_draft,
-            "pr_head": self.pr_head,
-            "pr_base": self.pr_base,
-            "pr_checked_unix": self.pr_checked_unix,
-            "cleanup_state": self.cleanup_state.as_str(),
-            "cleanup_head": self.cleanup_head,
-            "cleanup_reason": self.cleanup_reason.map(CleanupReason::as_str),
-        })
-    }
-
-    fn conflict(&self, requested_base: Option<&str>) -> String {
-        if self.state == AssignmentState::Active
-            && requested_base.is_some()
-            && requested_base != self.base.as_deref()
-        {
-            return format!(
-                "assignment '{}' already uses base '{}', not requested base '{}'",
-                self.assignment_id,
-                self.base.as_deref().unwrap_or("<unknown>"),
-                requested_base.unwrap_or_default()
-            );
-        }
-        format!(
-            "assignment '{}' for {}#{} is {}; phase '{}'; {}",
-            self.assignment_id,
-            self.repo,
-            self.issue,
-            self.state.as_str(),
-            self.phase,
-            self.last_error.as_deref().unwrap_or("no additional detail")
-        )
-    }
-}
-
-fn assignment_slug(repo: &str, issue: u64, assignment_id: &str) -> String {
-    let readable: String = repo
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    format!("{readable}-{issue}-{}", assignment_id.to_ascii_lowercase())
-}
-
-fn sqlite_u64(value: u64, label: &str) -> Result<i64, FlatError> {
-    i64::try_from(value)
-        .map_err(|_| format!("{label} {value} exceeds SQLite's integer range").into())
 }
 
 #[derive(Clone)]
@@ -4651,6 +4051,8 @@ impl Plugin for RepoWorkerPlugin {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use tower_mcp::context::{Extensions, RequestContext};
     use tower_mcp::protocol::RequestId;
