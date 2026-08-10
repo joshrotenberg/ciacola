@@ -1340,6 +1340,9 @@ impl Ledger {
     // execution paths should prefer `fail_exchange`, which preserves the
     // provider's typed accounting states. A positive scalar is banked but
     // remains incomplete because this API cannot prove terminal provenance.
+    /// Test-support compatibility path with no production callers;
+    /// slated for removal before any crates.io publication.
+    #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub async fn fail_turn(
         &self,
