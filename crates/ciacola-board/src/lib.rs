@@ -903,6 +903,7 @@ async fn agent_page(State(state): State<BoardState>, Path(agent_id): Path<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ciacola_core::{BoxFut, FlatError, Plugin, plugin::Section};
     use tokio_stream::StreamExt;
 
     fn admission_report(providers: Vec<ProviderAdmissionStatus>) -> AdmissionReport {
@@ -949,6 +950,10 @@ mod tests {
     }
 
     async fn state() -> BoardState {
+        state_with_plugins(Vec::new()).await
+    }
+
+    async fn state_with_plugins(plugins: Vec<Box<dyn Plugin>>) -> BoardState {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:")
             .await
             .expect("pool");
@@ -967,7 +972,7 @@ mod tests {
             runtime: Default::default(),
             roles: ciacola_core::roles::Roles::new(Vec::new(), String::new()),
         };
-        let host = Arc::new(PluginHost::setup(vec![], &ctx).await.expect("host"));
+        let host = Arc::new(PluginHost::setup(plugins, &ctx).await.expect("host"));
         BoardState {
             ledger,
             host,
@@ -977,6 +982,10 @@ mod tests {
     }
 
     async fn role_agent(state: &BoardState) -> String {
+        named_role_agent(state, "impl-owner-repo-74", None).await
+    }
+
+    async fn named_role_agent(state: &BoardState, name: &str, spawned_by: Option<&str>) -> String {
         let role: ciacola_core::roles::Role = serde_json::from_value(serde_json::json!({
             "name": "issue-implementer",
             "description": "implements one issue",
@@ -988,8 +997,12 @@ mod tests {
             roles.get("issue-implementer").expect("catalog role"),
             &std::collections::HashMap::new(),
         );
-        def.name = "impl-owner-repo-74".into();
-        state.ledger.create_agent(&def, None).await.expect("agent")
+        def.name = name.into();
+        state
+            .ledger
+            .create_agent(&def, spawned_by)
+            .await
+            .expect("agent")
     }
 
     fn turn(cost_state: &str, usage_state: &str) -> TurnRow {
@@ -1389,5 +1402,168 @@ mod tests {
         })
         .await
         .expect("stream did not end after shutdown was cancelled");
+    }
+
+    /// Every operator-supplied string reaches the page through `esc`,
+    /// so a hostile name, role, or prompt renders as text, not markup.
+    #[tokio::test]
+    async fn hostile_agent_strings_render_inert_on_overview_and_agent_page() {
+        let state = state().await;
+        let payload = "<script>alert(1)</script>";
+        let role: ciacola_core::roles::Role = serde_json::from_value(serde_json::json!({
+            "name": format!("qa {payload} \"role\" & def"),
+            "description": "hostile strings must render as text",
+            "system_prompt": format!("obey {payload} & \"quotes\""),
+        }))
+        .expect("role");
+        let role_name = role.name.clone();
+        let roles = ciacola_core::roles::Roles::new(vec![role], "agent.json");
+        let mut def = roles.to_def(
+            roles.get(&role_name).expect("catalog role"),
+            &std::collections::HashMap::new(),
+        );
+        def.name = format!("name {payload} & \"quoted\"");
+        let agent_id = state.ledger.create_agent(&def, None).await.expect("agent");
+        state
+            .ledger
+            .enqueue_turn(&agent_id, &format!("run {payload} now"))
+            .await
+            .expect("queue turn");
+
+        let overview = overview_body(&state).await;
+        assert!(!overview.contains("<script>alert"), "{overview}");
+        assert!(
+            overview.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{overview}"
+        );
+        assert!(
+            overview.contains("&quot;role&quot; &amp; def"),
+            "{overview}"
+        );
+
+        let detail = agent_page(State(state), Path(agent_id)).await.0;
+        assert!(!detail.contains("<script>alert"), "{detail}");
+        assert!(
+            detail.contains("name &lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;quoted&quot;"),
+            "{detail}"
+        );
+        assert!(detail.contains("&quot;role&quot; &amp; def"), "{detail}");
+        assert!(
+            detail.contains("run &lt;script&gt;alert(1)&lt;/script&gt; now"),
+            "{detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawned_agents_show_their_parent_on_overview_and_agent_page() {
+        let state = state().await;
+        let parent_id = role_agent(&state).await;
+        let child_id = named_role_agent(&state, "impl-child", Some(&parent_id)).await;
+
+        let parent_short = &parent_id[parent_id.len() - 6..];
+        let overview = overview_body(&state).await;
+        assert!(
+            overview.contains(&format!(
+                "<td data-label=\"parent\" class=\"dim mono\">{parent_short}</td>"
+            )),
+            "{overview}"
+        );
+        assert!(
+            overview.contains("<td data-label=\"parent\" class=\"dim mono\">root</td>"),
+            "{overview}"
+        );
+
+        let detail = agent_page(State(state), Path(child_id)).await.0;
+        assert!(detail.contains("spawned by"), "{detail}");
+        assert!(
+            detail.contains(&format!("href=\"/board/agent/{parent_id}\"")),
+            "{detail}"
+        );
+    }
+
+    struct MarkerPlugin;
+
+    impl Plugin for MarkerPlugin {
+        fn name(&self) -> &'static str {
+            "marker"
+        }
+
+        fn setup<'a>(
+            &'a mut self,
+            _ctx: &'a ciacola_core::PluginContext,
+        ) -> BoxFut<'a, Result<(), FlatError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn board_section(&self) -> BoxFut<'_, Option<Section>> {
+            Box::pin(async {
+                Some(Section {
+                    title: "journeys & <detours>".into(),
+                    html: "<div id=\"marker-section\"><b>verbatim</b> plugin body</div>".into(),
+                })
+            })
+        }
+    }
+
+    /// A plugin's section title is operator-facing text and gets
+    /// escaped; its html is the plugin's own rendering and passes
+    /// through untouched inside the shared panel shell.
+    #[tokio::test]
+    async fn plugin_sections_get_the_panel_shell_with_title_escaped_and_html_verbatim() {
+        let state = state_with_plugins(vec![Box::new(MarkerPlugin)]).await;
+        let overview = overview_body(&state).await;
+        assert!(
+            overview.contains(
+                "<section class=\"panel\"><h2>journeys &amp; &lt;detours&gt;</h2>\
+                 <div class=\"section-body\"><div id=\"marker-section\"><b>verbatim</b> \
+                 plugin body</div></div></section>"
+            ),
+            "{overview}"
+        );
+    }
+
+    /// One HTTP/1.1 GET over an ephemeral loopback port. The crate has
+    /// no `tower` dev-dependency for `ServiceExt::oneshot`, so the
+    /// router is exercised through `axum::serve` the way the binary
+    /// mounts it, which also covers routing and status codes.
+    async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("send request");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.expect("read response");
+        String::from_utf8(raw).expect("utf-8 response")
+    }
+
+    #[tokio::test]
+    async fn http_router_serves_the_overview_and_agent_pages() {
+        let state = state().await;
+        let agent_id = role_agent(&state).await;
+        let app = router(state.ledger.clone(), state.host.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let overview = http_get(addr, "/board").await;
+        assert!(overview.starts_with("HTTP/1.1 200 OK\r\n"), "{overview}");
+        assert!(overview.contains("local agent supervision"), "{overview}");
+        assert!(overview.contains("impl-owner-repo-74"), "{overview}");
+
+        let detail = http_get(addr, &format!("/board/agent/{agent_id}")).await;
+        assert!(detail.starts_with("HTTP/1.1 200 OK\r\n"), "{detail}");
+        assert!(detail.contains("impl-owner-repo-74"), "{detail}");
+        assert!(detail.contains("issue-implementer"), "{detail}");
+
+        server.abort();
     }
 }

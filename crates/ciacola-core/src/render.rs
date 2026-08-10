@@ -188,6 +188,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn esc_neutralizes_angle_brackets_quotes_and_ampersands() {
+        assert_eq!(esc("<script>"), "&lt;script&gt;");
+        assert_eq!(esc("a \"quoted\" attr"), "a &quot;quoted&quot; attr");
+        assert_eq!(esc("fish & chips"), "fish &amp; chips");
+        assert_eq!(
+            esc("<a href=\"x\">&</a>"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;&lt;/a&gt;"
+        );
+    }
+
+    /// The ampersand is replaced first, so text that already looks like
+    /// an entity stays literal text instead of decoding into markup.
+    #[test]
+    fn esc_keeps_entity_shaped_input_literal() {
+        assert_eq!(esc("&lt;"), "&amp;lt;");
+        assert_eq!(esc("&amp;"), "&amp;amp;");
+    }
+
+    #[test]
     fn live_page_waits_for_the_body_and_declares_a_mobile_viewport() {
         let html = page_with("board", "<h1>board</h1>", true).0;
 
