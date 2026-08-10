@@ -13,7 +13,7 @@ use crate::assignment::{
     Assignment, AssignmentState, CleanupReason, CleanupState, PrState, PublicationState,
 };
 use crate::db::AssignmentDb;
-use crate::git::{gh, git_output, git_predicate, github_repo, worktree_is_clean};
+use crate::git::{gh, github_repo, is_ancestor, rev_parse_verify, worktree_is_clean};
 use crate::repos::{Repos, WorktreeSnapshot};
 
 /// Is this a conventional-commit title: `type(scope)!: subject`?
@@ -295,7 +295,7 @@ pub(crate) async fn validate_cleanup_resources(
                 "assigned worktree is dirty; retain it or commit/clean it before cleanup".into(),
             );
         }
-        let current = git_output(worktree, &["rev-parse", "--verify", "HEAD^{commit}"]).await?;
+        let current = rev_parse_verify(worktree, "HEAD^{commit}").await?;
         if plan.head.as_deref() != Some(current.as_str()) {
             return Err(format!(
                 "assigned worktree moved to {current} after cleanup was authorized at {}",
@@ -358,7 +358,7 @@ pub(crate) async fn cleanup_plan(
                 "assigned worktree is dirty; retain it or commit/clean it before cleanup".into(),
             );
         }
-        let head = git_output(worktree, &["rev-parse", "--verify", "HEAD^{commit}"]).await?;
+        let head = rev_parse_verify(worktree, "HEAD^{commit}").await?;
         if let Some(branch_head) = branch_head.as_deref()
             && branch_head != head
         {
@@ -376,15 +376,11 @@ pub(crate) async fn cleanup_plan(
         CleanupReason::NoChanges
     } else if let Some(discard) = discard_head {
         let canonical = if worktree.exists() {
-            git_output(
-                worktree,
-                &["rev-parse", "--verify", &format!("{discard}^{{commit}}")],
-            )
-            .await?
+            rev_parse_verify(worktree, &format!("{discard}^{{commit}}")).await?
         } else {
-            git_output(
+            rev_parse_verify(
                 Path::new(&assignment.bare_path),
-                &["rev-parse", "--verify", &format!("{discard}^{{commit}}")],
+                &format!("{discard}^{{commit}}"),
             )
             .await?
         };
@@ -434,11 +430,8 @@ pub(crate) async fn canonical_approved_head(
     let worktree = Path::new(&assignment.worktree);
     match requested {
         Some(requested) => {
-            let canonical = git_output(
-                worktree,
-                &["rev-parse", "--verify", &format!("{requested}^{{commit}}")],
-            )
-            .await?;
+            let canonical =
+                rev_parse_verify(worktree, &format!("{requested}^{{commit}}")).await?;
             if canonical != requested {
                 return Err(format!(
                     "expected_head must be the full canonical commit OID '{canonical}'"
@@ -570,11 +563,7 @@ pub(crate) async fn publish_assignment(
             .or(assignment.pushed_head.as_deref())
             .or(assignment.expected_head.as_deref());
         if expected_previous != Some(remote)
-            || !git_predicate(
-                Path::new(&assignment.worktree),
-                &["merge-base", "--is-ancestor", remote, &approved],
-            )
-            .await?
+            || !is_ancestor(Path::new(&assignment.worktree), remote, &approved).await?
         {
             return Err(format!(
                 "remote branch moved to {remote}; refusing to overwrite it with approved head {approved}"
