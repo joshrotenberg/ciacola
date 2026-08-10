@@ -635,6 +635,36 @@ mod tests {
             .expect("commit head")
     }
 
+    /// Advance the origin's `main` with a commit that conflicts with the
+    /// assignment's own edit to `a`, then merge it into the worktree and
+    /// leave the conflict unresolved. Returns the moved base commit.
+    async fn conflicting_base_move(origin: &Path, worktree: &Path) -> String {
+        std::fs::write(origin.join("a"), "moved base side").expect("write moved base");
+        git(origin, &["add", "a"]).await;
+        git(origin, &["commit", "-qm", "chore: conflicting base move"]).await;
+        let moved = git_output(origin, &["rev-parse", "--verify", "HEAD^{commit}"])
+            .await
+            .expect("moved base head");
+        git(worktree, &["fetch", "-q", "origin", "main"]).await;
+        let merge = tokio::process::Command::new("git")
+            .args(["merge", "--no-edit", "FETCH_HEAD"])
+            .current_dir(worktree)
+            .kill_on_drop(true)
+            .output()
+            .await
+            .expect("run conflicting merge");
+        assert!(
+            !merge.status.success(),
+            "fixture merge must conflict: {}",
+            String::from_utf8_lossy(&merge.stdout)
+        );
+        let unmerged = git_output(worktree, &["ls-files", "-u"])
+            .await
+            .expect("unmerged entries");
+        assert!(!unmerged.is_empty(), "merge must leave unmerged paths");
+        moved
+    }
+
     async fn memory_plugin(repos: Repos) -> (RepoWorkerPlugin, Ledger) {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:")
             .await
@@ -4075,5 +4105,306 @@ branch_templates = { "local/repo" = "fix/{slug}" }
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn moved_base_merge_conflict_is_fenced_at_publication_and_cleanup() {
+        let (tmp, repos) = local_repos("moved-base-conflict").await;
+        let (mut plugin, _ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 93, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let worktree = Path::new(&assignment.worktree);
+        let head = commit_change(worktree, "a", "assignment side").await;
+        let moved_base = conflicting_base_move(&tmp.join("origin"), worktree).await;
+
+        let args = json!({
+            "agent_id": assignment.agent_id,
+            "expected_head": head,
+            "title": "fix: conflicted assignment",
+            "body": "Closes #93"
+        });
+        let publish = operator_tool(&plugin, "open_pr").call(args.clone()).await;
+        let publish = serde_json::to_string(&publish).expect("render conflicted publication");
+        assert!(
+            publish.contains("assigned worktree is dirty; commit or retain it before publication"),
+            "got: {publish}"
+        );
+        let cleanup = operator_tool(&plugin, "finish_issue")
+            .call(json!({"agent_id": assignment.agent_id}))
+            .await;
+        let cleanup = serde_json::to_string(&cleanup).expect("render conflicted cleanup");
+        assert!(
+            cleanup.contains(
+                "assigned worktree is dirty; retain it or commit/clean it before cleanup"
+            ),
+            "got: {cleanup}"
+        );
+        let durable = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(durable.state, AssignmentState::Active);
+        assert_eq!(durable.publication_state, PublicationState::Unpublished);
+
+        git(worktree, &["merge", "--abort"]).await;
+        let refused = operator_tool(&plugin, "finish_issue")
+            .call(json!({"agent_id": assignment.agent_id}))
+            .await;
+        let refused = serde_json::to_string(&refused).expect("render fence refusal");
+        assert!(
+            refused.contains(&format!(
+                "cleanup would discard unpublished work at {head}; review it and retry with \
+                 discard_head='{head}', or keep=true"
+            )),
+            "got: {refused}"
+        );
+        assert!(worktree.exists());
+        assert_eq!(
+            git_output(worktree, &["rev-parse", "--verify", "HEAD^{commit}"])
+                .await
+                .expect("worktree head"),
+            head
+        );
+
+        let pr = fake.pr(48, "OPEN", true, &assignment.branch, &head, "main");
+        fake.set_created(&pr);
+        let opened = operator_tool(&plugin, "open_pr").call(args).await;
+        let opened = serde_json::to_string(&opened).expect("render open");
+        assert!(opened.contains("\"created\":true"), "got: {opened}");
+        let remote = git_output(
+            &tmp.join("origin"),
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{}^{{commit}}", assignment.branch),
+            ],
+        )
+        .await
+        .expect("remote branch");
+        assert_eq!(
+            remote, head,
+            "publication must pin the exact reviewed commit"
+        );
+        assert_eq!(
+            git_output(worktree, &["merge-base", &head, &moved_base])
+                .await
+                .expect("merge base"),
+            assignment.base_head.as_deref().expect("base head"),
+            "the moved base must never be merged into the published head"
+        );
+        assert_eq!(
+            git_output(
+                &tmp.join("origin"),
+                &["rev-parse", "--verify", "refs/heads/main^{commit}"],
+            )
+            .await
+            .expect("origin main"),
+            moved_base,
+            "publication must not touch the moved base branch"
+        );
+
+        let fenced = operator_tool(&plugin, "finish_issue")
+            .call(json!({"agent_id": assignment.agent_id}))
+            .await;
+        let fenced = serde_json::to_string(&fenced).expect("render post-publication fence");
+        assert!(
+            fenced.contains(&format!("cleanup would discard open work at {head}")),
+            "got: {fenced}"
+        );
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closed_or_head_drifted_pull_requests_never_authorize_cleanup() {
+        let (tmp, repos) = local_repos("pr-cleanup-authority").await;
+        let (mut plugin, _ledger) = memory_plugin(repos).await;
+        let fake = FakeGh::new(&tmp);
+        plugin.repos.as_mut().expect("repos").gh_binary = fake.binary.clone();
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 94, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let worktree = Path::new(&assignment.worktree);
+        let reviewed = commit_change(worktree, "change", "reviewed").await;
+        let pr = fake.pr(49, "OPEN", true, &assignment.branch, &reviewed, "main");
+        fake.set_created(&pr);
+        let opened = operator_tool(&plugin, "open_pr")
+            .call(json!({
+                "agent_id": assignment.agent_id,
+                "expected_head": reviewed,
+                "title": "fix: publish before external verdicts",
+                "body": "Closes #94"
+            }))
+            .await;
+        assert!(
+            serde_json::to_string(&opened)
+                .expect("render publication")
+                .contains("\"created\":true")
+        );
+
+        // The nearest durable analog of a CI failure today: the PR exists
+        // but was closed without merging. Cleanup must observe that state
+        // and still refuse removal without an exact discard fence.
+        let closed = fake.pr(49, "CLOSED", false, &assignment.branch, &reviewed, "main");
+        fake.set_existing(Some(&closed));
+        let refused = operator_tool(&plugin, "finish_issue")
+            .call(json!({"agent_id": assignment.agent_id}))
+            .await;
+        let refused = serde_json::to_string(&refused).expect("render closed refusal");
+        assert!(
+            refused.contains(&format!("cleanup would discard closed work at {reviewed}")),
+            "got: {refused}"
+        );
+        let durable = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(durable.pr_state, Some(PrState::Closed));
+        assert_eq!(durable.state, AssignmentState::Active);
+        assert!(worktree.exists());
+
+        // A merged PR that does not cover the newest local commit is not
+        // cleanup authority either.
+        let unreviewed = commit_change(worktree, "second", "unreviewed").await;
+        let merged_stale = fake.pr(49, "MERGED", false, &assignment.branch, &reviewed, "main");
+        fake.set_existing(Some(&merged_stale));
+        let refused = operator_tool(&plugin, "finish_issue")
+            .call(json!({"agent_id": assignment.agent_id}))
+            .await;
+        let refused = serde_json::to_string(&refused).expect("render stale merge refusal");
+        assert!(
+            refused.contains(&format!(
+                "cleanup would discard merged work at {unreviewed}"
+            )),
+            "got: {refused}"
+        );
+
+        // A merged PR whose recorded head moved off the durable expected
+        // head is refused outright, and the drift is durably observed.
+        let drifted_head = assignment.base_head.as_deref().expect("base head");
+        let drifted = fake.pr(
+            49,
+            "MERGED",
+            false,
+            &assignment.branch,
+            drifted_head,
+            "main",
+        );
+        fake.set_existing(Some(&drifted));
+        let refused = operator_tool(&plugin, "finish_issue")
+            .call(json!({"agent_id": assignment.agent_id}))
+            .await;
+        let refused = serde_json::to_string(&refused).expect("render drift refusal");
+        assert!(
+            refused.contains("drifted from durable expected head"),
+            "got: {refused}"
+        );
+        let durable = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(durable.pr_head.as_deref(), Some(drifted_head));
+        assert_eq!(durable.publication_state, PublicationState::Failed);
+        assert!(
+            durable
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("drifted from durable expected head"))
+        );
+        assert_eq!(plugin.health().await["status"], "degraded");
+        assert!(worktree.exists());
+        for commit in [&reviewed, &unreviewed] {
+            assert!(
+                git_predicate(
+                    Path::new(&assignment.bare_path),
+                    &["cat-file", "-e", commit]
+                )
+                .await
+                .expect("commit reachability"),
+                "cleanup refusals must lose no committed work"
+            );
+        }
+        std::fs::remove_dir_all(tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn conflicted_assignment_is_retained_intact_with_keep() {
+        let (tmp, repos) = local_repos("retain-conflict").await;
+        let (plugin, ledger) = memory_plugin(repos).await;
+        operator_tool(&plugin, "start_issue")
+            .call(json!({"repo": "local/repo", "issue": 95, "base": "main"}))
+            .await;
+        let assignment = plugin.assignments().await.expect("assignments")[0].clone();
+        let worktree = Path::new(&assignment.worktree);
+        let head = commit_change(worktree, "a", "assignment side").await;
+        let moved_base = conflicting_base_move(&tmp.join("origin"), worktree).await;
+
+        let retained = operator_tool(&plugin, "finish_issue")
+            .call(json!({"agent_id": assignment.agent_id, "keep": true}))
+            .await;
+        let retained = serde_json::to_string(&retained).expect("render retention");
+        assert!(
+            retained.contains("\"state\":\"retained\""),
+            "got: {retained}"
+        );
+        assert!(
+            retained.contains("\"worktree_removed\":false"),
+            "got: {retained}"
+        );
+
+        let durable = plugin.assignments().await.expect("assignments")[0].clone();
+        assert_eq!(durable.state, AssignmentState::Retained);
+        assert!(
+            ledger
+                .get_agent(assignment.agent_id.as_deref().expect("agent"))
+                .await
+                .expect("agent query")
+                .expect("agent row")
+                .retired
+        );
+        assert!(worktree.exists());
+        assert_eq!(
+            git_output(
+                Path::new(&assignment.bare_path),
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/heads/{}^{{commit}}", assignment.branch),
+                ],
+            )
+            .await
+            .expect("retained branch head"),
+            head
+        );
+        let conflicted = std::fs::read_to_string(worktree.join("a")).expect("conflicted file");
+        assert!(conflicted.contains("<<<<<<<"), "got: {conflicted}");
+        assert!(conflicted.contains("assignment side"), "got: {conflicted}");
+        assert!(conflicted.contains("moved base side"), "got: {conflicted}");
+        assert!(
+            !git_output(worktree, &["ls-files", "-u"])
+                .await
+                .expect("unmerged entries")
+                .is_empty(),
+            "retention must not resolve or clean the conflict"
+        );
+
+        // The retained conflict still cannot be discarded silently.
+        let refused = operator_tool(&plugin, "finish_issue")
+            .call(json!({"assignment_id": assignment.assignment_id}))
+            .await;
+        let refused = serde_json::to_string(&refused).expect("render retained cleanup refusal");
+        assert!(
+            refused.contains(
+                "assigned worktree is dirty; retain it or commit/clean it before cleanup"
+            ),
+            "got: {refused}"
+        );
+        assert_eq!(
+            git_output(
+                &tmp.join("origin"),
+                &["rev-parse", "--verify", "refs/heads/main^{commit}"],
+            )
+            .await
+            .expect("origin main"),
+            moved_base
+        );
+        std::fs::remove_dir_all(tmp).ok();
     }
 }
