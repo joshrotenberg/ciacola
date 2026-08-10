@@ -8,13 +8,13 @@ use sqlx::{Row, SqlitePool};
 use ciacola_core::agent::FlatError;
 use ciacola_core::ledger::Ledger;
 
-use crate::GhPr;
 use crate::assignment::{
     Assignment, AssignmentState, CleanupReason, CleanupState, LegacyAssignment, PublicationState,
     assignment_slug, sqlite_u64,
 };
 use crate::config::BranchTemplate;
 use crate::git::{git_output, github_origin_matches, validate_branch_name};
+use crate::journey::GhPr;
 use crate::repos::Repos;
 
 #[derive(Clone)]
