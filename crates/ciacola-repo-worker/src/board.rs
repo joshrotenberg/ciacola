@@ -135,7 +135,7 @@ pub(crate) fn board_section(plugin: &RepoWorkerPlugin) -> BoxFut<'_, Option<Sect
                 format!("{completed_count} completed journey(s)")
             };
             html.push_str(&format!(
-                "<details><summary>{completed_summary}</summary>\
+                "<details id=\"d-repo-worker-completed\"><summary>{completed_summary}</summary>\
                  <table class=\"responsive-table\"><caption class=\"sr-only\">Recently completed repository journeys</caption>\
                  {headings}{completed_rows}</table></details>"
             ));
