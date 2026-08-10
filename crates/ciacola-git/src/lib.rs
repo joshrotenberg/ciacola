@@ -300,3 +300,179 @@ impl Plugin for GitPlugin {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// Identity comes from the environment, not from ambient git config,
+    /// so the fixtures commit on any CI runner.
+    async fn git(dir: &Path, args: &[&str]) {
+        let out = tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .await
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ciacola-git-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    async fn repo_with_commit(label: &str) -> PathBuf {
+        let dir = temp_dir(label);
+        git(&dir, &["init", "-q", "-b", "main"]).await;
+        std::fs::write(dir.join("a"), "alpha\nbeta\n").expect("write");
+        git(&dir, &["add", "."]).await;
+        git(&dir, &["commit", "-qm", "one"]).await;
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_clean_repo_reports_branch_and_head_and_nothing_else() {
+        let dir = repo_with_commit("clean").await;
+
+        let state = read_repo("a1", "worker", &dir).await.expect("a repository");
+        assert_eq!(state.agent_id, "a1");
+        assert_eq!(state.name, "worker");
+        assert_eq!(state.dir, dir.display().to_string());
+        assert_eq!(state.branch, "main");
+        assert!(!state.head.is_empty(), "short head: {state:?}");
+        assert_eq!(state.dirty_files, 0);
+        assert_eq!((state.insertions, state.deletions), (0, 0));
+        assert_eq!((state.ahead, state.behind), (0, 0));
+        assert_eq!(state.upstream, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn dirty_counts_cover_modified_and_untracked_files() {
+        let dir = repo_with_commit("dirty").await;
+        std::fs::write(dir.join("a"), "alpha\ngamma\n").expect("write");
+        std::fs::write(dir.join("untracked"), "new\n").expect("write");
+
+        let state = read_repo("a1", "worker", &dir).await.expect("a repository");
+        assert_eq!(state.dirty_files, 2, "one modified plus one untracked");
+        // The untracked file is not part of `diff HEAD`; the edit is.
+        assert_eq!(state.insertions, 1);
+        assert_eq!(state.deletions, 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ahead_and_behind_are_counted_against_the_upstream() {
+        let root = temp_dir("ahead-behind");
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).expect("mkdir origin");
+        git(&origin, &["init", "-q", "--bare", "-b", "main"]).await;
+
+        let local = root.join("local");
+        std::fs::create_dir_all(&local).expect("mkdir local");
+        git(&local, &["init", "-q", "-b", "main"]).await;
+        std::fs::write(local.join("a"), "alpha\n").expect("write");
+        git(&local, &["add", "."]).await;
+        git(&local, &["commit", "-qm", "one"]).await;
+        let origin_path = origin.to_str().expect("utf8 path");
+        git(&local, &["remote", "add", "origin", origin_path]).await;
+        git(&local, &["push", "-q", "-u", "origin", "main"]).await;
+
+        // One commit only the remote has, made through a second clone.
+        git(&root, &["clone", "-q", origin_path, "other"]).await;
+        let other = root.join("other");
+        std::fs::write(other.join("b"), "remote\n").expect("write");
+        git(&other, &["add", "."]).await;
+        git(&other, &["commit", "-qm", "remote"]).await;
+        git(&other, &["push", "-q", "origin", "main"]).await;
+
+        // Two commits only the local branch has, so a swapped
+        // ahead/behind parse cannot pass.
+        std::fs::write(local.join("c"), "local one\n").expect("write");
+        git(&local, &["add", "."]).await;
+        git(&local, &["commit", "-qm", "local one"]).await;
+        std::fs::write(local.join("d"), "local two\n").expect("write");
+        git(&local, &["add", "."]).await;
+        git(&local, &["commit", "-qm", "local two"]).await;
+        git(&local, &["fetch", "-q", "origin"]).await;
+
+        let state = read_repo("a1", "worker", &local)
+            .await
+            .expect("a repository");
+        assert_eq!(state.upstream.as_deref(), Some("origin/main"));
+        assert_eq!(state.ahead, 2);
+        assert_eq!(state.behind, 1);
+        assert_eq!(state.dirty_files, 0);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn detached_head_reports_a_placeholder_branch() {
+        let dir = repo_with_commit("detached").await;
+        git(&dir, &["checkout", "-q", "--detach"]).await;
+
+        let state = read_repo("a1", "worker", &dir).await.expect("a repository");
+        assert_eq!(state.branch, "(detached)");
+        assert!(!state.head.is_empty(), "short head: {state:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_remote_without_tracking_is_not_an_upstream() {
+        let dir = repo_with_commit("no-upstream").await;
+        let origin = temp_dir("no-upstream-origin");
+        git(&origin, &["init", "-q", "--bare", "-b", "main"]).await;
+        git(
+            &dir,
+            &["remote", "add", "origin", origin.to_str().expect("utf8")],
+        )
+        .await;
+
+        let state = read_repo("a1", "worker", &dir).await.expect("a repository");
+        assert_eq!(state.upstream, None);
+        assert_eq!((state.ahead, state.behind), (0, 0));
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&origin).ok();
+    }
+
+    #[tokio::test]
+    async fn a_directory_that_is_not_a_repository_contributes_nothing() {
+        let dir = temp_dir("not-a-repo");
+        assert!(
+            read_repo("a1", "worker", &dir).await.is_none(),
+            "a plain directory must read as absent, not as an error"
+        );
+
+        let missing = dir.join("does-not-exist");
+        assert!(
+            read_repo("a1", "worker", &missing).await.is_none(),
+            "a missing directory must read as absent, not as an error"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
