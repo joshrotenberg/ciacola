@@ -995,15 +995,12 @@ impl Ledger {
         rows.into_iter().map(agent_row).collect()
     }
 
-    /// Record the next turn as queued, or say why not. One turn in
-    /// flight per agent is the ledger's one admission rule: the guard is
-    /// inside the INSERT itself, so two concurrent sends cannot both
-    /// pass it.
-    ///
-    /// This is a low-level delivery/test primitive. Product submission
-    /// paths must use [`Ledger::admit_turn`], which applies the rolling
-    /// circuit breakers and persists any supervised exception atomically.
-    #[doc(hidden)]
+    /// Test support only: queue a turn with an unbounded protection
+    /// snapshot, bypassing rolling admission. Compiled out of production
+    /// builds; product paths must use [`Ledger::admit_turn`], which
+    /// applies the circuit breakers and persists any supervised
+    /// exception atomically.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn enqueue_turn(&self, agent_id: &str, prompt: &str) -> Result<i64, FlatError> {
         self.enqueue_turn_with_admission_override(agent_id, prompt, None)
             .await
@@ -1012,54 +1009,38 @@ impl Ledger {
     /// Enqueue a turn and durably attach the policy decision that let a
     /// supervised request proceed. The value is stored as canonical JSON;
     /// its schema belongs to admission policy rather than the ledger.
+    #[cfg(any(test, feature = "test-support"))]
     async fn enqueue_turn_with_admission_override(
         &self,
         agent_id: &str,
         prompt: &str,
         admission_override: Option<&serde_json::Value>,
     ) -> Result<i64, FlatError> {
+        let agent = match self.get_agent(agent_id).await? {
+            None => return Err(format!("no agent '{agent_id}'").into()),
+            Some(agent) if agent.retired => {
+                return Err(format!("agent '{agent_id}' is retired").into());
+            }
+            Some(agent) => agent,
+        };
         let admission_override = admission_override.map(serde_json::to_string).transpose()?;
-        // RETURNING keeps the seq in the same statement as the guarded
-        // INSERT; a separate MAX(seq) read could hand back another
-        // sender's turn number under a kill-plus-resend race.
-        let row: Option<(i64,)> = sqlx::query_as(
-            "INSERT INTO turns
-                 (agent_id, seq, prompt, state, at_unix, provider, admission_override,
-                  turn_protection_state, turn_protection, failure_kind)
-             SELECT a.agent_id,
-                    (SELECT COALESCE(MAX(seq), 0) + 1 FROM turns WHERE agent_id = a.agent_id),
-                    ?2, 'queued', ?3,
-                    COALESCE(NULLIF(json_extract(a.def, '$.provider'), ''), 'claude'), ?4,
-                    'unbounded',
-                    json_object(
-                        'version', 1,
-                        'provider', COALESCE(NULLIF(json_extract(a.def, '$.provider'), ''), 'claude'),
-                        'state', 'unbounded',
-                        'configured_limit', NULL,
-                        'capability', NULL,
-                        'unavailable_override', NULL),
-                    'none'
-               FROM agents a
-              WHERE a.agent_id = ?1 AND a.retired = 0
-               AND NOT EXISTS (SELECT 1 FROM turns
-                               WHERE agent_id = ?1 AND state IN ('queued', 'running'))
-             RETURNING seq",
-        )
-        .bind(agent_id)
-        .bind(prompt)
-        .bind(crate::time::now_unix())
-        .bind(admission_override)
-        .fetch_optional(&self.pool)
-        .await?;
+        let protection =
+            crate::limits::TurnProtectionSnapshot::unbounded(agent.def.provider.as_str());
+        // The same guarded statement admission runs: busy fence, retirement
+        // fence, and race-safe seq allocation in one INSERT ... RETURNING.
+        let row: Option<(i64,)> = sqlx::query_as(crate::admission::GUARDED_TURN_INSERT)
+            .bind(agent_id)
+            .bind(prompt)
+            .bind(crate::time::now_unix())
+            .bind(agent.def.provider.as_str())
+            .bind(admission_override)
+            .bind(protection.state.as_str())
+            .bind(serde_json::to_string(&protection)?)
+            .fetch_optional(&self.pool)
+            .await?;
         match row {
             Some((seq,)) => Ok(seq),
-            None => match self.get_agent(agent_id).await? {
-                None => Err(format!("no agent '{agent_id}'").into()),
-                Some(agent) if agent.retired => {
-                    Err(format!("agent '{agent_id}' is retired").into())
-                }
-                Some(_) => Err(format!("agent '{agent_id}' already has a turn in flight").into()),
-            },
+            None => Err(format!("agent '{agent_id}' already has a turn in flight").into()),
         }
     }
 
