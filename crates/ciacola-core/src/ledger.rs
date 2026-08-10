@@ -1274,36 +1274,52 @@ impl Ledger {
         .await?;
         let recorded = done.rows_affected() == 1;
         if recorded {
-            // session_started_seq marks where the current session
-            // began, and rotation measures from it. Two ways in: the id
-            // changed (a session we did not assign), or the id was
-            // assigned and this is the turn that opened it, which is
-            // what `session_started_seq = 0` means. Without the second
-            // clause an assigned id never records its start, because it
-            // never differs, and rotation then counts from 0 and fires
-            // one turn early on every agent for the rest of its life.
-            sqlx::query(
-                "UPDATE agents SET session = COALESCE(?2, session),
-                     cost_micro_usd = CASE
-                         WHEN cost_micro_usd > 9223372036854775807 - ?3
-                             THEN 9223372036854775807
-                         ELSE cost_micro_usd + ?3 END,
-                     session_started_seq = CASE
-                         WHEN ?2 IS NOT NULL
-                              AND (session IS NULL OR session <> ?2
-                                   OR session_started_seq = 0) THEN ?4
-                         ELSE session_started_seq END
-                 WHERE agent_id = ?1",
-            )
-            .bind(agent_id)
-            .bind(exchange.session.as_deref())
-            .bind(cost)
-            .bind(seq)
-            .execute(&mut *tx)
-            .await?;
+            Self::roll_up_settled_turn(&mut tx, agent_id, exchange.session.as_deref(), cost, seq)
+                .await?;
         }
         tx.commit().await?;
         Ok(recorded)
+    }
+
+    /// One settled turn's durable effect on its agent row, shared by
+    /// every settlement path so the logic cannot drift between them:
+    /// adopt a learned session id, bank cost with saturation, and stamp
+    /// where the current session began.
+    ///
+    /// `session_started_seq` marks where the current session began, and
+    /// rotation measures from it. Two ways in: the id changed (a session
+    /// we did not assign), or the id was assigned and this is the turn
+    /// that opened it, which is what `session_started_seq = 0` means.
+    /// Without the second clause an assigned id never records its start,
+    /// because it never differs, and rotation then counts from 0 and
+    /// fires one turn early on every agent for the rest of its life.
+    async fn roll_up_settled_turn(
+        tx: &mut sqlx::SqliteConnection,
+        agent_id: &str,
+        session: Option<&str>,
+        cost_micro_usd: i64,
+        seq: i64,
+    ) -> Result<(), FlatError> {
+        sqlx::query(
+            "UPDATE agents SET session = COALESCE(?2, session),
+                 cost_micro_usd = CASE
+                     WHEN cost_micro_usd > 9223372036854775807 - ?3
+                         THEN 9223372036854775807
+                     ELSE cost_micro_usd + ?3 END,
+                 session_started_seq = CASE
+                     WHEN ?2 IS NOT NULL
+                          AND (session IS NULL OR session <> ?2
+                               OR session_started_seq = 0) THEN ?4
+                     ELSE session_started_seq END
+             WHERE agent_id = ?1",
+        )
+        .bind(agent_id)
+        .bind(session)
+        .bind(cost_micro_usd)
+        .bind(seq)
+        .execute(tx)
+        .await?;
+        Ok(())
     }
 
     /// Settle a turn that did not succeed.
@@ -1389,25 +1405,7 @@ impl Ledger {
         .await?;
         let recorded = done.rows_affected() == 1;
         if recorded && (cost_micro_usd > 0 || session.is_some()) {
-            sqlx::query(
-                "UPDATE agents SET session = COALESCE(?2, session),
-                     cost_micro_usd = CASE
-                         WHEN cost_micro_usd > 9223372036854775807 - ?3
-                             THEN 9223372036854775807
-                         ELSE cost_micro_usd + ?3 END,
-                     session_started_seq = CASE
-                         WHEN ?2 IS NOT NULL
-                              AND (session IS NULL OR session <> ?2
-                                   OR session_started_seq = 0) THEN ?4
-                         ELSE session_started_seq END
-                 WHERE agent_id = ?1",
-            )
-            .bind(agent_id)
-            .bind(session)
-            .bind(cost_micro_usd)
-            .bind(seq)
-            .execute(&mut *tx)
-            .await?;
+            Self::roll_up_settled_turn(&mut tx, agent_id, session, cost_micro_usd, seq).await?;
         }
         tx.commit().await?;
         Ok(recorded)
@@ -1483,25 +1481,8 @@ impl Ledger {
         .await?;
         let recorded = done.rows_affected() == 1;
         if recorded && (cost > 0 || exchange.session.is_some()) {
-            sqlx::query(
-                "UPDATE agents SET session = COALESCE(?2, session),
-                     cost_micro_usd = CASE
-                         WHEN cost_micro_usd > 9223372036854775807 - ?3
-                             THEN 9223372036854775807
-                         ELSE cost_micro_usd + ?3 END,
-                     session_started_seq = CASE
-                         WHEN ?2 IS NOT NULL
-                              AND (session IS NULL OR session <> ?2
-                                   OR session_started_seq = 0) THEN ?4
-                         ELSE session_started_seq END
-                 WHERE agent_id = ?1",
-            )
-            .bind(agent_id)
-            .bind(exchange.session.as_deref())
-            .bind(cost)
-            .bind(seq)
-            .execute(&mut *tx)
-            .await?;
+            Self::roll_up_settled_turn(&mut tx, agent_id, exchange.session.as_deref(), cost, seq)
+                .await?;
         }
         tx.commit().await?;
         Ok(recorded)
