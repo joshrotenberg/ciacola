@@ -272,49 +272,6 @@ impl AgentDef {
     }
 }
 
-/// A durable conversation. Can exist while nothing is running; `session`
-/// is the whole of what makes it resumable.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Agent {
-    pub id: String,
-    pub def: AgentDef,
-    /// Provider session id, assigned before the first turn and confirmed
-    /// when the provider opens it. This is the recovery mechanism:
-    /// anyone holding it can continue the conversation, from any process,
-    /// at any later time.
-    pub session: Option<String>,
-    pub turns: Vec<Turn>,
-    pub cost_micro_usd: u64,
-}
-
-impl Agent {
-    pub fn new(def: AgentDef) -> Self {
-        Self {
-            id: ulid::Ulid::new().to_string(),
-            def,
-            session: None,
-            turns: Vec::new(),
-            cost_micro_usd: 0,
-        }
-    }
-}
-
-/// One exchange: our prompt, the agent's reply, what it cost.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Turn {
-    pub seq: u32,
-    pub prompt: String,
-    pub reply: String,
-    pub cost_micro_usd: u64,
-    #[serde(default)]
-    pub tokens_in: u64,
-    #[serde(default)]
-    pub tokens_out: u64,
-    /// Provider-internal turns spent producing the reply (tool calls etc).
-    pub num_turns: u32,
-    pub elapsed_ms: u64,
-}
-
 /// The outcome of one exchange with the provider, before anything is
 /// recorded anywhere.
 #[derive(Debug, Clone)]
@@ -450,16 +407,15 @@ pub fn compose_system_prompt(def: &AgentDef) -> String {
 }
 
 /// One exchange with the provider: say `text` to the conversation
-/// identified by `session` (or start one under `def`'s system prompt).
+/// identified by `session` (or start one under `def`'s system prompt),
+/// under the exact per-turn ceiling snapshot admitted by the ledger.
 ///
 /// `started` is whether that session has been opened at the provider
 /// yet. An id is assigned before the first turn runs, so its presence
 /// says nothing about whether a conversation exists behind it.
 ///
 /// Pure in the sense that matters: it mutates nothing of ours. Every
-/// caller decides for itself where the outcome is recorded, which is
-/// what lets the same function serve the in-memory `prompt`, the
-/// channel-driven executor, and the polling one.
+/// caller decides for itself where the outcome is recorded.
 #[tracing::instrument(
     skip_all,
     fields(
@@ -472,21 +428,6 @@ pub fn compose_system_prompt(def: &AgentDef) -> String {
         tokens_out = tracing::field::Empty,
     )
 )]
-pub async fn run_exchange(
-    providers: &ProviderRegistry,
-    def: &AgentDef,
-    mcp: Option<McpScope>,
-    session: Option<&str>,
-    started: bool,
-    text: &str,
-    events: &dyn TurnEvents,
-) -> Result<Exchange, FlatError> {
-    run_exchange_with_ceiling(providers, def, mcp, session, started, text, None, events).await
-}
-
-/// Execute with the exact per-turn ceiling snapshot admitted by the ledger.
-/// The public convenience path above remains unbounded for direct callers;
-/// product execution always calls this persisted-policy path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_exchange_with_ceiling(
     providers: &ProviderRegistry,
@@ -720,53 +661,6 @@ fn partial_exchange(
         provider_turns: None,
         elapsed_ms: partial.elapsed.unwrap_or(measured_elapsed).as_millis() as u64,
     })
-}
-
-/// Prompt the agent once. Resumes its session if it has one, starts the
-/// conversation if not. On success the turn is recorded on the agent and
-/// returned.
-///
-/// The cap handling that used to live beside this function is gone from
-/// core, not lost: recognising a run that stopped at a ceiling is the
-/// backend's job now, and the adapter returns it as a [`TurnOutcome`]
-/// carrying its spend and its resume id rather than as an error.
-pub async fn prompt<'a>(
-    providers: &ProviderRegistry,
-    agent: &'a mut Agent,
-    text: &str,
-) -> Result<&'a Turn, FlatError> {
-    let started = agent.session.is_some();
-    let exchange = run_exchange(
-        providers,
-        &agent.def,
-        None,
-        agent.session.as_deref(),
-        started,
-        text,
-        &ciacola_agent::NoEvents,
-    )
-    .await?;
-    if let Some(error) = exchange.error {
-        return Err(error.into());
-    }
-    if let Some(session) = exchange.session.clone() {
-        agent.session = Some(session);
-    }
-    agent.cost_micro_usd += exchange.cost_micro_usd();
-    let tokens = exchange.tokens();
-    let cost_micro_usd = exchange.cost_micro_usd();
-    let seq = agent.turns.len() as u32 + 1;
-    agent.turns.push(Turn {
-        seq,
-        prompt: text.to_string(),
-        reply: exchange.reply,
-        cost_micro_usd,
-        tokens_in: tokens.input,
-        tokens_out: tokens.output,
-        num_turns: exchange.provider_turns.unwrap_or_default(),
-        elapsed_ms: exchange.elapsed_ms,
-    });
-    Ok(agent.turns.last().expect("just pushed"))
 }
 
 #[cfg(test)]

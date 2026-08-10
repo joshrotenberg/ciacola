@@ -61,14 +61,13 @@ pub mod notify;
 pub mod plugin;
 pub mod polling;
 pub mod recover;
-pub mod registry;
 pub mod render;
 pub mod roles;
 pub mod server;
 pub mod store;
 pub mod time;
 
-pub use agent::{Agent, AgentDef, Exchange, FlatError, Turn, prompt, run_exchange};
+pub use agent::{AgentDef, Exchange, FlatError};
 pub use delegation::{
     DelegatableAction, DelegationBackendStatus, DelegationInheritance, DelegationPolicy,
     DelegationPolicyError, DelegationScope, DelegationSurface,
